@@ -1,0 +1,16 @@
+C61 0 right ['right']
+C62 left right ['right']
+C63 [1, 2]
+C64 [0, 1, 2, 'else']
+C65 5 ['box']
+C66 [10, 23] ['values', 'index']
+C67 1 [2, 3, 4] 5
+C68 {'start': 0, 'a': 1, 'shared': 'right', 'middle': 9, 'b': 2}
+C69 False [10, 30] {'keep': 1}
+C70 1 7 6 -6 48 16 -5
+C71 [1, 2, 3] 3 True True
+C72 [1, 2, 3]
+C73 [21, 22]
+C74 [1, 2, 3] 3 True
+C75 ['enter', 'resource', 'exit']
+C76 ['enter', 'body', 'exit', 'after']

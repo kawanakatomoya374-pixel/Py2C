@@ -1,0 +1,7 @@
+{}
+{'x': 4, 'y': 5}
+{'a': 1, 'b': 2}
+{1: 'last', 2: 'two'}
+{'alpha': 1, 'beta': 2}
+{'alpha': 1, 'gamma': 3, 'beta': 2}
+{'left': 7, 'right': 8}

@@ -1,0 +1,8 @@
+('axis', 9)
+('point', 3, 4, [5, 6], 3)
+('point-other',)
+('other',)
+('point-other',)
+('int',)
+('str',)
+('object',)

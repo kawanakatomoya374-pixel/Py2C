@@ -1,0 +1,5 @@
+['enter', 'body:7', 'exit:None']
+['s-enter', 's-body', 's-exit', 's-after']
+['enter', 'f-body', 'exit:visible']
+caught:visible
+['w-enter', 'w-body:11', 'w-exit']

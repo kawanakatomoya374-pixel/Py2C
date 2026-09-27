@@ -1,0 +1,6 @@
+('key', '=', 'value=tail')
+('key=value', '=', 'tail')
+('alpha', '', '')
+('', '', 'alpha')
+('', '::', 'head')
+('tail', '::', '')
