@@ -10,7 +10,7 @@ Hosted CLI、生成C、freestandingコア、GUIコマンドバッファ、GCを�
 |---|---|---|
 | 基本変換 | 既存スモーク、60ケース、starred unpack、メソッド既定引数、`del`属性/添字、bit演算を回帰化 | 継続可能 |
 | Python意味論 | `and`/`or`の短絡とオペランド返却、for/while-else、with例外抑止、複合代入の評価回数を修正 | 改善済み |
-| finally | finally内の`return`、`break`、`continue`は正確なアンワインド未実装のため明示診断 | 安全側の限定 |
+| finally | finally内の`return`、`break`、`continue`を対応（finally本体を実行し、進行中の例外・`return`を上書きする）。クリーンアップフレームが「実行中のfinally」を認識し、再実行せず例外フレームだけ復元する | 実装済み（C500–C505） |
 | ISO C11 | コンパイラ本体は厳格C11で構築可能。`--c11`はGNU拡張を要する生成構文を明示拒否 | サブセット保証 |
 | GC/メモリ | ルート容量を`P2C_GC_ROOT_CAPACITY`で設定可能化し、超過を黙殺せず停止。主要なAST・トークン・シンボル・生成器マップの解放を追加 | 改善済み、残課題あり |
 | 自作OS移植 | freestanding静的ライブラリとプラットフォーム抽象、GUIコマンドバッファを維持 | 継続可能 |

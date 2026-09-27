@@ -96,9 +96,16 @@ static void format_error_with_source(char *out, size_t out_sz, const char *kind,
     if (line_len > 200) line_len = 200; /* 極端に長い行は安全のため切り詰める */
 
     size_t used = strlen(out);
-    int m = snprintf(out + used, out_sz - used, "\n\n    %.*s\n    ", (int)line_len, line_start);
-    if (m < 0) return;
-    used = strlen(out);
+    /* 出力は out_sz で有界なので、切り詰めは仕様どおり（-Wformat-truncation の
+     * 誤検出を避けるため、snprintfを使わず明示的な長さで書き込む）。 */
+    {
+        const char *prefix = "\n\n    ";
+        const char *suffix = "\n    ";
+        for (size_t i = 0; prefix[i] && used + 1 < out_sz; i++) out[used++] = prefix[i];
+        for (size_t i = 0; i < line_len && used + 1 < out_sz; i++) out[used++] = line_start[i];
+        for (size_t i = 0; suffix[i] && used + 1 < out_sz; i++) out[used++] = suffix[i];
+        out[used] = '\0';
+    }
     /* colは1始まり。範囲外なら行頭に^を置く */
     size_t caret_pos = (col >= 1 && (size_t)(col - 1) <= line_len) ? (size_t)(col - 1) : 0;
     for (size_t i = 0; i < caret_pos && used + 1 < out_sz; i++) out[used++] = ' ';
@@ -108,6 +115,19 @@ static void format_error_with_source(char *out, size_t out_sz, const char *kind,
 const char* p2c_version_string(void) {
     return PYTHON_CODE_TO_C_VERSION_STRING;
 }
+
+#ifndef PYTHON_CODE_TO_C_NO_STDLIB
+/* 固定文字列を容量確認つきで連結する。ISO C99が保証する1つの文字列リテラルは
+ * 4095バイトまでなので、対応一覧は複数のリテラルへ分割してここで連結する
+ * （末尾NULを含めて初めて書き込み、入りきらない場合は何もしない）。
+ * freestanding（PYTHON_CODE_TO_C_NO_STDLIB）では機能一覧を生成しないため、
+ * 使われない関数にならないよう同じ条件で囲む。 */
+static size_t p2c_append_literal(char *dst, size_t cap, size_t used, const char *src, size_t len) {
+    if (!dst || !src || used + len + 1u > cap) return used;
+    memcpy(dst + used, src, len + 1u);
+    return used + len;
+}
+#endif
 
 const char* p2c_supported_range_string(void) {
 #ifndef PYTHON_CODE_TO_C_NO_STDLIB
@@ -122,6 +142,7 @@ const char* p2c_supported_range_string(void) {
             "  文:\n"
             "    if / elif / else, while (while/for else節含む), for <var> in range(...), for <var> in <list/tuple/str>、for starred unpack\n"
             "    def（デフォルト引数・キーワード引数・*args・**kwargs・キーワード専用引数対応）, return（複数値のタプル戻り値含む）, class, try / except / else / finally（try本体・except節から脱出するreturn/break/continueはfinallyを実行してから脱出）, bare raise\n"
+            "    try / except / else / finally の finally 内 return/break/continue（保留中の例外や return を上書きし、finally を実行してから脱出する）\n"
             "    match / case（literal、None、capture、wildcard、sequence/mapping/class/as/star、or-pattern、if guard）, import <mod>, from <mod> import <name>, pass, break, continue, assert, global\n"
             "    代入 (=), 代入式 (name := value), 複合代入 (+= -= *= /= //= %%=、属性・添字ターゲット含む), タプル/Starred unpack代入 (a, *mid, z = seq)、for (a, *mid, z) in seq\n"
             "    複数代入 (a = b = c = 1), セミコロン区切りの複数文 (a=1; b=2)\n"
@@ -129,6 +150,8 @@ const char* p2c_supported_range_string(void) {
             "    数値(int/float)・文字列・bool・None, list/dict/tuple/set リテラル, list/dict/set内包表記、隣接文字列リテラルの暗黙連結\n"
             "    算術・比較・論理・集合演算子、dictマージ (d1 | d2, d1 |= d2), 三項式 (x if c else y), f-string (f\"...\"), lambda (lambda x, y: x + y)\n"
             "    添字・スライス・属性アクセス、listスライスの代入・+=・del\n"
+            "    ジェネレータ式 (x for x in ys): 複数for節・タプルターゲット・ifフィルタに対応し、\n"
+            "      最も外側のiterableだけを生成時に評価するPythonの規則にも従う\n"
             "    class継承（メソッド・__init__の継承、多段階継承、明示的な基底クラス呼び出し ClassName.method(self,...)）\n"
             "    関数呼び出しでのキーワード引数 (foo(a=1, b=2))\n"
             "    *args（可変長位置引数）・**kwargs（可変長キーワード引数）: 関数・ネスト関数・クラスメソッドに対応\n"
@@ -137,8 +160,13 @@ const char* p2c_supported_range_string(void) {
             "    in / not in（list/tuple/str/dictキー）, is / is not, 連鎖比較 (1 < x < 10)\n"
             "  組み込み関数:\n"
             "    print (sep=/end=対応), len, range, input, str, int, float, bool, abs, round, min, max, sum, sorted (reverse=対応)\n"
-            "    enumerate, zip, isinstance（型のタプル対応: isinstance(x,(int,str))）, type\n"
-            "    any, all, map, filter, list, tuple, divmod, pow(base, exp, mod), format(value, spec), callable\n"
+            "    enumerate, zip, isinstance（型のタプル対応: isinstance(x,(int,str))、クラスオブジェクトや Outer.Inner も可）, type\n"
+            "    any, all, map, filter, list, tuple, divmod, pow(base, exp, mod), format(value, spec), callable\n",
+            p2c_version_string());
+        /* ISO C99が保証する1つの文字列リテラルは4095バイトまで（-Wpedantic の
+         * -Woverlength-strings が上限超過を診断する）。対応一覧はそれを超えるため
+         * 複数のリテラルに分割し、残り容量を確認しながら連結する。 */
+        static const char features_mid[] =
             "  単一値:\n"
             "    ... (Ellipsis) と Ellipsis（is/==/repr/type()/コンテナ要素に対応。def f(): ... のスタブ本体も可）\n"
             "  特殊メソッド:\n"
@@ -154,25 +182,35 @@ const char* p2c_supported_range_string(void) {
             "    f-string / str.format() / format() の書式指定: {:05d} {:.2f} {:>10} {:x} {:b} {:,} {:.0%%} など主要な書式に対応（括弧内の複数f-string連結を含む）\n"
             "  組み込みモジュール: math (pi, e, sqrt, sin, cos, pow)\n"
             "    pygame (ヘッドレス版: 実際の描画/音声/入力なし。init/display/time/\n"
-            "            event/draw/key/sprite/Surface/Rect等、ゲームロジック検証用)\n",
-            p2c_version_string());
-        /* -Wpedantic の -Woverlength-strings は、1つの翻訳フェーズ7文字列が
-         * ISO C99 の下限4095バイトを超えるとエラーにする。対応一覧の追記で
-         * 全体が上限へ近づいたため、未対応一覧は別のsnprintfで追記する。 */
-        size_t used = strlen(buf);
-        snprintf(buf + used, sizeof(buf) - used,
+            "            event/draw/key/sprite/Surface/Rect等、ゲームロジック検証用)\n";
+        /* 追記部分はそれぞれ4095バイト以下のリテラルに分割し、残り容量を
+         * 確認してからコピーする（静かな切り詰めを起こさない）。 */
+        static const char features_tail[] =
             "\n"
+            "  クラス:\n"
+            "    ネストしたクラス定義 (class Outer: class Inner: ...): クラス本体からはその名前で参照可、\n"
+            "      外部からは Outer.Inner 経由。生成CではC名を Outer__Inner に前置して衝突を避け、\n"
+            "      外側クラスの __classobj() が属性として登録する。クラスオブジェクトはGC管理下で\n"
+            "      新しいランタイムAPIを必要としないため、NO_STDLIB/freestandingでもそのまま動く。\n"
+            "    多重継承 (class D(B, C)): Pythonと同じC3線形化でMROを求め、ダイヤモンド継承でも基底メソッドの選択がCPythonと一致する。\n"
+            "      基底クラスのクラス属性はサブクラスのインスタンスからも見える（MRO順に探索）。\n"
+            "    束縛メソッド: m = obj.method でメソッドを取り出し、コールバック（sorted(key=...)、map()等）へ渡せる。\n"
             "  文字列エスケープ:\n"
             "    \\n \\t \\r \\v \\f \\b \\a \\\\ \\\" \\', \\ooo, \\xHH, \\uXXXX, \\UXXXXXXXX, 行継続\n"
             "    （未知のエスケープはバックスラッシュごと保持。\\N{...}はUnicode名前表が無いため診断）\n"
             "\n"
             "[未対応（診断エラーになります）]\n"
-            "  ネストしたクラス定義、クラスメソッドへのデコレータ、デコレータ関数の *args / **kwargs\n"
-            "  ジェネレータ式の複数for節・ネストクロージャ捕捉、async forの状態機械（一部のasync/awaitは対応）\n"
-            "  finally節内のreturn/break/continue、複数のstarred代入対象\n"
-            "  多重継承、複素数型、bytes/bytearray\n"
+            "  関数本体内のclass定義、クラスメソッドへのデコレータ、デコレータ関数の *args / **kwargs\n"
+            "  ネストクロージャ捕捉を行うジェネレータ式、async forの状態機械（一部のasync/awaitは対応）\n"
+            "  複数のstarred代入対象、複素数型、bytes/bytearray\n"
             "\n"
-            "詳細と既知の制限は README.md を参照してください。\n");
+            "詳細と既知の制限は README.md を参照してください。\n";
+        {
+            size_t used = strlen(buf);
+            used = p2c_append_literal(buf, sizeof(buf), used, features_mid, sizeof(features_mid) - 1u);
+            used = p2c_append_literal(buf, sizeof(buf), used, features_tail, sizeof(features_tail) - 1u);
+            (void)used;
+        }
         built = true;
     }
     return buf;

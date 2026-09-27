@@ -26,7 +26,9 @@
 | Python 3.13型構文 | `make test-py313-syntax` | 型パラメータ既定値、TypeVarTuple、ParamSpec、soft keyword `type`文を型消去して警告即エラーの厳格C11生成Cで実行 |
 | ジェネレータ・協調async | `make test-generator-async-runtime`、`make test-async-generator` | 状態保存、停止・再開、StopIteration、`yield from`値委譲、ネストawait、FIFO協調実行、GC到達性、CPython差分を確認 |
 | ベアメタル実行 | `make test-baremetal-runtime` | `PYTHON_CODE_TO_C_NO_STDLIB`、静的ヒープ、platform write、tick、GC、協調awaitを警告即エラーで実行 |
-| ベアメタル生成C | `make test-baremetal-build`、`make test-baremetal-generated` | 起動・アダプタ例をfreestandingアーカイブ化し、`baremetal_hello.py`を実変換してC11オブジェクト化 |
+| ベアメタル生成C | `make test-baremetal-build`、`make test-baremetal-generated` | 起動・アダプタ例をfreestandingアーカイブ化し、`baremetal_hello.py`（ネストしたクラス定義を含む）を実変換してC11オブジェクト化 |
+| ネストしたクラス定義 | CPython差分 C461–C479、`make test-decorator-diagnostics`、`make test-embed-generated`、`make test-baremetal-generated` | 19件一致。`Outer.Inner`経由の構築・メソッド呼出し、クラス本体での名前参照と上から下への評価順、同名ネストクラスの衝突回避（`Left__Node`/`Right__Node`）、二段ネスト、`isinstance(x, Outer.Inner)`を確認。関数本体内の`class`定義とメソッド本体からのクラススコープ参照は明示診断。組込み例（`embed_boot.py`/`baremetal_hello.py`）でも変換・実行 |
+| C識別子の衝突回避 | CPython差分 C480–C486、`make test-baremetal-generated` | Cライブラリ名（`index`/`round`/`abs`/`pow`/`sqrt`/`log`/`main`）をパラメータ・ローカル・モジュール関数名に使った7件が一致。前方宣言・パラメータ宣言・`(void)`キャスト・本体参照のマングル名統一を確認 |
 | 文字コード・基数変換 | `tests/numeric_text_builtins_alpha06.py`、C288–C299、単一ヘッダー | UTF-8単一Unicodeスカラー値の`ord`/`chr`、負値を含む`bin`/`oct`/`hex`、開始値付き`sum`がCPythonと一致 |
 | 名称監査 | Alpha0.3および旧製品名の残存走査 | Alpha0.6正本で残存なし |
 

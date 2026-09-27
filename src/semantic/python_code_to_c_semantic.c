@@ -523,10 +523,10 @@ static P2C_Result visit_stmt(P2C_Semantic *sem, P2C_AstStmt *stmt) {
             break;
         }
         case AST_TRY: {
-            if (contains_finally_control_flow(n->u.try_stmt.finalbody)) {
-                set_sem_error(sem, "return, break, and continue inside finally are not supported because they can override pending control flow", n->line, n->col);
-                return P2C_ERR_SEMANTIC;
-            }
+            /* finally内のreturn/break/continueはPythonでは「finallyを実行してから
+             * 脱出し、進行中の制御フロー（例外・return）を上書きする」意味を持つ。
+             * 生成Cはtry開始時に例外フレームを保存し、脱出時（in_finalbody）に
+             * その復元だけを行って本体を再実行しないため、これを受理できる。 */
             for (size_t i = 0; i < p2c_vec_len(n->u.try_stmt.body); i++) {
                 P2C_Result r = visit_stmt(sem, (P2C_AstStmt*)p2c_vec_get(n->u.try_stmt.body, i));
                 if (r != P2C_OK) return r;
@@ -628,22 +628,18 @@ static P2C_Result visit_stmt(P2C_Semantic *sem, P2C_AstStmt *stmt) {
                     if (decorator_result != P2C_OK) return decorator_result;
                 }
             }
-            /* ネストしたクラス定義（クラス本体の直下に別のclassを書く）はまだ
-             * 未対応。コード生成側がクラス本体のメンバーとして関数定義のみを
-             * 想定しており、ネストしたclassは黙ってスキップされてしまうため
-             * （結果、実行時に該当属性が見つからずクラッシュする）、ここで
-             * はっきり「未対応」を伝える。 */
+            /* ネストしたクラス定義（class本体の直下に別のclassを書く）は対応済みで、
+             * コード生成側が外側クラス名を前置したC名（Outer__Inner）へ解決し、
+             * 外側クラスの__classobjで属性として登録する。ここではクラス本体と
+             * モジュール直下だけを許可する。関数本体の中のclass定義はCでは
+             * 関数の入れ子定義になり不正なCになるため、はっきり診断する。 */
             {
                 P2C_SymbolScope *enclosing = p2c_symtab_current_scope(sem->symtab);
-                if (enclosing && enclosing->scope_type == SCOPE_CLASS) {
-                    char buf[256];
-                    snprintf(buf, sizeof(buf),
-                        "nested class '%s' is not supported yet "
-                        "(class bodies may only contain method definitions). "
-                        "Define '%s' at module level instead.",
-                        n->u.classdef.name ? n->u.classdef.name : "?",
-                        n->u.classdef.name ? n->u.classdef.name : "?");
-                    set_sem_error(sem, buf, n->line, n->col);
+                if (enclosing && enclosing->scope_type != SCOPE_MODULE && enclosing->scope_type != SCOPE_CLASS) {
+                    set_sem_error(sem,
+                        "class definitions inside functions are not supported yet "
+                        "(define the class at module level or directly inside another class)",
+                        n->line, n->col);
                     return P2C_ERR_SEMANTIC;
                 }
             }

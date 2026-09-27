@@ -32,6 +32,8 @@
 | async with | `AST_WITH.is_async`、複数context managerの左から右への`__aenter__`待機・右から左への`__aexit__`待機、通常exit、truthy exitによる抑止、falsy exit後の元例外再送出、class内protocol methodの内部awaitをstate machineへ変換 | C358–C362、C373–C383 |
 | set comprehension | 同期`for`・filter・重複排除を伴う`{expression for ...}`を`p2c_set_new`/`p2c_set_add`へlowerし、strict ISO C11ではGNU拡張Cを出さず明示診断する | C363–C365、`test-set-comprehension-c11` |
 | decorator | `@decorator`と`@factory(...)`をparserで受理し、module-level function/classについて上から下への式評価、下から上への適用、GC rootを持つcallable object再束縛を実装。bare-name decorator、default引数、async function、class objectをCPython差分で確認 | C366–C372、`test-decorator-diagnostics` |
+| ネストしたクラス定義 | クラス本体の直下の`class`を、C名を外側クラス名で前置した`Outer__Inner`へlowerし、外側クラスの`__classobj()`が上から下への評価順で属性登録する。クラス本体の式からはその名前で参照でき、外部からは`Outer.Inner`で参照・構築できる。同名ネストクラスの衝突回避、二段ネスト、ネストクラス版`__str__`、`isinstance(x, Outer.Inner)`も対応。関数本体内の`class`定義とメソッド本体からのクラススコープ参照は明示診断 | C461–C479、`test-embed-generated`、`test-baremetal-generated`、`test-decorator-diagnostics` |
+| C識別子の衝突回避 | `index`/`round`/`abs`/`pow`/`sqrt`/`log`/`main`等をパラメータ・ローカル・モジュール関数名に使っても、前方宣言・パラメータ宣言・`(void)`キャスト・本体参照がすべて同じ`p2c_user_<name>`へ揃うよう統一（クラスメソッドの`(void)`キャストだけ生名で、生成Cが`undeclared identifier`になっていた） | C480–C486、`test-baremetal-generated` |
 | ベアメタル | 静的ヒープ・UART相当出力・tick・GC・起動入口・クロスC11テンプレート・実変換Python例を追加 | `test-baremetal-runtime`、`test-baremetal-build`、`test-baremetal-generated` |
 | 文字コード・基数変換 | UTF-8単一Unicodeスカラー値の`ord`/`chr`、負値を含む`bin`/`oct`/`hex`、開始値付き`sum(iterable, start)`を追加し、`sum`の引数数を検証 | C288–C299、単一ヘッダー自己テスト |
 | Python 3.13型構文 | soft keyword `type Alias[params] = expr`、既定型パラメータ、TypeVarTuple、ParamSpecをfreestanding互換の型消去で受理。位置専用引数`/`はキーワード誤用時に`TypeError` | C300–C302、`test-py313-syntax` |
@@ -59,7 +61,7 @@ Alpha0.6の自己テストは、単一ヘッダーだけをincludeする翻訳�
 
 | 品質ゲート | 結果 |
 |---|---|
-| CPython差分コンフォーマンス | **C01–C383、383件一致** |
+| CPython差分コンフォーマンス | **C01–C528、528件一致** |
 | GCC一括構築 | `make CC=gcc full-build` 合格 |
 | GCC全回帰 | `make CC=gcc test` 合格 |
 | Clang一括構築 | `make CC=clang full-build` 合格 |
@@ -75,8 +77,14 @@ Alpha0.6の自己テストは、単一ヘッダーだけをincludeする翻訳�
 | LeakSanitizer | `make CC=clang test-gc-leaks`で3 runtime epochのshutdown後にruntime所有heapが残らないことを確認 |
 | 名称監査 | 文書・テスト・版番号・生成コード表記をPython Code to C Alpha0.6 / 0.6.0へ統一し、旧版参照は残存なし |
 
+## 追加構文と厳格化（2026-09-28の第2ラウンド）
+
+第2ラウンドで、多重継承の**C3線形化MRO**、基底クラスのクラス属性の継承、**束縛メソッド**（`m = obj.method`）、`finally`内の`return`/`break`/`continue`、**複数for節・タプルターゲットを持つジェネレータ式**を追加し、`sorted()`/`min()`/`max()`のタプル・リスト比較と安定マージソート（O(n log n)）を実装しました。CPython差分は**528アサーション**（C487–C528を追加）へ増え、全一致です。
+
+ビルドはさらに厳格化し、`-Wcast-align=strict`、`-Wlogical-op`、`-Wduplicated-cond/-branches`、`-Wstrict-overflow=2`、`-Wformat-overflow=2`/`-Wformat-truncation=2`/`-Wstringop-overflow=4`、`-Wuse-after-free=3`、`-Wjump-misses-init`、`-Wswitch-default`、`-Wunused-macros` などを追加（追加分の28警告はすべて修正）。ホスト向けに実行時ハードニング（`-fstack-protector-strong`、`-fstack-clash-protection`、`-D_FORTIFY_SOURCE=3`）を既定適用し、組込み向けに `make test-stack-usage`（フレーム上限4096バイト）と `make test-analyzer`（GCC `-fanalyzer`）を新設しました。`-fanalyzer` が検出した例外生成失敗時のNULL参照1件も修正しています。詳細は[厳格ビルドと静的検査](../testing/STRICT_BUILD_AND_ANALYSIS_ALPHA0.6.md)を参照してください。
+
 ## 既知の制限
 
-Alpha0.6はPython実装全体ではありません。整数は任意精度ではなく安全な64ビット固定幅であり、範囲外は`OverflowError`として扱います。`yield from`へのsend/throw/close・委譲戻り値、複数for・tuple/star target・nested closure内の自由変数captureを持つgenerator expression、async generator、async withの複合`as` target・body内の複雑な停止点、Task、キャンセル、I/O待機、async for body/else内のawait、複数awaitを含む副作用順依存式、再帰closure、深い多段capture、**nested function/class method decorator、可変長引数decorator、decorated functionへのkeyword call**、`__match_args__`を使わないclass positional推論・任意Mapping実装などの未対応`match/case`パターン、実行時の`typing.TypeAliasType`、Unicode固有の文字列casefoldは未実装または明示診断です。`yield from iterable`の値委譲、`async def`、拡張await、`async for`、`asyncio.run`、ネスト`def`、direct child `nonlocal`、C11 lambda closure、型構文の型消去受理は対応します。これらの制限は、非標準C拡張や不正な生成Cへ暗黙にフォールバックしないための安全契約です。
+Alpha0.6はPython実装全体ではありません。整数は任意精度ではなく安全な64ビット固定幅であり、範囲外は`OverflowError`として扱います。`yield from`へのsend/throw/close・委譲戻り値、star target・nested closure内の自由変数captureを持つgenerator expression、async generator、async withの複合`as` target・body内の複雑な停止点、Task、キャンセル、I/O待機、async for body/else内のawait、複数awaitを含む副作用順依存式、再帰closure、深い多段capture、**nested function/class method decorator、可変長引数decorator、decorated functionへのkeyword call**、`__match_args__`を使わないclass positional推論・任意Mapping実装などの未対応`match/case`パターン、実行時の`typing.TypeAliasType`、Unicode固有の文字列casefoldは未実装または明示診断です。`yield from iterable`の値委譲、`async def`、拡張await、`async for`、`asyncio.run`、ネスト`def`、direct child `nonlocal`、C11 lambda closure、型構文の型消去受理、**ネストしたクラス定義**（モジュール直下とクラス本体の直下のみ。関数本体内の`class`定義とメソッド本体からのクラススコープ参照は明示診断）は対応します。クラスオブジェクトの`__name__`が未実装であること、クラスオブジェクト経由のメソッド取り出し（`Class.method`）、クラスメソッドへのデコレータ（`@staticmethod`/`@classmethod`/`@property`）、関数本体内の`class`定義は、引き続き既知の制限です。これらの制限は、非標準C拡張や不正な生成Cへ暗黙にフォールバックしないための安全契約です。
 
 詳細な構文範囲は[機能リファレンス](../spec/FEATURE_REFERENCE_ALPHA0.6.md)、[async with・set comprehension拡張仕様](../spec/ASYNC_WITH_AND_SET_COMPREHENSION_ALPHA0.6.md)、および[decorator拡張仕様](../spec/DECORATORS_ALPHA0.6.md)、起動・ビルド・クロス構築は[起動・ビルド手順](../build/BUILD_AND_LAUNCH_ALPHA0.6.md)、ファジング運用は[コンテナファジング手順](../testing/CONTAINER_FUZZING_ALPHA0.6.md)、移植条件は[構文・移植性ガイド](../spec/SYNTAX_AND_PORTABILITY.md)、テストIDは[コンフォーマンス台帳](../testing/CONFORMANCE_TEST_MATRIX_ALPHA0.6.md)を参照してください。

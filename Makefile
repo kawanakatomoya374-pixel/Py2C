@@ -15,10 +15,26 @@ P2C_FUZZ_SEEDS ?= 12648430 24237 17412
 #   -Wconversion / -Wsign-conversion ... 暗黙の切り詰めと符号反転
 #   -Wcast-qual / -Wwrite-strings   ... const契約の破壊
 #   -Wvla                           ... 組込み向けに可変長スタック配列を排除
+#   -Wcast-align=strict             ... アラインメントを上げるキャスト（組込みで致命的）
+#   -Wlogical-op / -Wduplicated-cond / -Wduplicated-branches ... 条件式の書き間違い
+#   -Wstrict-overflow=2 / -Wshift-overflow=2 ... 符号付きオーバーフロー前提の最適化
+#   -Wformat-overflow=2 / -Wformat-truncation=2 / -Wstringop-overflow=4 ...
+#       snprintf等の切り詰め・領域外書き込み
+#   -Wuse-after-free=3 / -Warray-bounds=2 ... 解放後利用・配列境界
+#   -Wjump-misses-init / -Wnested-externs / -Wmissing-declarations / -Wredundant-decls
+#       ... 宣言と初期化の取り違え、スコープの逸脱
+#   -Wswitch-default / -Wimplicit-fallthrough=5 ... switchの網羅とfall-through
+#   -Wunused-macros / -Wmissing-parameter-type / -Wold-style-definition ...
+#       使われない定義・暗黙の古い書き方
 # 意図的に有効化しないフラグ:
 #   -Wswitch-enum: ASTノード種別のswitchはdefault:節で未対応種別を診断する設計で
 #     あり、全case列挙(1200件超)に見合う安全性を生まない。網羅性はtests/の
 #     CPython差分回帰で担保する。
+#   -Wdeclaration-after-statement: C11の混合宣言は本コードベースの意図した書き方で
+#     あり、C89配置への書き換えは646箇所の移動（初期化式の評価順も変わりうる）に
+#     なる割に安全性を増やさない。オブジェクトの寿命とGCの可視性は、Predeclare
+#     パスとテストで担保する。
+#   -Wc++-compat: C++互換は対象外（C11専用）。void*からの暗黙変換だけで108件出る。
 #   -Wnull-dereference: TU毎の通常ビルドでは0件だが、単一ヘッダ構成では
 #     全ソースが1TUになりGCCの関数間解析が効くため、未チェック確保と誤検出が
 #     混在した約300件の "potential null pointer dereference" を報告する。
@@ -28,8 +44,21 @@ WARN_CFLAGS ?= -Wall -Wextra -Werror -Wpedantic \
 	-Wstrict-prototypes -Wmissing-prototypes -Wold-style-definition \
 	-Wredundant-decls -Wundef \
 	-Wconversion -Wsign-conversion -Wcast-qual -Wwrite-strings \
-	-Wdouble-promotion -Wvla -Wfloat-equal
-CFLAGS ?= -std=c11 -O2 $(WARN_CFLAGS)
+	-Wdouble-promotion -Wvla -Wfloat-equal \
+	-Wcast-align=strict -Wpointer-arith -Wbad-function-cast -Wnested-externs \
+	-Wjump-misses-init -Wlogical-op -Wduplicated-cond -Wduplicated-branches \
+	-Wrestrict -Wshift-overflow=2 -Wformat-overflow=2 -Wformat-truncation=2 \
+	-Wformat-signedness -Wstringop-overflow=4 -Wstringop-truncation \
+	-Warray-bounds=2 -Wmissing-declarations -Warith-conversion \
+	-Wmultistatement-macros -Wsizeof-pointer-memaccess -Wsizeof-array-argument \
+	-Wuse-after-free=3 -Wunused-macros -Wswitch-default -Wcast-function-type \
+	-Wimplicit-fallthrough=5 -Wmissing-parameter-type -Wcalloc-transposed-args \
+	-Wstrict-overflow=2
+# ホスト環境でのみ意味のある実行時ハードニング（開発機・CIでの検証用）。
+# 組込み/freestanding構成ではスタック保護もFORTIFYも存在しないため、
+# HOSTED_CFLAGSとして分離し、CFLAGSの既定値にのみ含める。
+HOSTED_HARDEN ?= -fstack-protector-strong -fstack-clash-protection -D_FORTIFY_SOURCE=3
+CFLAGS ?= -std=c11 -O2 $(HOSTED_HARDEN) $(WARN_CFLAGS)
 CPPFLAGS ?= -I./include
 LDFLAGS ?=
 LDLIBS ?= -lm
@@ -53,7 +82,7 @@ SRC := $(shell find src -type f -name '*.c' ! -path 'src/tools/gui_main.c' | sor
 OBJFILES := $(patsubst src/%.c,$(OBJ)/%.o,$(SRC))
 DEPS := $(OBJFILES:.o=.d)
 
-.PHONY: all help check-tools gui run run-gui clean test test-sanitizers test-parser-sanitizers test-gc-lifecycle test-gc-allocation-failure test-gc-leaks test-gc-stack-scan-scope test-gc-temp-roots install freestanding freestanding-clean test-set test-set-comprehension-c11 test-decorator-diagnostics test-conformance test-container-fuzz test-portability full-build single-header test-single-header test-single-header-c11 test-single-header-freestanding test-integer-overflow test-platform-adapter test-generator-async-runtime test-async-generator test-baremetal-runtime test-baremetal-exceptions test-baremetal-build test-baremetal-generated test-py313-syntax test-embed-runtime test-freestanding-setjmp test-embed-compile test-embed-generated test-hobby-os-template test-crlf test-allocator-injection test-setjmp-hook test-heap-unification
+.PHONY: all help check-tools gui run run-gui clean test test-sanitizers test-parser-sanitizers test-gc-lifecycle test-gc-allocation-failure test-gc-leaks test-gc-stack-scan-scope test-gc-temp-roots install freestanding freestanding-clean test-set test-set-comprehension-c11 test-decorator-diagnostics test-conformance test-container-fuzz test-portability full-build single-header test-single-header test-single-header-c11 test-single-header-freestanding test-integer-overflow test-platform-adapter test-generator-async-runtime test-async-generator test-baremetal-runtime test-baremetal-exceptions test-baremetal-build test-baremetal-generated test-py313-syntax test-embed-runtime test-freestanding-setjmp test-embed-compile test-embed-generated test-hobby-os-template test-crlf test-allocator-injection test-setjmp-hook test-heap-unification test-stack-usage test-analyzer
 all: $(BUILD)/python-code-to-c
 	@mkdir -p bin
 	@ln -sf ../$(BUILD)/python-code-to-c bin/python_code_to_c
@@ -85,6 +114,8 @@ help:
 	@printf '%s\n' '  make test-setjmp-hook           Check the P2C_SETJMP/P2C_LONGJMP OS replacement hook.'
 	@printf '%s\n' '  make test-heap-unification      Check that the runtime libc stub malloc shares the platform heap.'
 	@printf '%s\n' '  make check-tools                 Verify the configured compiler, archiver, and Python launcher.'
+	@printf '%s\n' '  make test-stack-usage            Check the freestanding runtime frames stay within STACK_USAGE_LIMIT.'
+	@printf '%s\n' '  make test-analyzer               Run GCC -fanalyzer over the compiler core and runtime.'
 
 check-tools:
 	@command -v "$(CC)" >/dev/null || { printf '%s\n' "compiler not found: $(CC)" >&2; exit 1; }
@@ -178,6 +209,7 @@ test: all
 	$(MAKE) test-single-header
 	$(MAKE) test-single-header-c11
 	$(MAKE) test-single-header-freestanding
+	$(MAKE) test-stack-usage
 	$(MAKE) test-conformance
 	$(MAKE) test-container-fuzz
 	sh tests/audit_regression.sh
@@ -422,6 +454,26 @@ test-gc-temp-roots:
 	ASAN_OPTIONS=detect_stack_use_after_return=0:detect_leaks=0:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 $(BUILD)/tests/test_gc_temp_roots
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(SANITIZER_CFLAGS) tests/test_gc_temp_roots.c src/runtime/python_code_to_c_runtime.c src/common/python_code_to_c_common.c src/platform/python_code_to_c_platform.c src/platform/python_code_to_c_platform_hosted.c src/platform/python_code_to_c_gui.c src/modules/python_code_to_c_pygame.c $(SANITIZER_CFLAGS) -pthread $(LDLIBS) -o $(BUILD)/tests/test_gc_temp_roots_lsan
 	ASAN_OPTIONS=detect_stack_use_after_return=0:detect_leaks=1:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 $(BUILD)/tests/test_gc_temp_roots_lsan
+
+# 組込み（カーネル）向けのスタック使用量検査。カーネルスタックは数KiBしか
+# 無いことが多く、1フレームが大きい関数はそのままスタックオーバーフローに
+# なる。ランタイム本体と変換器コアを -Wstack-usage で検査し、上限超過を
+# -Werror で失敗させる。現状の最大値は約3.4KiB（クラス階層のC3線形化と
+# クラスオブジェクト生成）で、次点は input() の1.0KiB。
+STACK_USAGE_LIMIT ?= 4096
+test-stack-usage:
+	@mkdir -p $(BUILD)/tests
+	$(CC) -I./include -DPYTHON_CODE_TO_C_NO_STDLIB -DPYTHON_CODE_TO_C_NO_PYGAME -ffreestanding -fno-builtin -fno-stack-protector -std=c11 -O2 $(WARN_CFLAGS) -Wstack-usage=$(STACK_USAGE_LIMIT) -c src/runtime/python_code_to_c_runtime.c -o $(BUILD)/tests/stack_usage_runtime.o
+	$(CC) -I./include -DPYTHON_CODE_TO_C_NO_STDLIB -DPYTHON_CODE_TO_C_NO_PYGAME -ffreestanding -fno-builtin -fno-stack-protector -std=c11 -O2 $(WARN_CFLAGS) -Wstack-usage=$(STACK_USAGE_LIMIT) -c src/common/python_code_to_c_common.c -o $(BUILD)/tests/stack_usage_common.o
+	@printf '%s\n' "stack_usage_ok: every frame <= $(STACK_USAGE_LIMIT) bytes"
+
+# GCCの静的解析(-fanalyzer)。解放後利用・二重解放・未初期化・確保失敗経路の
+# 取り違えなどを関数間で追跡する。実行時間が長いため既定のtestには含めず、
+# 明示的に実行する（-Werror で指摘を失敗として扱う）。
+test-analyzer:
+	$(CC) -I./include -std=c11 -O0 $(WARN_CFLAGS) -fanalyzer -Wno-analyzer-too-complex -c src/core/python_code_to_c.c -o $(BUILD)/tests/analyzer_core.o
+	$(CC) -I./include -std=c11 -O0 $(WARN_CFLAGS) -fanalyzer -Wno-analyzer-too-complex -c src/runtime/python_code_to_c_runtime.c -o $(BUILD)/tests/analyzer_runtime.o
+	@printf '%s\n' 'analyzer_ok: -fanalyzer reported no defects'
 
 test-baremetal-build:
 	$(MAKE) -f templates/toolchains/baremetal-example.mk PROJECT_ROOT=. CC="$(CC)" AR="$(AR)" clean all

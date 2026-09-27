@@ -53,16 +53,29 @@ struct P2C_CodeGen {
     P2C_Map *decorated_names; /* decorator適用後にP2C callable objectへ再束縛されるmodule-level定義名の集合 */
     P2C_Map *module_function_names; /* direct module-level function名の集合。decorator expressionをP2C callable adapterへ解決する */
     P2C_Map *decorator_callable_names; /* bare-name decoratorとして実際に参照されるmodule-level function名の集合 */
-    P2C_Map *class_bases;   /* クラス名 -> 基底クラス名（単一継承のみ対応、super()解決に使用） */
     P2C_Map *class_methods; /* クラス名 -> (メソッド名 -> 1) のP2C_Map。super()がどのクラスにメソッドが実際に定義されているか調べるのに使用 */
     const char *current_class;      /* 現在コード生成中のメソッドが属するクラス名（トップレベル関数ではNULL）。super()解決に使用 */
-    const char *current_class_base; /* current_classの直接の基底クラス名（無ければNULL） */
     int lambda_counter; /* lambda式ごとに一意なC関数名を振るためのカウンタ */
     int generator_expression_counter; /* generator expressionごとに一意なC step関数名を振るためのカウンタ */
+    /* ネストクラス定義（class本体の直下に置いたclass）の解決用状態。
+     * C名は外側クラスを前置した "Outer__Inner" にして衝突を避ける。
+     * scan_class_cnameはscan_stmt走査中の現在クラスのC名（トップレベルではNULL）、
+     * nested_class_aliasesは生成中のクラスで可視な「Python名 -> C名」マップ、
+     * in_class_bodyはそのマップをクラス本体の文（__classobj内）で評価しているかを表す。
+     * Python仕様ではクラススコープの名前はメソッド本体から見えないため、
+     * in_class_bodyがfalseのときに名前を参照したら明示的な診断を出す。 */
+    const char *scan_class_cname;
+    P2C_Map *nested_class_aliases;
+    bool in_class_body;
     P2C_Map *closure_env_names;
     P2C_Map *nonlocal_names;
     P2C_Map *cell_names;
     const char *closure_env_var;
+    /* ジェネレータ式・状態機械関数（async/generator）のステップ関数を生成して
+     * いる間だけ設定される、Pythonのローカル名 -> ジェネレータのローカル辞書。
+     * gen_exprの名前解決がこの表を優先することで、組込み関数呼び出しや
+     * タプル/辞書表示の中でも genexpr のローカル名を正しく解決できる。 */
+    P2C_Map *genexpr_locals;
     P2C_Result last_error;
     char *error_msg;
     const char *source_text; /* debug_info有効時に元のPython行をコメント挿入するために使う（NULL可） */

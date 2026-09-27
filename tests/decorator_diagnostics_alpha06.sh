@@ -19,4 +19,6 @@ expect_failure tests/decorator_keyword_call_rejection_alpha06.py 'keyword argume
 expect_failure tests/decorator_vararg_rejection_alpha06.py 'functions with *args or **kwargs cannot be used as decorators yet'
 expect_failure tests/decorator_nested_rejection_alpha06.py 'decorators are currently supported only on module-level functions'
 expect_failure tests/decorator_method_rejection_alpha06.py 'decorators are currently supported only on module-level functions'
+expect_failure tests/class_in_function_rejection_alpha06.py 'class definitions inside functions are not supported yet'
+expect_failure tests/nested_class_method_visibility_rejection_alpha06.py 'nested class names are not visible inside method bodies'
 printf '%s\n' 'decorator_diagnostics_ok'

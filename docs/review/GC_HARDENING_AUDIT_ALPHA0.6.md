@@ -96,3 +96,10 @@ Alpha0.6のGCは、container、closure/cell、generator/coroutine、exception ca
 > カーネルやアプリが`P2C_LONGJMP`を直接使って自前で脱出する場合は、
 > 例外フレームへ到達した時点で保存した深さへ戻す契約が必要になる。
 > 生成C（`--embed-entry`を含む）はこの契約を自分で守る。
+
+検証は両方向の欠陥注入で行った。マークフェーズの呼び出し
+（`g_gc_temp_roots = gc_mark_tls_temporaries();`）を外すと
+`make test-gc-temp-roots` は失敗し（`p2c_gc_last_temp_roots()`が0、左オペランドの
+検算も不一致）、`p2c_binop_rewind()`/`p2c_fstr_rewind()`を無効化すると同テストと
+`tests/gc_temp_roots_alpha06.py`の生成C実行が
+`RuntimeError: f-string nesting limit exceeded`で失敗する。

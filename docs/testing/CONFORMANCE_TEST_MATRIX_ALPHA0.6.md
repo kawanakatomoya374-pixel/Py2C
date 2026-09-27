@@ -158,7 +158,7 @@
 | C74 | `frozenset`フォールバックは読み取り操作を継続できる | 非停止互換経路を検証する |
 | C75 | `with ... as value`はenter/body/exitを順に一度ずつ実行する | リソースcleanupとenter値束縛を検証する |
 | C76 | as句なしの`with`でenter結果を破棄し、truthyな`__exit__`は本体例外を抑止する | C生成の未使用変数警告と例外抑止の意味論を検証する |
-| C77 | `finally`のreturn/break/continueは誤変換せず明示診断する | 危険な制御移譲を遮断する |
+| C77 | `finally`のreturn/break/continueは、finally本体を実行したうえで制御を移す（CPythonと出力一致） | 危険な制御移譲を正しくlowerする |
 | C78 | strict ISO C11可能コードは`-pedantic-errors`でコンパイルする | GCC依存の境界を検証する |
 | C79 | strict ISO C11非対応式は理由付きで拒否する | サイレントな不正生成を防ぐ |
 | C80 | freestandingコアは標準ライブラリ依存なしでアーカイブ化される | 自作OS組込み契約を検証する |
@@ -316,8 +316,16 @@
 | C403–C428 | `divmod`（int/float・両符号・タプル分解）、3引数`pow`（正/零/負指数・負の底と法・大きい法）、`format`（`<`/`>`/`,`/`%`を含む指定）、`callable`（関数・lambda・クラス・`__call__`付きインスタンス・値・ビルトイン名）、`str.isascii`/`str.isprintable` | 変換は受理するが未定義のC関数呼び出しを生成する（`divmod`/`p2c_user_pow`）、床除算・剰余の符号規則、負指数の逆元、`format`仕様の取りこぼし |
 | C429–C443 | `...`（Ellipsis）と`Ellipsis`：単一値の同一性、`repr`、`type()`、真偽、コンテナ/dict値、`def f(): ...`のスタブ本体、`-> ...`注釈 | 式文が`-Wunused-value`になる、単一値がNone扱いになる、`Ellipsis`名の未解決 |
 | C444–C460 | 文字列エスケープ：8進`\ooo`、16進`\xHH`、`\uXXXX`/`\UXXXXXXXX`（UTF-8化）、行継続、未知エスケープの保持、raw文字列、f-string内のエスケープとエスケープされた波括弧、空白を含む識別情報 | バックスラッシュの消失（`"caf\u00e9"`→`"cafu00e9"`）、サロゲートや範囲外コードポイントの扱い、f-stringと通常文字列での挙動差 |
+| C461–C479 | ネストしたクラス定義（`class Outer: class Inner:`）：`Outer.Inner`経由の構築とメソッド呼出し、クラス本体での`alias = Inner`束縛と`[First, Second]`内での参照、クラス本体の文の上から下への評価順、ネストクラスの継承と明示的基底呼出し、`isinstance(x, Outer.Inner)`、同じ単純名を持つ別々の外側クラスの衝突回避（`Left.Node`と`Right.Node`）、二段ネスト（`Deep.Mid.Core`）、インスタンス経由の`self.Inner`、ネストクラス版`__str__` | C名の衝突（`Outer__Inner`前置漏れ）、クラス本体での名前解決漏れ、メソッド本体からのクラススコープ参照（PythonではNameError）、外側クラスへの属性登録漏れ、`__classobj()`の再帰初期化漏れ |
 
-> C175–C460は通常のCPython出力差分に加え、対応する生成Cを警告即エラーの条件でコンパイルする。`match/case`、bare raise、dictマージ、文字列メソッド、for starred unpack、`print`キーワード引数、async for、async with、closureはstrict ISO C11経路または単一ヘッダー契約でも確認する。単一ヘッダーはClangだけでも`-pedantic-errors`で自己完結ビルドを確認し、freestanding構成ではHosted allocator・出力・時刻シンボルの不在を検査する。
+| C480–C486 | Cのライブラリ名と衝突しうる名前をパラメータ・ローカル・モジュール関数名に使う回帰（`index`/`round`/`abs`/`pow`/`sqrt`/`log`/`main`、クラスメソッドの引数、キーワード呼出し） | パラメータ宣言・`(void)`キャスト・本体参照・前方宣言でマングル名が食い違い、生成Cが「undeclared identifier」でコンパイル不能になる（クラスメソッドの`(void)`キャストだけ生名だった） |
+| C487–C493 | 多重継承のC3線形化MRO（ダイヤモンド継承で、サブクラスより先に兄弟基底のメソッドが解決されること）、isinstance の全基底判定、基底クラスのクラス属性の継承、基底 __init__ の継承、明示的な基底メソッド呼出し | 基底探索順（従来の深さ優先近似ではCPythonと異なるメソッドを選んでいた）、MROキャッシュ、クラス属性探索の欠落 |
+| C494–C499 | 束縛メソッド（m = obj.method）の取り出し・状態変更・複数回呼出し、hasattr、map/filter/コールバックへの受け渡し | メソッド属性の解決漏れ、map/filter が関数ポインタを直接呼びクロージャを黙ってスキップしていた不具合 |
+| C500–C505 | finally内の return/break/continue（finally本体の実行、進行中returnの上書き、例外の抑制、入れ子finally、ループ脱出） | 実行中のfinallyの再実行、例外フレームの復元漏れ |
+| C506–C515 | ジェネレータ式の複数for節（〜3節の積）、タプルターゲット、ifフィルタ、外側ローカルcapture、最外iterableの即時評価、sortedへの受け渡し | 1節のみの制限、ターゲット束縛漏れ、レベル変数（state machine）の誤再開 |
+| C516–C525 | タプル・リストの辞書式比較（sorted/min/max）、安定性（key=同値の順序保持）、reverse=、混在キー | タプルを整数として比較していたことによる未ソート出力、挿入ソートのO(n^2) |
+
+> C175–C486は通常のCPython出力差分に加え、対応する生成Cを警告即エラーの条件でコンパイルする。`match/case`、bare raise、dictマージ、文字列メソッド、for starred unpack、`print`キーワード引数、async for、async with、closure、ネストしたクラス定義はstrict ISO C11経路または単一ヘッダー契約でも確認する。単一ヘッダーはClangだけでも`-pedantic-errors`で自己完結ビルドを確認し、freestanding構成ではHosted allocator・出力・時刻シンボルの不在を検査する。ネストしたクラス定義とC識別子衝突の回帰は`examples/embed/embed_boot.py`（H04）と`examples/baremetal/baremetal_hello.py`（`make test-baremetal-generated`）でも実際に変換され、カーネル側ヒープだけを与えた組込み構成でCPython差分を取る。
 
 ### 自作OS統合ゲート（H01–H06）
 
@@ -334,6 +342,9 @@ CPython差分とは別に、組込み統合の契約を実行時検証する。
 | H07 | `make test-allocator-injection` | カーネルアロケータの1回注入（`p2c_platform_set_allocator`）と`P2C_Allocator`注入（`p2c_set_default_allocator`）が変換器コア・共有ヒープの両方へ効くこと、注入が失敗する場合のみ静的フォールバックを使い`p2c_core_static_allocator_active()`で観測できること、停止順序（ランタイム停止→プラットフォーム解除）でヒープが壊れないこと |
 | H08 | `make test-setjmp-hook` | ランタイム本体と生成Cの例外機構が`P2C_SETJMP`/`P2C_LONGJMP`だけを通ること（オーバーライドしたフックの呼び出し回数で検証） |
 | H09 | `make test-heap-unification` | NO_STDLIB構成（ランタイム同梱スタブ）で、スタブの`malloc/realloc/calloc/free`がカーネルアロケータへ委譲されること、`p2c_heap_alloc()`のブロックとraw mallocのブロックが相互に解放できること、プラットフォーム未設定時はスタブの線形ヒープが唯一のヒープになること、ヒープ未設定では確保がNULLを返すこと |
+| C526–C528 | super()のMRO解決：ダイヤモンド継承（class D(B, C)、B(A)、C(A)）でBのsuper()が実体の型のMROに従ってCを選ぶこと、単一継承でのsuper()、super().__init__()による基底初期化 | コード生成時に基底チェーンを静的に辿っていたことによる誤解決 |
+| H10 | make test-stack-usage | freestandingランタイムと共通層のすべてのフレームが STACK_USAGE_LIMIT（既定4096バイト）以下であること（-Wstack-usage と -Werror の併用） |
+| H11 | make test-analyzer | GCC -fanalyzer でコンパイラコアとランタイムの欠陥（解放後利用・NULL経路・確保失敗の取り違え）がないこと。実行時間が長いため任意実行 |
 
 > H01–H09は`make test`に含まれる。テンプレート・例・回帰テストは実装と同じ警告基準
 > （`-Werror`、`-Wconversion`、`-Wcast-qual`、`-Wvla`、`-Wfloat-equal`等）でビルドされる。

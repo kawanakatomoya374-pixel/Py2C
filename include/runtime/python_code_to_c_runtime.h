@@ -93,7 +93,12 @@ struct P2C_Object {
         struct { P2C_DictEntry **buckets; P2C_DictEntry *order_head; P2C_DictEntry *order_tail; size_t bucket_count; size_t len; } v_dict;
         struct { P2C_Object **items; size_t len; } v_tuple;
         struct { char *name; P2C_CallableFn func; P2C_ClosureFn closure_func; P2C_Object *env; } v_function;
-        struct { char *name; P2C_CallableFn ctor; P2C_MethodDef *methods; P2C_Map *attrs; char *base_name; } v_class;
+        /* mro: クラス階層のC3線形化キャッシュ（自分以外の基底クラス名を解決順に
+         * カンマで連結した文字列）。初回のメソッド・属性解決時に遅延計算する。
+         * 継承関係はbase_nameの名前文字列で保持しているが、多重継承のダイヤモンド
+         * （class D(B, C), B(A), C(A)）でPythonと同じ解決順にするにはC3線形化が
+         * 必要になるため、その結果をここへ保持する。 */
+        struct { char *name; P2C_CallableFn ctor; P2C_MethodDef *methods; P2C_Map *attrs; char *base_name; char *mro; } v_class;
         struct { P2C_Object *klass; P2C_Map *attrs; } v_instance;
         struct { char *name; P2C_Map *attrs; } v_module;
         struct { char *msg; char *type_name; P2C_Object *cause; } v_exception;
@@ -256,6 +261,9 @@ P2C_Object* p2c_import_module(const char *name);
 void p2c_register_module(P2C_Object *module);
 P2C_Object* p2c_call(P2C_Object *callable, P2C_Object **args, size_t nargs);
 P2C_Object* p2c_call_attr(P2C_Object *obj, const char *name, P2C_Object **args, size_t nargs);
+/* super().method(...) の動的解決（selfの型のMRO上で、defining_classの次から探索する）。
+ * コード生成は super().m(...) をこの呼び出しへlowerする。 */
+P2C_Object* p2c_super_call_attr(P2C_Object *self, P2C_Object *defining_class, const char *name, P2C_Object **args, size_t nargs);
 P2C_Object* p2c_call_attr_kw(P2C_Object *obj, const char *name, P2C_Object **args, size_t nargs,
                               const char **kw_names, P2C_Object **kw_values, size_t nkw);
 

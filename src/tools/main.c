@@ -205,9 +205,22 @@ static int run_mode(const char *argv0, const char *input_path) {
         fprintf(stderr, "Error: out of memory building compile command.\n");
         return 1;
     }
+#if defined(__GNUC__) && !defined(__clang__)
+/* バッファ長は直上のstrlen計算から求めているため実際に切り詰めは起きないが、
+
+ * GCCの範囲解析は「char[4096]のフィールドは最大4095バイト」と仮定するため
+
+ * -Wformat-truncation を誤検出する。この呼び出しに限り明示的に抑止する。 */
+
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-truncation"
+#endif
     snprintf(cmd, cmd_cap,
         "%s -I\"%s\" -std=c11 \"%s\" \"%s\" \"%s\" \"%s\" \"%s\" \"%s\" -lm -o \"%s\" 2>&1",
         cc, loc.include_dir, c_path, loc.runtime_c, loc.common_c, loc.platform_core_c, loc.platform_c, loc.pygame_c, bin_path);
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
 
     FILE *cc_out = popen(cmd, "r");
     free(cmd);

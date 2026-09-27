@@ -1,6 +1,0 @@
-enter A
-enter B
-body A B
-exit B <class 'ValueError'> boom
-exit A <class 'ValueError'> boom
-after

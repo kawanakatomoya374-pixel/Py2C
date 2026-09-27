@@ -5,6 +5,11 @@
 #ifndef PYTHON_CODE_TO_C_NO_STDLIB
 #define _GNU_SOURCE
 #define _POSIX_C_SOURCE 200809L
+/* 機能マクロが要求水準を満たしているかを確認する（-Wunused-macros への対処と、
+ * 古い環境で暗黙に別の宣言へ落ちることを防ぐ役割を兼ねる）。 */
+#if _POSIX_C_SOURCE < 200112L
+#error "python_code_to_c requires POSIX.1-2001 or later (strtok_r, strdup, snprintf)"
+#endif
 #endif
 #include "runtime/python_code_to_c_runtime.h"
 #include "modules/python_code_to_c_pygame.h"
@@ -55,7 +60,9 @@ void *p2c_heap_alloc_raw(size_t size) {
         heap_failures++;
         return NULL;
     }
-    P2C_HeapBlockHeader *hdr = (P2C_HeapBlockHeader*)(heap_start + heap_used);
+    /* 埋め込み用リニアヒープのブロックはヘッダ長がアライン倍数なので整列している。
+     * char* からの直接キャストは -Wcast-align=strict を誤検出させるため void* を経由する。 */
+    P2C_HeapBlockHeader *hdr = (P2C_HeapBlockHeader*)(void*)(heap_start + heap_used);
     heap_used += total;
     if (heap_used > heap_peak) heap_peak = heap_used;
     hdr->size  = size;
@@ -563,6 +570,7 @@ static void gc_free_obj_data(P2C_Object *obj) {
         case OBJ_CLASS:
             p2c_heap_free(obj->u.v_class.name);
             p2c_heap_free(obj->u.v_class.base_name);
+            p2c_heap_free(obj->u.v_class.mro);
             free_map_shallow(obj->u.v_class.attrs);
             break;
         case OBJ_INSTANCE:
@@ -1550,6 +1558,8 @@ P2C_Object* p2c_class_new(const char *name, P2C_CallableFn ctor, P2C_MethodDef *
     o->u.v_class.methods = methods;
     o->u.v_class.attrs = new_attr_map();
     o->u.v_class.base_name = p2c_strdup_local(base_name ? base_name : "");
+    /* MROキャッシュは初回のメソッド・属性解決時に計算する（未計算はNULL）。 */
+    o->u.v_class.mro = NULL;
     if (!o->u.v_class.name || !o->u.v_class.attrs || !o->u.v_class.base_name) {
         p2c_heap_free(o->u.v_class.name);
         p2c_heap_free(o->u.v_class.base_name);
@@ -1643,50 +1653,376 @@ static P2C_Object* p2c_find_class_by_name(const char *name) {
     return NULL;
 }
 
-/* base_nameはカンマ区切りで複数の基底クラス名を保持しうる（多重継承対応）。
- * 各基底クラスを左から順に（Pythonの単純なMRO近似として）再帰的に探索し、
- * 最初に見つかったメソッドを返す。 */
-static P2C_MethodDef* p2c_find_method_in_chain(P2C_Object *cls_obj, const char *name) {
-    if (!cls_obj) return NULL;
-    P2C_MethodDef *m = cls_obj->u.v_class.methods;
-    while (m && m->name) {
-        if (strcmp(m->name, name) == 0) return m;
-        m++;
+/* ---- クラス階層のC3線形化（PythonのMRO） ------------------------------
+ * 継承関係は名前文字列（"Base" や "Left,Right"）で保持しているため、名前から
+ * p2c_find_class_by_name() でクラスオブジェクトを引き、Pythonと同じC3線形化
+ *     L(C) = C + merge(L(B1), ..., L(Bn), [B1, ..., Bn])
+ * を計算する。ダイヤモンド継承
+ *     class A:        def who(self): ...
+ *     class B(A):     pass
+ *     class C(A):     def who(self): ...
+ *     class D(B, C):  pass
+ * ではPythonは C.who を選ぶ（MROは D, B, C, A）。以前は「左の基底から順に
+ * 深さ優先で再帰する」近似だったため A.who を選び、CPythonと静かに異なる
+ * 結果を返していた。
+ *
+ * 計算結果はクラスごとに一度だけ求め、v_class.mro へ「自分以外の名前を解決順に
+ * カンマで連結した文字列」としてキャッシュする（基底関係はクラス生成時に確定し、
+ * 以後変化しないため再計算は不要）。
+ *
+ * 破綻した階層（循環、深さ・幅・アリーナの上限超過、mergeの失敗）では従来と
+ * 同じ深さ優先の訪問順をキャッシュする。このときの解決結果は以前の実装と
+ * 一致する（安全側へのフォールバック）。
+ */
+#define P2C_MRO_MAX_NAMES 32
+#define P2C_MRO_MAX_BASES 8
+#define P2C_MRO_MAX_DEPTH 12
+/* アリーナはMRO計算中だけ使う一時領域。組込み（カーネルスタックが数KB）でも
+ * 収まるよう、各再帰フレームの作業配列は小さく、アリーナも4KB未満に抑える。 */
+#define P2C_MRO_ARENA_BYTES 3072
+
+typedef struct {
+    const char *names[P2C_MRO_MAX_NAMES];
+    size_t count;
+} P2C_NameList;
+
+typedef struct {
+    char *base;
+    size_t used;
+} P2C_MroArena;
+
+/* MRO文字列（"B,C,A"形式）をコピーせずに走査するための範囲。 */
+typedef struct {
+    const char *ptr;
+    size_t len;
+} P2C_NameSpan;
+
+/* クラス名はクラスオブジェクトやbase_nameに紐づく文字列を指すだけでよいが、
+ * strtok_rが書き換える一時バッファは関数を抜けると消えるため、線形化の間だけ
+ * 有効なアリーナへコピーして寿命を揃える。 */
+static const char* p2c_mro_intern(P2C_MroArena *arena, const char *text, size_t len) {
+    if (!arena || !text) return NULL;
+    if (len + 1u > (size_t)P2C_MRO_ARENA_BYTES - arena->used) return NULL;
+    char *slot = arena->base + arena->used;
+    memcpy(slot, text, len);
+    slot[len] = '\0';
+    arena->used += len + 1u;
+    return slot;
+}
+
+static bool p2c_name_list_add(P2C_NameList *list, const char *name) {
+    if (!list || !name || !name[0]) return false;
+    for (size_t i = 0; i < list->count; i++) {
+        if (strcmp(list->names[i], name) == 0) return true;
     }
+    if (list->count >= P2C_MRO_MAX_NAMES) return false;
+    list->names[list->count] = name;
+    list->count++;
+    return true;
+}
+
+static bool p2c_name_list_has_from(const P2C_NameList *list, size_t from, const char *name) {
+    for (size_t i = from; i < list->count; i++) {
+        if (strcmp(list->names[i], name) == 0) return true;
+    }
+    return false;
+}
+
+/* C3のmerge。lists[0..nlists-1]の先頭から、他のどのリストの末尾にも現れない
+ * 名前を1つずつ取り出してoutへ移す。取り出せる名前が無ければ階層が一貫して
+ * いない（循環など）ためfalseを返す。 */
+static bool p2c_c3_merge(P2C_NameList *const *lists, size_t nlists, P2C_NameList *out) {
+    size_t remaining = 0;
+    for (size_t i = 0; i < nlists; i++) remaining += lists[i]->count;
+    while (remaining > 0) {
+        bool took = false;
+        for (size_t i = 0; i < nlists && !took; i++) {
+            if (lists[i]->count == 0) continue;
+            const char *candidate = lists[i]->names[0];
+            bool blocked = false;
+            for (size_t j = 0; j < nlists && !blocked; j++) {
+                if (j == i || lists[j]->count == 0) continue;
+                if (p2c_name_list_has_from(lists[j], 1, candidate)) blocked = true;
+            }
+            if (blocked) continue;
+            if (!p2c_name_list_add(out, candidate)) return false;
+            for (size_t j = 0; j < nlists; j++) {
+                if (lists[j]->count > 0 && strcmp(lists[j]->names[0], candidate) == 0) {
+                    memmove(&lists[j]->names[0], &lists[j]->names[1],
+                            (lists[j]->count - 1) * sizeof(const char*));
+                    lists[j]->count--;
+                }
+            }
+            remaining = 0;
+            for (size_t j = 0; j < nlists; j++) remaining += lists[j]->count;
+            took = true;
+        }
+        if (!took) return false;
+    }
+    return true;
+}
+
+/* outの先頭には自分自身の名前が入る。 */
+static bool p2c_c3_linearize(P2C_Object *cls_obj, P2C_NameList *out, P2C_MroArena *arena, int depth) {
+    if (!cls_obj || !out || !arena || depth > P2C_MRO_MAX_DEPTH) return false;
+    if (!p2c_name_list_add(out, cls_obj->u.v_class.name)) return false;
     const char *bases = cls_obj->u.v_class.base_name;
-    if (!bases || !bases[0]) return NULL;
+    if (!bases || !bases[0]) return true;
     char buf[512];
     size_t blen = strlen(bases);
-    if (blen >= sizeof(buf)) blen = sizeof(buf) - 1;
-    memcpy(buf, bases, blen);
-    buf[blen] = '\0';
+    if (blen >= sizeof(buf)) return false;
+    memcpy(buf, bases, blen + 1u);
+    P2C_NameList direct;
+    P2C_NameList sub_lists[P2C_MRO_MAX_BASES];
+    P2C_NameList *all_lists[P2C_MRO_MAX_BASES + 1];
+    size_t nsub = 0;
+    direct.count = 0;
     char *save = NULL;
     for (char *tok = strtok_r(buf, ",", &save); tok; tok = strtok_r(NULL, ",", &save)) {
-        P2C_Object *base_cls = p2c_find_class_by_name(tok);
-        if (base_cls) {
-            P2C_MethodDef *found = p2c_find_method_in_chain(base_cls, name);
-            if (found) return found;
+        /* 直接の基底が上限を超える階層はC3を諦めて従来の深さ優先へ委ねる
+         * （スタック使用量を有界に保つため）。 */
+        if (nsub >= P2C_MRO_MAX_BASES) return false;
+        const char *interned = p2c_mro_intern(arena, tok, strlen(tok));
+        if (!interned) return false;
+        if (!p2c_name_list_add(&direct, interned)) return false;
+        sub_lists[nsub].count = 0;
+        /* 未登録の基底（組み込み例外名など）は名前だけを1要素リストとして残し、
+         * MROには含める（解決順の比較には名前で十分なため）。 */
+        P2C_Object *base_cls = p2c_find_class_by_name(interned);
+        if (base_cls && base_cls != cls_obj) {
+            if (!p2c_c3_linearize(base_cls, &sub_lists[nsub], arena, depth + 1)) return false;
+        } else if (!p2c_name_list_add(&sub_lists[nsub], interned)) {
+            return false;
         }
+        all_lists[nsub] = &sub_lists[nsub];
+        nsub++;
+    }
+    all_lists[nsub] = &direct;
+    P2C_NameList tail;
+    tail.count = 0;
+    if (!p2c_c3_merge(all_lists, nsub + 1, &tail)) return false;
+    for (size_t i = 0; i < tail.count; i++) {
+        if (!p2c_name_list_add(out, tail.names[i])) return false;
+    }
+    return true;
+}
+
+/* C3を計算できない階層向けのフォールバック。以前の実装と同じ「左の基底から
+ * 順に深さ優先で訪問した順序」を重複除去して並べる。 */
+static bool p2c_mro_dfs_collect(P2C_Object *cls_obj, P2C_NameList *out, P2C_MroArena *arena, int depth) {
+    if (!cls_obj || !out || !arena || depth > P2C_MRO_MAX_DEPTH) return false;
+    const char *bases = cls_obj->u.v_class.base_name;
+    if (!bases || !bases[0]) return true;
+    char buf[512];
+    size_t blen = strlen(bases);
+    if (blen >= sizeof(buf)) return false;
+    memcpy(buf, bases, blen + 1u);
+    char *save = NULL;
+    for (char *tok = strtok_r(buf, ",", &save); tok; tok = strtok_r(NULL, ",", &save)) {
+        const char *interned = p2c_mro_intern(arena, tok, strlen(tok));
+        if (!interned) return false;
+        if (!p2c_name_list_add(out, interned)) return false;
+        P2C_Object *base_cls = p2c_find_class_by_name(interned);
+        if (base_cls && base_cls != cls_obj) {
+            if (!p2c_mro_dfs_collect(base_cls, out, arena, depth + 1)) return false;
+        }
+    }
+    return true;
+}
+
+/* list[from..]の名前をカンマで連結したヒープ文字列を作る。 */
+static char* p2c_mro_join(const P2C_NameList *list, size_t from) {
+    size_t total = 1u;
+    for (size_t i = from; i < list->count; i++) total += strlen(list->names[i]) + 1u;
+    char *joined = (char*)p2c_malloc_checked(total, "class MRO");
+    if (!joined) return NULL;
+    size_t pos = 0;
+    for (size_t i = from; i < list->count; i++) {
+        size_t len = strlen(list->names[i]);
+        if (i > from) joined[pos++] = ',';
+        memcpy(joined + pos, list->names[i], len);
+        pos += len;
+    }
+    joined[pos] = '\0';
+    return joined;
+}
+
+/* クラスのMRO（自分自身を除く解決順）を返す。初回だけ計算してキャッシュする。
+ * 計算自体に失敗した場合も「継承なし」を表す空文字列を返し、毎回の再計算を防ぐ。 */
+static const char* p2c_class_mro(P2C_Object *cls_obj) {
+    if (!cls_obj || !cls_obj->cls || cls_obj->cls->type_tag != OBJ_CLASS) return NULL;
+    if (cls_obj->u.v_class.mro) return cls_obj->u.v_class.mro;
+    char arena_buf[P2C_MRO_ARENA_BYTES];
+    P2C_MroArena arena;
+    P2C_NameList order;
+    arena.base = arena_buf;
+    arena.used = 0;
+    order.count = 0;
+    if (!p2c_c3_linearize(cls_obj, &order, &arena, 0)) {
+        order.count = 0;
+        arena.used = 0;
+        if (!p2c_mro_dfs_collect(cls_obj, &order, &arena, 0)) order.count = 0;
+    }
+    char *joined = p2c_mro_join(&order, 1);
+    cls_obj->u.v_class.mro = joined ? joined : p2c_strdup_local("");
+    return cls_obj->u.v_class.mro;
+}
+
+/* MRO文字列から次の名前を取り出す。offsetは呼び出し側が0で初期化し、名前が
+ * 尽きたらfalseを返す。名前はコピーしない（呼び出し中はMRO文字列が生存する）。 */
+static bool p2c_mro_next(const char *mro, size_t *offset, P2C_NameSpan *out) {
+    if (!mro || !offset || !out) return false;
+    size_t i = *offset;
+    if (mro[i] == '\0') return false;
+    size_t start = i;
+    while (mro[i] != '\0' && mro[i] != ',') i++;
+    out->ptr = mro + start;
+    out->len = i - start;
+    if (mro[i] == ',') i++;
+    *offset = i;
+    return out->len > 0;
+}
+
+static bool p2c_name_span_equals(const P2C_NameSpan *span, const char *name) {
+    if (!span || !name) return false;
+    return strlen(name) == span->len && memcmp(name, span->ptr, span->len) == 0;
+}
+
+static P2C_Object* p2c_find_class_by_span(const P2C_NameSpan *span) {
+    if (!span || span->len == 0) return NULL;
+    for (int i = 0; i < g_class_registry_count; i++) {
+        const char *name = g_class_registry_names[i];
+        if (name && p2c_name_span_equals(span, name)) return g_class_registry_objs[i];
     }
     return NULL;
 }
 
-/* isinstance / has_method 用: base_nameのカンマ区切りリストのいずれかに一致するか、
- * さらにその先の基底クラスも再帰的に確認する。 */
+static P2C_MethodDef* p2c_find_own_method(P2C_Object *cls_obj, const char *name) {
+    if (!cls_obj || !name) return NULL;
+    for (P2C_MethodDef *m = cls_obj->u.v_class.methods; m && m->name; m++) {
+        if (strcmp(m->name, name) == 0) return m;
+    }
+    return NULL;
+}
+
+/* メソッドの解決。自クラス → MRO順の基底クラス。PythonのMROに従うため、
+ * ダイヤモンド継承でも基底の選択がCPythonと一致する。 */
+static P2C_MethodDef* p2c_find_method_in_chain(P2C_Object *cls_obj, const char *name) {
+    if (!cls_obj || !name) return NULL;
+    P2C_MethodDef *own = p2c_find_own_method(cls_obj, name);
+    if (own) return own;
+    const char *mro = p2c_class_mro(cls_obj);
+    size_t offset = 0;
+    P2C_NameSpan span;
+    while (p2c_mro_next(mro, &offset, &span)) {
+        P2C_Object *base_cls = p2c_find_class_by_span(&span);
+        if (!base_cls) continue;
+        P2C_MethodDef *found = p2c_find_own_method(base_cls, name);
+        if (found) return found;
+    }
+    return NULL;
+}
+
+/* クラス本体の代入（メソッド以外のクラス属性）をMRO順に探す。
+ * Python同様、サブクラスのインスタンスから基底クラスのクラス属性が見える。 */
+static P2C_Object* p2c_class_attr_along_mro(P2C_Object *cls_obj, const char *name) {
+    if (!cls_obj || !name || !cls_obj->cls || cls_obj->cls->type_tag != OBJ_CLASS) return NULL;
+    if (cls_obj->u.v_class.attrs) {
+        P2C_Object *val = attr_map_get(cls_obj->u.v_class.attrs, name);
+        if (val) return val;
+    }
+    const char *mro = p2c_class_mro(cls_obj);
+    size_t offset = 0;
+    P2C_NameSpan span;
+    while (p2c_mro_next(mro, &offset, &span)) {
+        P2C_Object *base_cls = p2c_find_class_by_span(&span);
+        if (!base_cls || !base_cls->u.v_class.attrs) continue;
+        P2C_Object *val = attr_map_get(base_cls->u.v_class.attrs, name);
+        if (val) return val;
+    }
+    return NULL;
+}
+
+/* obj.method を値として取り出したとき（m = obj.method、sorted(key=obj.key) など）
+ * に返す「束縛メソッド」。呼び出し時は元のインスタンスをselfとしてメソッドへ
+ * 転送する。環境辞書（selfとメソッド名）を持つクロージャとして実装するため、
+ * 新しいOBJ型やGCルートを増やさずに済み、GCの走査対象
+ * （関数オブジェクトのenv辞書）にもそのまま乗る。 */
+static P2C_Object* p2c_bound_method_dispatch(P2C_Object *env, P2C_Object **args, size_t nargs) {
+    if (!env || !env->cls || env->cls->type_tag != OBJ_DICT) {
+        p2c_raise(p2c_make_exception("TypeError", "invalid bound method receiver"));
+        return &P2C_None;
+    }
+    P2C_Object *bound_self = p2c_dict_get_with_default(env, p2c_obj_from_str("self"), &P2C_None);
+    P2C_Object *bound_name = p2c_dict_get_with_default(env, p2c_obj_from_str("name"), &P2C_None);
+    if (!bound_self || bound_self == &P2C_None || !p2c_obj_is_str(bound_name)) {
+        p2c_raise(p2c_make_exception("TypeError", "invalid bound method"));
+        return &P2C_None;
+    }
+    return p2c_call_attr(bound_self, p2c_obj_as_str(bound_name), args, nargs);
+}
+
+static P2C_Object* p2c_bound_method_new(P2C_Object *self_obj, const char *name) {
+    P2C_Object *env = p2c_dict_new();
+    if (!env) return &P2C_None;
+    p2c_dict_set(env, p2c_obj_from_str("self"), self_obj);
+    p2c_dict_set(env, p2c_obj_from_str("name"), p2c_obj_from_str(name));
+    return p2c_closure_new(name, p2c_bound_method_dispatch, env);
+}
+
+/* super().method(...) の解決。Pythonでは「インスタンスの型のMRO上で、そのメソッドを
+ * 定義しているクラスの次」から探索する。defining_class（メソッド本体を書いたクラス）
+ * を受け取り、selfの実際の型のMROで defining_class の次から name を持つメソッドを
+ * 探して self を束縛して呼ぶ。コード生成時に基底チェーンを静的に辿る近似と違い、
+ * 多重継承のダイヤモンド（class D(B, C)、B(A)、C(A)）でもCPythonと同じ実装が選ばれる。 */
+P2C_Object* p2c_super_call_attr(P2C_Object *self, P2C_Object *defining_class, const char *name, P2C_Object **args, size_t nargs) {
+    if (!self || !self->cls || self->cls->type_tag != OBJ_INSTANCE || !name) {
+        p2c_raise(p2c_make_exception("TypeError", "super() requires an instance method receiver"));
+        return &P2C_None;
+    }
+    P2C_Object *klass = self->u.v_instance.klass;
+    const char *def_name = (defining_class && defining_class->cls && defining_class->cls->type_tag == OBJ_CLASS)
+        ? defining_class->u.v_class.name : NULL;
+    if (!def_name) {
+        /* 呼び出し元のクラスが分からない場合は、自クラスの次という情報が無いため、
+         * インスタンスのクラス自身（＝最も自然な既定）から探索する。 */
+        P2C_MethodDef *own = p2c_find_own_method(klass, name);
+        if (own) return own->func(self, args, nargs);
+    }
+    const char *mro = p2c_class_mro(klass);
+    size_t offset = 0;
+    P2C_NameSpan span;
+    /* MROリストは「自分自身を除く」並びなので、defining_classがインスタンスの
+     * クラス自身なら先頭から、そうでなければMRO上でdefining_classの次から探索する
+     * （Pythonの super() はメソッドを定義しているクラス自身を飛ばす）。 */
+    bool skipping = def_name != NULL &&
+        !(klass->u.v_class.name && strcmp(klass->u.v_class.name, def_name) == 0);
+    while (p2c_mro_next(mro, &offset, &span)) {
+        if (skipping) {
+            if (p2c_name_span_equals(&span, def_name)) skipping = false;
+            continue;
+        }
+        P2C_Object *base_cls = p2c_find_class_by_span(&span);
+        if (!base_cls) continue;
+        P2C_MethodDef *found = p2c_find_own_method(base_cls, name);
+        if (found) return found->func(self, args, nargs);
+    }
+    p2c_raise(p2c_make_exception("AttributeError", name));
+    return &P2C_None;
+}
+
+/* isinstance 用: クラス自身またはMRO上の基底クラス名に一致するか。
+ * MRO文字列はC3線形化（失敗時は深さ優先の訪問順）なので、名前の一致判定は
+ * 従来の再帰的な探索と同じか、より多くの基底名（未登録の基底名もMROに残る）を
+ * 見る。Pythonのisinstanceの判定に近づく方向の変更で、結果は広がるのみ。 */
 static bool p2c_class_chain_has_name(P2C_Object *cls_obj, const char *target_name) {
-    if (!cls_obj) return false;
+    if (!cls_obj || !target_name || !target_name[0]) return false;
     if (cls_obj->u.v_class.name && strcmp(cls_obj->u.v_class.name, target_name) == 0) return true;
-    const char *bases = cls_obj->u.v_class.base_name;
-    if (!bases || !bases[0]) return false;
-    char buf[512];
-    size_t blen = strlen(bases);
-    if (blen >= sizeof(buf)) blen = sizeof(buf) - 1;
-    memcpy(buf, bases, blen);
-    buf[blen] = '\0';
-    char *save = NULL;
-    for (char *tok = strtok_r(buf, ",", &save); tok; tok = strtok_r(NULL, ",", &save)) {
-        P2C_Object *base_cls = p2c_find_class_by_name(tok);
-        if (base_cls && p2c_class_chain_has_name(base_cls, target_name)) return true;
+    const char *mro = p2c_class_mro(cls_obj);
+    size_t offset = 0;
+    P2C_NameSpan span;
+    while (p2c_mro_next(mro, &offset, &span)) {
+        if (p2c_name_span_equals(&span, target_name)) return true;
     }
     return false;
 }
@@ -1714,6 +2050,9 @@ bool p2c_isinstance_of_class(P2C_Object *obj, const char *class_name) {
 
 bool p2c_isinstance_of_object(P2C_Object *obj, P2C_Object *class_obj) {
     if (!class_obj || !class_obj->cls || class_obj->cls->type_tag != OBJ_CLASS) return false;
+    /* クラスオブジェクトの同一性で判定できる場合はそれを使う。名前ベースの
+     * 判定はフォールバックとして残す（組み込み型や名前で保持された継承関係用）。 */
+    if (obj && obj->cls && obj->cls->type_tag == OBJ_INSTANCE && obj->u.v_instance.klass == class_obj) return true;
     return p2c_isinstance_of_class(obj, class_obj->u.v_class.name);
 }
 
@@ -1738,6 +2077,8 @@ P2C_Object* p2c_builtin_type(P2C_Object *obj) {
         case OBJ_SET: tn = "set"; break;
         case OBJ_INSTANCE: tn = (obj->u.v_instance.klass && obj->u.v_instance.klass->u.v_class.name) ? obj->u.v_instance.klass->u.v_class.name : "object"; break;
         case OBJ_EXCEPTION: tn = obj->u.v_exception.type_name ? obj->u.v_exception.type_name : "Exception"; break;
+        case OBJ_CLASS: tn = "type"; break;
+        case OBJ_MODULE: tn = "module"; break;
         default: break;
     }
     /* 実際のtypeオブジェクトは表現していないため、print(type(x))で表示した際に
@@ -3344,6 +3685,14 @@ void p2c_runtime_free(void *ptr) { p2c_heap_free(ptr); }
 
 void p2c_raise(P2C_Object *exc) {
     if (!exc) exc = p2c_make_exception("RuntimeError", "unknown error");
+    if (!exc) {
+        /* 例外オブジェクトの生成自体に失敗した場合（メモリ枯渇）。NULLを
+         * 例外として伝播させるとハンドラ側で落ちるため、ここで安全に停止する
+         * （-fanalyzer が指摘した経路）。 */
+        p2c_platform_write("Exception\n: out of memory while creating exception object\n");
+        p2c_platform_abort("unhandled exception");
+        return;
+    }
     if (p2c_exc_stack) { p2c_exc_stack->exc = exc; P2C_LONGJMP(p2c_exc_stack->env, 1); }
     if (exc->cls && exc->cls->type_tag == OBJ_EXCEPTION) {
         p2c_platform_write(exc->u.v_exception.type_name ? exc->u.v_exception.type_name : "Exception");
@@ -3405,9 +3754,11 @@ bool p2c_exc_name_match(P2C_Object *exc, const char *type_name) {
     if (!type_name || !*type_name) return true;
     if (exc->cls && exc->cls->type_tag == OBJ_EXCEPTION) return strcmp(exc->u.v_exception.type_name ? exc->u.v_exception.type_name : "", type_name) == 0 || strcmp(type_name, "Exception") == 0;
     if (exc->cls && exc->cls->type_tag == OBJ_INSTANCE && exc->u.v_instance.klass && exc->u.v_instance.klass->cls && exc->u.v_instance.klass->cls->type_tag == OBJ_CLASS) {
-        const char *name = exc->u.v_instance.klass->u.v_class.name ? exc->u.v_instance.klass->u.v_class.name : "";
-        const char *base = exc->u.v_instance.klass->u.v_class.base_name ? exc->u.v_instance.klass->u.v_class.base_name : "";
-        return strcmp(name, type_name) == 0 || strcmp(base, type_name) == 0 || strcmp(type_name, "Exception") == 0;
+        /* 以前は直接の基底名(base_name)しか比較しておらず、基底が2段以上先に
+         * ある例外階層（class A(Exception); class B(A); で except A）を捕捉
+         * できなかった。MRO上の名前と比較して階層を辿れるようにする。 */
+        if (strcmp(type_name, "Exception") == 0) return true;
+        return p2c_class_chain_has_name(exc->u.v_instance.klass, type_name);
     }
     return false;
 }
@@ -4287,13 +4638,47 @@ P2C_Object* p2c_obj_repr(P2C_Object *obj) {
     return out;
 }
 
-/* min/max/sortedで使う比較。数値だけでなく文字列の辞書式比較にも対応する
- * （p2c_obj_lt等は数値専用のため、文字列同士の比較では常にfalseになってしまう）。 */
+static bool p2c_obj_less(P2C_Object *a, P2C_Object *b);
+
+/* タプル/リスト同士の辞書式比較（Pythonの系列比較規則）。
+ * 先頭から要素ごとに比べ、最初に大小がついた要素で決まる。共通部分が等しく
+ * 長さが違う場合は短い方が小さい。
+ * 以前はタプルを整数として扱っていたため、sorted([(2, 1), (1, 1)]) や
+ * min((a, b) for ...) が黙って「比較していない」結果を返していた。 */
+static bool p2c_sequence_less(P2C_Object *a, P2C_Object *b) {
+    int64_t na = p2c_len(a);
+    int64_t nb = p2c_len(b);
+    int64_t n = na < nb ? na : nb;
+    for (int64_t i = 0; i < n; i++) {
+        P2C_Object *ea = p2c_iter_at(a, i);
+        P2C_Object *eb = p2c_iter_at(b, i);
+        if (p2c_obj_less(ea, eb)) return true;
+        if (p2c_obj_less(eb, ea)) return false;
+    }
+    return na < nb;
+}
+
+/* min/max/sortedで使う比較。数値・文字列・系列（タプル/リスト）に対応する。
+ * （p2c_obj_lt等は数値専用のため、文字列同士の比較では常にfalseになってしまう。） */
 static bool p2c_obj_less(P2C_Object *a, P2C_Object *b) {
+    bool a_seq, b_seq, a_num, b_num;
+    if (a == b) return false;
     if (a && b && p2c_obj_is_str(a) && p2c_obj_is_str(b)) {
         return strcmp(p2c_obj_as_str(a), p2c_obj_as_str(b)) < 0;
     }
-    return (p2c_obj_is_float(a) || p2c_obj_is_float(b)) ? (p2c_obj_as_float(a) < p2c_obj_as_float(b)) : (p2c_obj_as_int(a) < p2c_obj_as_int(b));
+    a_seq = a && (p2c_obj_is_tuple(a) || p2c_obj_is_list(a));
+    b_seq = b && (p2c_obj_is_tuple(b) || p2c_obj_is_list(b));
+    if (a_seq && b_seq) return p2c_sequence_less(a, b);
+    a_num = a && (p2c_obj_is_int(a) || p2c_obj_is_float(a) || p2c_obj_is_bool(a));
+    b_num = b && (p2c_obj_is_int(b) || p2c_obj_is_float(b) || p2c_obj_is_bool(b));
+    if (a_num && b_num) {
+        return (p2c_obj_is_float(a) || p2c_obj_is_float(b)) ? (p2c_obj_as_float(a) < p2c_obj_as_float(b)) : (p2c_obj_as_int(a) < p2c_obj_as_int(b));
+    }
+    /* 数値・文字列・系列以外（None、dict、インスタンス等）はPython同様に順序を
+     * 持たない。以前は整数0として比較しており、sorted()が黙って未ソートの結果を
+     * 返していたため、CPythonと同じくTypeErrorにする。 */
+    p2c_raise(p2c_make_exception("TypeError", "'<' not supported between instances of these types"));
+    return false;
 }
 
 P2C_Object* p2c_obj_abs(P2C_Object *obj) {
@@ -4519,6 +4904,48 @@ P2C_Object* p2c_builtin_int_base(P2C_Object *obj, unsigned base, const char *pre
     while (count > 0) out[pos++] = reversed[--count];
     return p2c_obj_from_str_n(out, pos);
 }
+/* キー列を使った安定マージソートの再帰部分。items/keysのlo..hi-1をソートする。
+ * 比較関数はp2c_obj_less（順序を持たない型ではTypeErrorを送出する）。 */
+static void p2c_merge_sort_run(P2C_Object **items, P2C_Object **keys, P2C_Object **tmp_items, P2C_Object **tmp_keys, size_t lo, size_t hi, bool descending) {
+    size_t mid, i, j, k;
+    if (hi - lo < 2) return;
+    mid = lo + (hi - lo) / 2;
+    p2c_merge_sort_run(items, keys, tmp_items, tmp_keys, lo, mid, descending);
+    p2c_merge_sort_run(items, keys, tmp_items, tmp_keys, mid, hi, descending);
+    i = lo; j = mid; k = lo;
+    while (i < mid && j < hi) {
+        /* 右の要素が「より小さい」ときだけ右を先に取り、それ以外は左を先に取る。
+         * これで昇順・降順いずれでも同じキーの相対順序が保たれる（安定）。 */
+        bool take_left = descending ? !p2c_obj_less(keys[i], keys[j]) : !p2c_obj_less(keys[j], keys[i]);
+        if (take_left) { tmp_items[k] = items[i]; tmp_keys[k] = keys[i]; i++; }
+        else { tmp_items[k] = items[j]; tmp_keys[k] = keys[j]; j++; }
+        k++;
+    }
+    while (i < mid) { tmp_items[k] = items[i]; tmp_keys[k] = keys[i]; i++; k++; }
+    while (j < hi) { tmp_items[k] = items[j]; tmp_keys[k] = keys[j]; j++; k++; }
+    for (k = lo; k < hi; k++) { items[k] = tmp_items[k]; keys[k] = tmp_keys[k]; }
+}
+
+/* sorted()/list.sort()の並べ替え。以前は挿入ソート（O(n^2)）だったため、
+ * 要素数の多いリストでは実用時間に収まらなかった。CPythonと同じ安定な
+ * マージソート（O(n log n)）に置き換える。 */
+static void p2c_stable_sort(P2C_Object **items, P2C_Object **keys, size_t n, bool descending) {
+    P2C_Object **tmp_items;
+    P2C_Object **tmp_keys;
+    if (n < 2) return;
+    tmp_items = (P2C_Object**)p2c_malloc_checked(n * sizeof(P2C_Object*), "sort items");
+    tmp_keys = (P2C_Object**)p2c_malloc_checked(n * sizeof(P2C_Object*), "sort keys");
+    if (!tmp_items || !tmp_keys) {
+        p2c_heap_free(tmp_items);
+        p2c_heap_free(tmp_keys);
+        p2c_raise(p2c_make_exception("MemoryError", "sorted() scratch allocation failed"));
+        return;
+    }
+    p2c_merge_sort_run(items, keys, tmp_items, tmp_keys, 0, n, descending);
+    p2c_heap_free(tmp_items);
+    p2c_heap_free(tmp_keys);
+}
+
 P2C_Object* p2c_builtin_sorted_key(P2C_Object *iterable, P2C_Object *key, P2C_Object *reverse) {
     size_t n = 0;
     bool owned = false;
@@ -4537,21 +4964,7 @@ P2C_Object* p2c_builtin_sorted_key(P2C_Object *iterable, P2C_Object *key, P2C_Ob
         tmp[i] = items[i];
         keys[i] = key && !p2c_obj_is_none(key) ? p2c_call(key, &tmp[i], 1) : tmp[i];
     }
-    for (size_t i = 1; i < n; i++) {
-        P2C_Object *item = tmp[i];
-        P2C_Object *item_key = keys[i];
-        size_t j = i;
-        while (j > 0) {
-            bool descending = reverse && p2c_obj_is_truthy(reverse);
-            bool before = descending ? p2c_obj_less(keys[j - 1], item_key) : p2c_obj_less(item_key, keys[j - 1]);
-            if (!before) break;
-            tmp[j] = tmp[j - 1];
-            keys[j] = keys[j - 1];
-            j--;
-        }
-        tmp[j] = item;
-        keys[j] = item_key;
-    }
+    p2c_stable_sort(tmp, keys, n, reverse && p2c_obj_is_truthy(reverse));
     for (size_t i = 0; i < n; i++) p2c_list_append(out, tmp[i]);
     p2c_heap_free(tmp);
     p2c_heap_free(keys);
@@ -4599,12 +5012,21 @@ P2C_Object* p2c_builtin_round(P2C_Object *x, P2C_Object *ndigits) {
     }
     /* round(x, ndigits) -> float */
     int64_t nd = p2c_obj_as_int(ndigits);
-    char fmt[32];
-    snprintf(fmt, sizeof(fmt), "%.*f", (int)(nd > 0 ? nd : 0), v);
+    /* %.*f の出力長は「値の整数部（最大約309桁）+ 小数点 + 精度」で決まるため、
+     * 精度を現実的な上限へ制限したうえで十分なバッファを確保する
+     * （CPythonのroundも桁数を制限している）。 */
+    char fmt[512];
+    int64_t precision = nd > 0 ? nd : 0;
+    if (precision > 64) precision = 64;
+    snprintf(fmt, sizeof(fmt), "%.*f", (int)precision, v);
     return p2c_obj_from_float(strtod(fmt, NULL));
 #else
+    /* freestandingではround()を使えないため、0桁丸めの近似実装にする
+     * （関数呼び出し結果を直接キャストすると -Wbad-function-cast になるため
+     * 一度変数へ受ける）。 */
     (void)ndigits;
-    return p2c_obj_from_int((int64_t)p2c_obj_as_float(x));
+    double value = p2c_obj_as_float(x);
+    return p2c_obj_from_int((int64_t)value);
 #endif
 }
 
@@ -4775,10 +5197,13 @@ P2C_Object* p2c_builtin_map(P2C_Object *fn, P2C_Object *iterable) {
     size_t n = 0; bool owned = false;
     P2C_Object **items = p2c_iter_items(iterable, &n, &owned);
     P2C_Object *out = p2c_list_new();
-    if (!fn || !fn->u.v_function.func) { if (owned) p2c_heap_free(items); return out; }
+    /* 呼び出しは必ず p2c_call 経由にする（関数オブジェクト・クロージャ・
+     * 束縛メソッド・クラスを同じ規則で扱う）。以前は v_function.func を直接
+     * 呼んでいたため、クロージャや束縛メソッド（func==NULL）を渡すと
+     * 呼び出しをスキップして空リストを返す、という静かな誤りになっていた。 */
     for (size_t i = 0; i < n; i++) {
         P2C_Object *args[1] = { items[i] };
-        P2C_Object *result = fn->u.v_function.func(args, 1);
+        P2C_Object *result = p2c_call(fn, args, 1);
         p2c_list_append(out, result ? result : &P2C_None);
     }
     if (owned) p2c_heap_free(items);
@@ -4792,12 +5217,14 @@ P2C_Object* p2c_builtin_filter(P2C_Object *fn, P2C_Object *iterable) {
     P2C_Object *out = p2c_list_new();
     for (size_t i = 0; i < n; i++) {
         bool keep;
-        if (!fn || fn == &P2C_None || !fn->u.v_function.func) {
+        if (!fn || fn == &P2C_None) {
             keep = p2c_obj_is_truthy(items[i]);
         } else {
+            /* クロージャ・束縛メソッドも呼べるよう p2c_call 経由にする
+             * （以前は v_function.func が無い述語をNone扱いして、
+             * 黙ってtruthyフィルタとして動いていた）。 */
             P2C_Object *args[1] = { items[i] };
-            P2C_Object *result = fn->u.v_function.func(args, 1);
-            keep = p2c_obj_is_truthy(result);
+            keep = p2c_obj_is_truthy(p2c_call(fn, args, 1));
         }
         if (keep) p2c_list_append(out, items[i]);
     }
@@ -4908,14 +5335,24 @@ static P2C_Object* getattr_raw(P2C_Object *obj, const char *name) {
         case OBJ_INSTANCE: {
             P2C_Object *val = attr_map_get(obj->u.v_instance.attrs, name);
             if (val) return val;
-            if (obj->u.v_instance.klass && obj->u.v_instance.klass->u.v_class.attrs) {
-                val = attr_map_get(obj->u.v_instance.klass->u.v_class.attrs, name);
-                if (val) return val;
+            /* クラス属性は基底クラスも含めてMRO順に探す（Python同様、サブクラスの
+             * インスタンスから基底クラスのクラス属性が見える）。以前は自分の
+             * クラスのattrsしか見ておらず、class B(A) のインスタンスでA側の
+             * クラス属性を読むとAttributeErrorになっていた。 */
+            val = p2c_class_attr_along_mro(obj->u.v_instance.klass, name);
+            if (val) return val;
+            /* メソッドを値として取り出す場合（m = obj.method、sorted(key=obj.key)
+             * など）は束縛メソッドを返す。以前はここでNULLを返しており、
+             * obj.method() の呼び出し形以外はAttributeErrorになっていた。 */
+            if (p2c_find_method_in_chain(obj->u.v_instance.klass, name)) {
+                return p2c_bound_method_new(obj, name);
             }
             return NULL;
         }
         case OBJ_CLASS:
-            return attr_map_get(obj->u.v_class.attrs, name);
+            /* クラスオブジェクトの属性も基底クラスを辿る（class D(B) で D.x が
+             * Bのクラス属性を見つける）。 */
+            return p2c_class_attr_along_mro(obj, name);
         case OBJ_MODULE:
             return attr_map_get(obj->u.v_module.attrs, name);
         case OBJ_EXCEPTION:

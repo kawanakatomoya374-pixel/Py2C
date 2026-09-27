@@ -158,9 +158,22 @@ static void handle_run(int client_fd, const char *src) {
     char *cmd = (char*)malloc(cmd_cap);
     char compile_log[4096] = {0};
     if (cmd) {
+#if defined(__GNUC__) && !defined(__clang__)
+/* バッファ長は直上のstrlen計算から求めているため実際に切り詰めは起きないが、
+
+ * GCCの範囲解析は「char[4096]のフィールドは最大4095バイト」と仮定するため
+
+ * -Wformat-truncation を誤検出する。この呼び出しに限り明示的に抑止する。 */
+
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-truncation"
+#endif
         snprintf(cmd, cmd_cap,
             "%s -I\"%s\" -std=c11 \"%s\" \"%s\" \"%s\" \"%s\" \"%s\" \"%s\" -lm -o \"%s\" 2>&1",
             cc, loc.include_dir, c_path, loc.runtime_c, loc.common_c, loc.platform_core_c, loc.platform_c, loc.pygame_c, bin_path);
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
         FILE *p = popen(cmd, "r");
         if (p) {
             size_t got = fread(compile_log, 1, sizeof(compile_log) - 1, p);

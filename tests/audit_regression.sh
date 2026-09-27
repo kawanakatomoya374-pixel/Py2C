@@ -45,12 +45,14 @@ compile_and_run bitops_alpha06
 printf '%s\n' '1 7 6 -6' '48 16 -5' '34' > "$TMP/bitops_alpha06.expected"
 diff -u "$TMP/bitops_alpha06.expected" "$TMP/bitops_alpha06.out"
 
-if "$BIN" "$ROOT/tests/audit_semantics.py" -o "$TMP/finally.c" > "$TMP/finally.out" 2>&1; then
-    echo 'expected finally control-flow diagnostic was not emitted' >&2
-    exit 1
-fi
-grep -F 'inside finally are not supported' "$TMP/finally.out" >/dev/null
-printf '%s\n' 'C77: finally control-flow diagnostic passed'
+# C77: finally内のreturn/break/continueは、finally本体を実行したうえで
+# 進行中の制御フローを上書きする（Pythonと同じ）。以前は安全側に倒して
+# 意味解析エラーにしていたが、生成Cがクリーンアップフレームで正しく扱えるように
+# なったため受理し、CPythonと出力が一致することを回帰として固定する。
+compile_and_run finally_control_flow_alpha06
+python3 "$ROOT/tests/finally_control_flow_alpha06.py" > "$TMP/finally_control_flow_alpha06.expected"
+diff -u "$TMP/finally_control_flow_alpha06.expected" "$TMP/finally_control_flow_alpha06.out"
+printf '%s\n' 'C77: finally control-flow semantics passed'
 
 compile_and_run nonlocal_audit_alpha06
 printf '%s\n' '12 14 14' > "$TMP/nonlocal_audit_alpha06.expected"

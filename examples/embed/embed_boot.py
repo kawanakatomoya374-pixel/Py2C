@@ -34,6 +34,28 @@ class Sensor:
         return "Sensor(" + self.name + ")"
 
 
+class Bus:
+    """ネストクラスのデモ: Channel は Bus のクラス本体で定義する。
+
+    生成Cでは外側クラス名を前置した C 名（Bus__Channel）になり、
+    Bus の __classobj() が属性として登録する。カーネル側のヒープだけで
+    動くため、組込み環境でもそのまま動く。
+    """
+
+    label = "spi0"
+
+    class Channel:
+        def __init__(self, index, scale):
+            self.index = index
+            self.scale = scale
+
+        def read(self, raw):
+            return raw * self.scale
+
+    def channel(self, index, scale):
+        return Bus.Channel(index, scale)
+
+
 def boot():
     samples = [3, 1, 4, 1, 5, 9, 2, 6]
     try:
@@ -46,6 +68,9 @@ def boot():
     print("odd squares", odd_squares)
     sensor = Sensor("temp", 3)
     print(sensor, sensor.read(7))
+    bus = Bus()
+    channel = bus.channel(2, 4)
+    print("bus", Bus.label, channel.index, channel.read(5))
     text = ", ".join(str(x) for x in samples)
     print("text:", text)
     STATE["total"] = sum(samples)

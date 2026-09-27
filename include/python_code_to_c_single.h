@@ -1462,16 +1462,29 @@ struct P2C_CodeGen {
     P2C_Map *decorated_names; /* decorator適用後にP2C callable objectへ再束縛されるmodule-level定義名の集合 */
     P2C_Map *module_function_names; /* direct module-level function名の集合。decorator expressionをP2C callable adapterへ解決する */
     P2C_Map *decorator_callable_names; /* bare-name decoratorとして実際に参照されるmodule-level function名の集合 */
-    P2C_Map *class_bases;   /* クラス名 -> 基底クラス名（単一継承のみ対応、super()解決に使用） */
     P2C_Map *class_methods; /* クラス名 -> (メソッド名 -> 1) のP2C_Map。super()がどのクラスにメソッドが実際に定義されているか調べるのに使用 */
     const char *current_class;      /* 現在コード生成中のメソッドが属するクラス名（トップレベル関数ではNULL）。super()解決に使用 */
-    const char *current_class_base; /* current_classの直接の基底クラス名（無ければNULL） */
     int lambda_counter; /* lambda式ごとに一意なC関数名を振るためのカウンタ */
     int generator_expression_counter; /* generator expressionごとに一意なC step関数名を振るためのカウンタ */
+    /* ネストクラス定義（class本体の直下に置いたclass）の解決用状態。
+     * C名は外側クラスを前置した "Outer__Inner" にして衝突を避ける。
+     * scan_class_cnameはscan_stmt走査中の現在クラスのC名（トップレベルではNULL）、
+     * nested_class_aliasesは生成中のクラスで可視な「Python名 -> C名」マップ、
+     * in_class_bodyはそのマップをクラス本体の文（__classobj内）で評価しているかを表す。
+     * Python仕様ではクラススコープの名前はメソッド本体から見えないため、
+     * in_class_bodyがfalseのときに名前を参照したら明示的な診断を出す。 */
+    const char *scan_class_cname;
+    P2C_Map *nested_class_aliases;
+    bool in_class_body;
     P2C_Map *closure_env_names;
     P2C_Map *nonlocal_names;
     P2C_Map *cell_names;
     const char *closure_env_var;
+    /* ジェネレータ式・状態機械関数（async/generator）のステップ関数を生成して
+     * いる間だけ設定される、Pythonのローカル名 -> ジェネレータのローカル辞書。
+     * gen_exprの名前解決がこの表を優先することで、組込み関数呼び出しや
+     * タプル/辞書表示の中でも genexpr のローカル名を正しく解決できる。 */
+    P2C_Map *genexpr_locals;
     P2C_Result last_error;
     char *error_msg;
     const char *source_text; /* debug_info有効時に元のPython行をコメント挿入するために使う（NULL可） */
@@ -1592,7 +1605,12 @@ struct P2C_Object {
         struct { P2C_DictEntry **buckets; P2C_DictEntry *order_head; P2C_DictEntry *order_tail; size_t bucket_count; size_t len; } v_dict;
         struct { P2C_Object **items; size_t len; } v_tuple;
         struct { char *name; P2C_CallableFn func; P2C_ClosureFn closure_func; P2C_Object *env; } v_function;
-        struct { char *name; P2C_CallableFn ctor; P2C_MethodDef *methods; P2C_Map *attrs; char *base_name; } v_class;
+        /* mro: クラス階層のC3線形化キャッシュ（自分以外の基底クラス名を解決順に
+         * カンマで連結した文字列）。初回のメソッド・属性解決時に遅延計算する。
+         * 継承関係はbase_nameの名前文字列で保持しているが、多重継承のダイヤモンド
+         * （class D(B, C), B(A), C(A)）でPythonと同じ解決順にするにはC3線形化が
+         * 必要になるため、その結果をここへ保持する。 */
+        struct { char *name; P2C_CallableFn ctor; P2C_MethodDef *methods; P2C_Map *attrs; char *base_name; char *mro; } v_class;
         struct { P2C_Object *klass; P2C_Map *attrs; } v_instance;
         struct { char *name; P2C_Map *attrs; } v_module;
         struct { char *msg; char *type_name; P2C_Object *cause; } v_exception;
@@ -1755,6 +1773,9 @@ P2C_Object* p2c_import_module(const char *name);
 void p2c_register_module(P2C_Object *module);
 P2C_Object* p2c_call(P2C_Object *callable, P2C_Object **args, size_t nargs);
 P2C_Object* p2c_call_attr(P2C_Object *obj, const char *name, P2C_Object **args, size_t nargs);
+/* super().method(...) の動的解決（selfの型のMRO上で、defining_classの次から探索する）。
+ * コード生成は super().m(...) をこの呼び出しへlowerする。 */
+P2C_Object* p2c_super_call_attr(P2C_Object *self, P2C_Object *defining_class, const char *name, P2C_Object **args, size_t nargs);
 P2C_Object* p2c_call_attr_kw(P2C_Object *obj, const char *name, P2C_Object **args, size_t nargs,
                               const char **kw_names, P2C_Object **kw_values, size_t nkw);
 
@@ -2902,7 +2923,10 @@ P2C_Allocator* p2c_linear_allocator(void *buffer, size_t size) {
     lc->size = size - sizeof(LinearCtx) - sizeof(P2C_Allocator);
     lc->used = 0;
     
-    P2C_Allocator *a = (P2C_Allocator*)((char*)buffer + sizeof(LinearCtx));
+    /* bufferはP2C_ALIGN_UP8済みで、sizeof(LinearCtx)もポインタ整列の倍数なので
+     * 実体は整列している。char*からの直接キャストは型情報から整列要件しか
+     * 読めない-Wcast-align=strictが誤検出するため、void*を経由して意図を明示する。 */
+    P2C_Allocator *a = (P2C_Allocator*)(void*)((char*)buffer + sizeof(LinearCtx));
     a->ctx = lc;
     a->alloc = linear_alloc;
     a->free = linear_free;
@@ -2977,7 +3001,8 @@ P2C_Allocator* p2c_pool_allocator(void *buffer, size_t buf_size, size_t obj_size
     pc->buf_size = buf_size - sizeof(PoolCtx) - sizeof(P2C_Allocator);
     pc->obj_count = 0;
     
-    P2C_Allocator *a = (P2C_Allocator*)((char*)buffer + sizeof(PoolCtx));
+    /* 上と同じ理由（pool用の整列済みバッファ、sizeof(PoolCtx)はポインタ整列の倍数）。 */
+    P2C_Allocator *a = (P2C_Allocator*)(void*)((char*)buffer + sizeof(PoolCtx));
     a->ctx = pc;
     a->alloc = pool_alloc;
     a->free = pool_free;
@@ -3498,8 +3523,12 @@ static unsigned char *embed_block_payload(P2C_EmbedBlock *block) {
     return (unsigned char*)block + P2C_EMBED_HEADER;
 }
 
+/* 埋め込みヒープ内のブロック境界はヘッダ長がアライン倍数であるため常に整列している。
+ * unsigned char* からの直接キャストは型からアライン要件しか読めない
+ * -Wcast-align=strict を誤検出させるため、void* を経由して「整列済みの領域を
+ * 型付きビューへ戻す」意図を明示する。 */
 static P2C_EmbedBlock *embed_payload_block(void *ptr) {
-    return (P2C_EmbedBlock*)((unsigned char*)ptr - P2C_EMBED_HEADER);
+    return (P2C_EmbedBlock*)(void*)((unsigned char*)ptr - P2C_EMBED_HEADER);
 }
 
 static bool embed_block_valid(P2C_EmbedHeap *heap, P2C_EmbedBlock *block) {
@@ -3546,7 +3575,7 @@ int p2c_embed_heap_init(P2C_EmbedHeap *heap, void *raw, size_t size) {
     if (usable < 2u * P2C_EMBED_HEADER + P2C_EMBED_ALIGN) return -1;
     heap->base = (unsigned char*)aligned;
     heap->capacity = usable;
-    P2C_EmbedBlock *first = (P2C_EmbedBlock*)heap->base;
+    P2C_EmbedBlock *first = (P2C_EmbedBlock*)(void*)heap->base;
     first->size = usable;
     first->magic = P2C_EMBED_MAGIC;
     first->flags = P2C_EMBED_FLAG_FREE;
@@ -3601,7 +3630,7 @@ void *p2c_embed_heap_alloc(P2C_EmbedHeap *heap, size_t size) {
     /* 分割: 残りが「ヘッダ + 最小ペイロード」以上あるときだけ切り分ける。 */
     size_t rest = block->size - need;
     if (rest >= P2C_EMBED_HEADER + P2C_EMBED_ALIGN) {
-        P2C_EmbedBlock *tail = (P2C_EmbedBlock*)((unsigned char*)block + need);
+        P2C_EmbedBlock *tail = (P2C_EmbedBlock*)(void*)((unsigned char*)block + need);
         tail->size = rest;
         tail->magic = P2C_EMBED_MAGIC;
         tail->flags = P2C_EMBED_FLAG_FREE;
@@ -3664,7 +3693,7 @@ void *p2c_embed_heap_realloc(P2C_EmbedHeap *heap, void *ptr, size_t new_size) {
         size_t rest = block->size - need;
         /* 縮小: 余りが独立ブロックとして成立するなら切り離して返す。 */
         if (rest >= P2C_EMBED_HEADER + P2C_EMBED_ALIGN) {
-            P2C_EmbedBlock *tail = (P2C_EmbedBlock*)((unsigned char*)block + need);
+            P2C_EmbedBlock *tail = (P2C_EmbedBlock*)(void*)((unsigned char*)block + need);
             tail->size = rest;
             tail->magic = P2C_EMBED_MAGIC;
             tail->next = NULL;
@@ -3676,7 +3705,7 @@ void *p2c_embed_heap_realloc(P2C_EmbedHeap *heap, void *ptr, size_t new_size) {
     }
     /* 拡張: 直後の空きブロックと結合できるならその場で伸ばす。 */
     size_t need = P2C_EMBED_HEADER + embed_align_up(new_size);
-    P2C_EmbedBlock *next = (P2C_EmbedBlock*)((unsigned char*)block + block->size);
+    P2C_EmbedBlock *next = (P2C_EmbedBlock*)(void*)((unsigned char*)block + block->size);
     if (embed_block_valid(heap, next) && (next->flags & P2C_EMBED_FLAG_FREE) &&
         block->size + next->size >= need) {
         size_t combined = block->size + next->size;
@@ -3691,7 +3720,7 @@ void *p2c_embed_heap_realloc(P2C_EmbedHeap *heap, void *ptr, size_t new_size) {
         heap->used += need - (old_payload + P2C_EMBED_HEADER);
         if (heap->used > heap->peak) heap->peak = heap->used;
         if (rest >= P2C_EMBED_HEADER + P2C_EMBED_ALIGN) {
-            P2C_EmbedBlock *tail = (P2C_EmbedBlock*)((unsigned char*)block + need);
+            P2C_EmbedBlock *tail = (P2C_EmbedBlock*)(void*)((unsigned char*)block + need);
             tail->size = rest;
             tail->magic = P2C_EMBED_MAGIC;
             tail->next = NULL;
@@ -9147,10 +9176,10 @@ static P2C_Result visit_stmt(P2C_Semantic *sem, P2C_AstStmt *stmt) {
             break;
         }
         case AST_TRY: {
-            if (contains_finally_control_flow(n->u.try_stmt.finalbody)) {
-                set_sem_error(sem, "return, break, and continue inside finally are not supported because they can override pending control flow", n->line, n->col);
-                return P2C_ERR_SEMANTIC;
-            }
+            /* finally内のreturn/break/continueはPythonでは「finallyを実行してから
+             * 脱出し、進行中の制御フロー（例外・return）を上書きする」意味を持つ。
+             * 生成Cはtry開始時に例外フレームを保存し、脱出時（in_finalbody）に
+             * その復元だけを行って本体を再実行しないため、これを受理できる。 */
             for (size_t i = 0; i < p2c_vec_len(n->u.try_stmt.body); i++) {
                 P2C_Result r = visit_stmt(sem, (P2C_AstStmt*)p2c_vec_get(n->u.try_stmt.body, i));
                 if (r != P2C_OK) return r;
@@ -9252,22 +9281,18 @@ static P2C_Result visit_stmt(P2C_Semantic *sem, P2C_AstStmt *stmt) {
                     if (decorator_result != P2C_OK) return decorator_result;
                 }
             }
-            /* ネストしたクラス定義（クラス本体の直下に別のclassを書く）はまだ
-             * 未対応。コード生成側がクラス本体のメンバーとして関数定義のみを
-             * 想定しており、ネストしたclassは黙ってスキップされてしまうため
-             * （結果、実行時に該当属性が見つからずクラッシュする）、ここで
-             * はっきり「未対応」を伝える。 */
+            /* ネストしたクラス定義（class本体の直下に別のclassを書く）は対応済みで、
+             * コード生成側が外側クラス名を前置したC名（Outer__Inner）へ解決し、
+             * 外側クラスの__classobjで属性として登録する。ここではクラス本体と
+             * モジュール直下だけを許可する。関数本体の中のclass定義はCでは
+             * 関数の入れ子定義になり不正なCになるため、はっきり診断する。 */
             {
                 P2C_SymbolScope *enclosing = p2c_symtab_current_scope(sem->symtab);
-                if (enclosing && enclosing->scope_type == SCOPE_CLASS) {
-                    char buf[256];
-                    snprintf(buf, sizeof(buf),
-                        "nested class '%s' is not supported yet "
-                        "(class bodies may only contain method definitions). "
-                        "Define '%s' at module level instead.",
-                        n->u.classdef.name ? n->u.classdef.name : "?",
-                        n->u.classdef.name ? n->u.classdef.name : "?");
-                    set_sem_error(sem, buf, n->line, n->col);
+                if (enclosing && enclosing->scope_type != SCOPE_MODULE && enclosing->scope_type != SCOPE_CLASS) {
+                    set_sem_error(sem,
+                        "class definitions inside functions are not supported yet "
+                        "(define the class at module level or directly inside another class)",
+                        n->line, n->col);
                     return P2C_ERR_SEMANTIC;
                 }
             }
@@ -9469,6 +9494,10 @@ struct P2C_CleanupFrame {
     int try_id;             /* 生成済み例外フレーム _p2c_ef_<try_id> の番号 */
     P2C_Vector *finalbody;  /* finally本体（NULL/空なら例外フレームの復元のみ） */
     int loop_depth;         /* このtryを生成し始めた時点のループ入れ子数 */
+    /* finally本体を生成している最中はtrue。finallyの中のreturn/break/continueは
+     * 「このfinallyを再実行せず、例外フレームの復元だけを行う」必要があるため、
+     * このフラグで区別する。 */
+    bool in_finalbody;
 };
 
 static void indent(P2C_CodeGen *cg) {
@@ -9526,24 +9555,34 @@ P2C_CodeGen* p2c_codegen_new(P2C_Allocator *a, P2C_CodeGenOptions *opts, P2C_Sym
     cg->decorated_names = p2c_map_new(a, p2c_hash_str, p2c_eq_str);
     cg->module_function_names = p2c_map_new(a, p2c_hash_str, p2c_eq_str);
     cg->decorator_callable_names = p2c_map_new(a, p2c_hash_str, p2c_eq_str);
-    cg->class_bases = p2c_map_new(a, p2c_hash_str, p2c_eq_str);
     cg->class_methods = p2c_map_new(a, p2c_hash_str, p2c_eq_str);
     cg->current_class = NULL;
-    cg->current_class_base = NULL;
     cg->closure_env_names = NULL;
     cg->nonlocal_names = NULL;
     cg->cell_names = NULL;
     cg->closure_env_var = NULL;
+    cg->genexpr_locals = NULL;
     cg->last_error = P2C_OK;
     cg->error_msg = NULL;
     cg->source_text = NULL;
     cg->lambda_counter = 0;
     cg->generator_expression_counter = 0;
+    cg->scan_class_cname = NULL;
+    cg->nested_class_aliases = NULL;
+    cg->in_class_body = false;
     return cg;
 }
 
 void p2c_codegen_set_source(P2C_CodeGen *cg, const char *source_text) {
     if (cg) cg->source_text = source_text;
+}
+
+/* 生成中のクラス本体で可視なネストクラスのC名を返す（可視でなければNULL）。
+ * ネストクラスはC名を外側クラス名で前置してシンボルを分離しているため、
+ * Python名からC名への解決が必要になる。 */
+static const char* nested_class_alias(P2C_CodeGen *cg, const char *name) {
+    if (!cg || !cg->nested_class_aliases || !name) return NULL;
+    return (const char*)p2c_map_get(cg->nested_class_aliases, name);
 }
 
 static void free_name_map(P2C_Map *map) {
@@ -9593,7 +9632,6 @@ void p2c_codegen_free(P2C_CodeGen *cg) {
     free_name_map(cg->decorated_names);
     free_name_map(cg->module_function_names);
     free_name_map(cg->decorator_callable_names);
-    free_string_map(cg->class_bases);
     if (cg->class_methods) {
         /* 値はネストしたP2C_Map*なので、外側を解放する前に個々にも解放する */
         for (size_t bi = 0; bi < cg->class_methods->bucket_count; bi++) {
@@ -9845,28 +9883,22 @@ static void scan_stmt(P2C_CodeGen *cg, P2C_AstStmt *stmt) {
     P2C_AstNode *n = &stmt->base;
     switch (n->type) {
         case AST_CLASSDEF: {
-            map_set_name(cg->known_classes, n->u.classdef.name);
+            /* ネストしたクラス定義はC名を外側クラス名で前置して衝突を避ける
+             * （Outer__Inner）。モジュール直下のクラスはクラス名そのものを使う
+             * 従来の名前付けを維持する。 */
+            char nested_scan_cname[512];
+            const char *class_cname = n->u.classdef.name;
+            if (cg->scan_class_cname) {
+                snprintf(nested_scan_cname, sizeof(nested_scan_cname), "%s__%s", cg->scan_class_cname, n->u.classdef.name);
+                class_cname = nested_scan_cname;
+            } else {
+                map_set_name(cg->known_classes, n->u.classdef.name);
+            }
             if (n->u.classdef.decorator_list && p2c_vec_len(n->u.classdef.decorator_list) > 0) {
                 map_set_name(cg->decorated_names, n->u.classdef.name);
                 for (size_t di = 0; di < p2c_vec_len(n->u.classdef.decorator_list); di++) {
                     P2C_AstExpr *decorator = (P2C_AstExpr*)p2c_vec_get(n->u.classdef.decorator_list, di);
                     if (decorator && decorator->base.type == AST_NAME) map_set_name(cg->decorator_callable_names, decorator->base.u.name.name);
-                }
-            }
-            /* super()解決用: 基底クラス名（単一継承のみ）とこのクラスが
-             * 直接定義しているメソッド名の集合を記録しておく。 */
-            const char *base_name = NULL;
-            for (size_t bi = 0; bi < p2c_vec_len(n->u.classdef.bases); bi++) {
-                base_name = extract_base_name((P2C_AstExpr*)p2c_vec_get(n->u.classdef.bases, bi));
-                if (base_name) break; /* 最初の（＝唯一対応する）基底のみ */
-            }
-            if (base_name) {
-                char *cname_dup = p2c_alloc(cg->alloc, strlen(n->u.classdef.name) + 1);
-                char *bname_dup = p2c_alloc(cg->alloc, strlen(base_name) + 1);
-                if (cname_dup && bname_dup) {
-                    strcpy(cname_dup, n->u.classdef.name);
-                    strcpy(bname_dup, base_name);
-                    p2c_map_insert(cg->class_bases, cname_dup, bname_dup);
                 }
             }
             P2C_Map *methods = p2c_map_new(cg->alloc, p2c_hash_str, p2c_eq_str);
@@ -9875,10 +9907,15 @@ static void scan_stmt(P2C_CodeGen *cg, P2C_AstStmt *stmt) {
                 if (member->base.type == AST_FUNCTIONDEF) map_set_name(methods, member->base.u.functiondef.name);
             }
             {
-                char *cname_dup2 = p2c_alloc(cg->alloc, strlen(n->u.classdef.name) + 1);
-                if (cname_dup2) { strcpy(cname_dup2, n->u.classdef.name); p2c_map_insert(cg->class_methods, cname_dup2, methods); }
+                char *cname_dup2 = p2c_alloc(cg->alloc, strlen(class_cname) + 1);
+                if (cname_dup2) { strcpy(cname_dup2, class_cname); p2c_map_insert(cg->class_methods, cname_dup2, methods); }
             }
-            scan_stmt_list(cg, n->u.classdef.body);
+            {
+                const char *saved_scan_cname = cg->scan_class_cname;
+                cg->scan_class_cname = class_cname;
+                scan_stmt_list(cg, n->u.classdef.body);
+                cg->scan_class_cname = saved_scan_cname;
+            }
             break;
         }
         case AST_FUNCTIONDEF:
@@ -10126,6 +10163,17 @@ static void gen_expr(P2C_CodeGen *cg, P2C_AstExpr *expr) {
     P2C_AstNode *n = &expr->base;
     switch (n->type) {
         case AST_NAME:
+            /* genexpr（および状態機械関数）のステップ関数の中では、Pythonの
+             * ローカル名をジェネレータのローカル辞書から読む。これにより
+             * gen_exprが持つ組込み関数ディスパッチやタプル/辞書表示、
+             * 添字・属性アクセスの中でもgenexprのローカル名を正しく解決できる
+             * （以前は生の識別子として出力され、生成Cが未宣言エラーになっていた）。 */
+            if (cg->genexpr_locals && map_has_name(cg->genexpr_locals, n->u.name.name)) {
+                write_str(cg, "p2c_generator_local_get(generator, \"");
+                write_str(cg, n->u.name.name);
+                write_str(cg, "\")");
+                break;
+            }
             /* Ellipsis はビルトインの単一値。Cの識別子ではないため、
              * 名前置換が起きる前にシングルトンへ解決する。 */
             if (strcmp(n->u.name.name, "Ellipsis") == 0) {
@@ -10137,7 +10185,20 @@ static void gen_expr(P2C_CodeGen *cg, P2C_AstExpr *expr) {
             } else if (map_has_name(cg->decorated_names, n->u.name.name)) {
                 write_str(cg, "_p2c_decorated_"); write_ident(cg, n->u.name.name);
             } else {
-                write_ident(cg, n->u.name.name);
+                const char *nested_alias = nested_class_alias(cg, n->u.name.name);
+                if (nested_alias) {
+                    /* クラス本体ではネストクラス名を前置済みC名へ解決する。
+                     * Pythonではクラススコープの名前はメソッド本体から見えない
+                     * （NameError）ため、その位置での参照は黙って壊れたCを
+                     * 出さず明示的に診断する。 */
+                    if (!cg->in_class_body) {
+                        codegen_set_error(cg, P2C_ERR_NOT_IMPLEMENTED,
+                            "nested class names are not visible inside method bodies; refer to the class through its enclosing class (Outer.Inner)");
+                    }
+                    write_str(cg, nested_alias);
+                } else {
+                    write_ident(cg, n->u.name.name);
+                }
             }
             break;
         case AST_CONST:
@@ -10538,7 +10599,15 @@ static void gen_expr(P2C_CodeGen *cg, P2C_AstExpr *expr) {
                             gen_expr(cg, (P2C_AstExpr*)p2c_vec_get(n->u.call.args, 0));
                             write_str(cg, ", \""); write_str(cg, type_name); write_str(cg, "\"))");
                         } else {
-                            write_str(cg, "p2c_obj_from_bool(false)");
+                            /* クラス名がbare nameでない場合（Outer.Innerのような属性経由や、
+                             * クラスオブジェクトを保持した変数）は第2引数をクラスオブジェクト
+                             * として評価して判定する。以前はここが常にfalseになり、
+                             * isinstance(x, ns.Class) が黙ってFalseを返していた。 */
+                            write_str(cg, "p2c_obj_from_bool(p2c_isinstance_of_object(");
+                            gen_expr(cg, (P2C_AstExpr*)p2c_vec_get(n->u.call.args, 0));
+                            write_str(cg, ", ");
+                            gen_expr(cg, (P2C_AstExpr*)p2c_vec_get(n->u.call.args, 1));
+                            write_str(cg, "))");
                         }
                     }
                 } else if (strcmp(name, "any") == 0 && argc == 1) {
@@ -10649,6 +10718,14 @@ static void gen_expr(P2C_CodeGen *cg, P2C_AstExpr *expr) {
                 } else if (map_has_name(cg->decorated_names, name)) {
                     if (nkw != 0) codegen_set_error(cg, P2C_ERR_NOT_IMPLEMENTED, "keyword arguments for decorated functions are not supported yet");
                     write_str(cg, "p2c_call(_p2c_decorated_"); write_ident(cg, name); write_str(cg, ", "); emit_args_array(cg, n->u.call.args); write_str(cg, ")");
+                } else if (nested_class_alias(cg, name)) {
+                    /* クラス本体内でのネストクラス呼び出し（例: factory = Inner()）は
+                     * 前置済みC名のクラスオブジェクトを呼び出す。 */
+                    if (!cg->in_class_body) {
+                        codegen_set_error(cg, P2C_ERR_NOT_IMPLEMENTED,
+                            "nested class names are not visible inside method bodies; refer to the class through its enclosing class (Outer.Inner)");
+                    }
+                    write_str(cg, "p2c_call("); write_str(cg, nested_class_alias(cg, name)); write_str(cg, ", "); emit_args_array(cg, n->u.call.args); write_str(cg, ")");
                 } else if (map_has_name(cg->known_classes, name) || is_declared(cg, name)) {
                     write_str(cg, "p2c_call("); write_ident(cg, name); write_str(cg, ", "); emit_args_array(cg, n->u.call.args); write_str(cg, ")");
                 } else {
@@ -10712,9 +10789,9 @@ static void gen_expr(P2C_CodeGen *cg, P2C_AstExpr *expr) {
                                     /* p2c_obj_slice(seq, start, None, None) で [kwonly_start:] を取り出す */
                                     write_str(cg, "p2c_builtin_tuple(p2c_obj_slice(");
                                     gen_expr(cg, src);
-                                    char ibuf2[64];
-                                    snprintf(ibuf2, sizeof(ibuf2), ", p2c_obj_from_int(%zu), &P2C_None, &P2C_None))", kwonly_start);
-                                    write_str(cg, ibuf2);
+                                    write_str(cg, ", p2c_obj_from_int(");
+                                    emit_usize(cg, kwonly_start);
+                                    write_str(cg, "), &P2C_None, &P2C_None))");
                                 }
                                 if (kwarg) {
                                     if (wrote_param) write_str(cg, ", ");
@@ -10888,30 +10965,38 @@ static void gen_expr(P2C_CodeGen *cg, P2C_AstExpr *expr) {
                  * 生成しない。単一継承のみ対応 — 多重継承のMRO解決は非対応）。
                  * 以前はsuper()自体が未定義関数呼び出しとして生成され、常に
                  * コンパイルエラーになっていた。 */
+                /* super().method(args) は、インスタンスの型のMRO上で「このメソッドを
+                 * 書いたクラスの次」から解決するようランタイムへ委譲する。
+                 * コード生成時に基底チェーンを静的に辿る近似では、多重継承の
+                 * ダイヤモンド（class D(B, C)、B(A)、C(A)でBのsuper()はCを指す）で
+                 * CPythonと異なる実装を呼んでしまうため。 */
+                P2C_AstExpr *super_call = func->base.u.attribute.value;
                 const char *method_name = func->base.u.attribute.attr;
-                const char *resolver_class = cg->current_class_base;
-                const char *found_in = NULL;
-                int guard = 0;
-                while (resolver_class && guard++ < 64) {
-                    P2C_Map *methods = (P2C_Map*)p2c_map_get(cg->class_methods, resolver_class);
-                    if (methods && p2c_map_get(methods, method_name)) { found_in = resolver_class; break; }
-                    resolver_class = (const char*)p2c_map_get(cg->class_bases, resolver_class);
-                }
-                if (!found_in) {
-                    /* 現在のクラスにcurrent_class_baseが無い(=基底クラスを継承していない)、
-                     * または継承チェーンのどこにもそのメソッドが見つからない場合。
-                     * 壊れたCを生成して分かりにくいコンパイルエラーにするのではなく、
-                     * ここでコード生成自体を明確なエラーとして止める。 */
-                    char errbuf[256];
-                    snprintf(errbuf, sizeof(errbuf),
-                        "super().%s(...) could not be resolved: no base class of '%s' defines '%s' "
-                        "(or the class has no base class). python_code_to_c only supports super() with single inheritance.",
-                        method_name, cg->current_class ? cg->current_class : "?", method_name);
-                    codegen_set_error(cg, P2C_ERR_NOT_IMPLEMENTED, errbuf);
+                if (!cg->current_class) {
+                    codegen_set_error(cg, P2C_ERR_NOT_IMPLEMENTED,
+                                      "super() is supported only inside a class method body");
+                    write_str(cg, "((P2C_Object*)0)");
+                } else if (p2c_vec_len(super_call->base.u.call.args) > 0) {
+                    /* super(Class, self) の2引数形は未対応（0引数形のみ対応）。 */
+                    codegen_set_error(cg, P2C_ERR_NOT_IMPLEMENTED,
+                                      "only the zero-argument super() form is supported");
                     write_str(cg, "((P2C_Object*)0)");
                 } else {
-                    write_str(cg, found_in); write_str(cg, "__"); write_str(cg, method_name); write_str(cg, "(self");
-                    for (size_t ai = 0; ai < argc; ai++) { write_str(cg, ", "); gen_expr(cg, (P2C_AstExpr*)p2c_vec_get(n->u.call.args, ai)); }
+                    if (nkw > 0) {
+                        codegen_set_error(cg, P2C_ERR_NOT_IMPLEMENTED,
+                                          "keyword arguments for super() method calls are not supported yet");
+                    }
+                    write_str(cg, "p2c_super_call_attr(self, "); write_str(cg, cg->current_class);
+                    write_str(cg, ", \""); write_str(cg, method_name); write_str(cg, "\", ");
+                    if (argc == 0) write_str(cg, "NULL, 0");
+                    else {
+                        write_str(cg, "(P2C_Object*[]){");
+                        for (size_t ai = 0; ai < argc; ai++) {
+                            if (ai) write_str(cg, ", ");
+                            gen_expr(cg, (P2C_AstExpr*)p2c_vec_get(n->u.call.args, ai));
+                        }
+                        write_str(cg, "}, "); emit_usize(cg, argc);
+                    }
                     write_str(cg, ")");
                 }
             } else if (func->base.type == AST_ATTRIBUTE) {
@@ -11179,7 +11264,10 @@ static void gen_assign_target(P2C_CodeGen *cg, P2C_AstExpr *target, P2C_AstExpr 
  * 指したままになるのを防ぎ、保留中の例外はPythonの規則どおり破棄される。 */
 static void emit_exit_cleanups(P2C_CodeGen *cg, int min_loop_depth) {
     for (struct P2C_CleanupFrame *f = cg->cleanup_top; f && f->loop_depth >= min_loop_depth; f = f->prev) {
-        if (f->finalbody && p2c_vec_len(f->finalbody) > 0) {
+        /* 生成中のfinally本体（in_finalbody）は再実行しない。finallyの中で
+         * return/break/continue した場合は、既に実行中のfinallyを飛ばして
+         * 例外フレームの復元だけを行えばPythonと同じ挙動になる。 */
+        if (!f->in_finalbody && f->finalbody && p2c_vec_len(f->finalbody) > 0) {
             struct P2C_CleanupFrame *saved_top = cg->cleanup_top;
             cg->cleanup_top = f->prev; /* finally自身のフレームは再実行しない */
             gen_stmt_list(cg, f->finalbody);
@@ -11212,6 +11300,7 @@ static void gen_try_stmt(P2C_CodeGen *cg, P2C_AstStmt *stmt) {
     _p2c_cf.try_id = try_id;
     _p2c_cf.finalbody = n->u.try_stmt.finalbody;
     _p2c_cf.loop_depth = cg->loop_depth;
+    _p2c_cf.in_finalbody = false;
     cg->cleanup_top = &_p2c_cf;
     gen_stmt_list(cg, n->u.try_stmt.body);
     if (p2c_vec_len(n->u.try_stmt.orelse) > 0) gen_stmt_list(cg, n->u.try_stmt.orelse);
@@ -11269,10 +11358,14 @@ static void gen_try_stmt(P2C_CodeGen *cg, P2C_AstStmt *stmt) {
         pop_indent(cg);
     }
     indent(cg); write_str(cg, "}"); write_newline(cg);
-    /* finally本体の生成中は自分自身のフレームを外しておく（finallyの中から
-     * 見た脱出先は外側のtryになる）。 */
-    cg->cleanup_top = _p2c_cf.prev;
+    /* finally本体の生成中は、このtryのフレームを「実行中」として残す。
+     * finallyの中のreturn/break/continueは、このfinallyを再実行せずに
+     * 例外フレームの復元だけを行う必要がある（emit_exit_cleanupsが
+     * in_finalbodyを見て本体の再実行を抑止する）。 */
+    _p2c_cf.in_finalbody = true;
     if (p2c_vec_len(n->u.try_stmt.finalbody) > 0) gen_stmt_list(cg, n->u.try_stmt.finalbody);
+    _p2c_cf.in_finalbody = false;
+    cg->cleanup_top = _p2c_cf.prev;
     indent(cg); write_str(cg, "p2c_exc_stack = _p2c_ef_"); emit_usize(cg, (size_t)try_id); write_str(cg, ".prev;"); write_newline(cg);
     /* ハンドラ無しで外側へ再送出する経路でも、このフレームで放棄した一時値を
      * 巻き戻しておく（正常終了時は深さが保存値と等しいので何もしない）。 */
@@ -11406,6 +11499,11 @@ static void gen_match_pattern(P2C_CodeGen *cg, P2C_AstMatchPattern *pattern, int
             indent(cg); write_str(cg, "if ("); emit_match_ok_ref(cg, state_id); write_str(cg, " && !_p2c_match_or_"); emit_usize(cg, (size_t)or_done_id); write_str(cg, ") "); emit_match_ok_ref(cg, state_id); write_str(cg, " = 0;"); write_newline(cg);
             break;
         }
+        default:
+            /* 未知のパターン種別は「マッチしない」として扱う（未対応の構文は
+             * parse時に診断されるため、ここへは来ない）。 */
+            indent(cg); write_str(cg, "if ("); emit_match_ok_ref(cg, state_id); write_str(cg, ") "); emit_match_ok_ref(cg, state_id); write_str(cg, " = 0;"); write_newline(cg);
+            break;
     }
 }
 
@@ -11783,7 +11881,11 @@ static void emit_cell_declarations(P2C_CodeGen *cg, P2C_Map *cells) {
     }
 }
 
-static void gen_suspension_expr(P2C_CodeGen *cg, P2C_AstExpr *expr, P2C_Map *locals) {
+/* ジェネレータ式のステップ関数内で式を生成する入口（実体は _impl の直後に定義）。
+ * _impl から再帰的に呼び出すため、ここで先に宣言する。 */
+static void gen_suspension_expr(P2C_CodeGen *cg, P2C_AstExpr *expr, P2C_Map *locals);
+
+static void gen_suspension_expr_impl(P2C_CodeGen *cg, P2C_AstExpr *expr, P2C_Map *locals) {
     if (!expr) { write_str(cg, "&P2C_None"); return; }
     P2C_AstNode *n = &expr->base;
     if (n->type == AST_NAME) {
@@ -11916,6 +12018,12 @@ static void gen_suspension_expr(P2C_CodeGen *cg, P2C_AstExpr *expr, P2C_Map *loc
         } else if (strcmp(name, "str") == 0 && argc == 1) {
             write_str(cg, "p2c_obj_str(");
             gen_suspension_expr(cg, (P2C_AstExpr*)p2c_vec_get(n->u.call.args, 0), locals); write_str(cg, ")");
+        } else if (is_builtin_callable_name(name)) {
+            /* 組込み関数はgen_expr側に完全なディスパッチ（len/range/sum/sorted/
+             * isinstance等の引数検査と変換）があるため、そのまま再利用する。
+             * cg->genexpr_locals が設定されているので、引数の中のローカル名も
+             * ジェネレータのローカルから解決される。 */
+            gen_expr(cg, expr);
         } else {
             write_str(cg, "p2c_call("); write_ident(cg, name); write_str(cg, ", ");
             if (argc == 0) write_str(cg, "NULL, 0");
@@ -11934,76 +12042,228 @@ static void gen_suspension_expr(P2C_CodeGen *cg, P2C_AstExpr *expr, P2C_Map *loc
     gen_expr(cg, expr);
 }
 
+/* ジェネレータ式・状態機械関数（async/generator）のステップ関数の中で式を生成する
+ * 入口。生成の間だけ cg->genexpr_locals を設定し、gen_expr側の名前解決
+ * （組込み関数の引数、タプル/辞書表示、添字、f-string等）でもジェネレータの
+ * ローカル名を参照できるようにする。 */
+static void gen_suspension_expr(P2C_CodeGen *cg, P2C_AstExpr *expr, P2C_Map *locals) {
+    P2C_Map *saved_locals = cg->genexpr_locals;
+    cg->genexpr_locals = locals;
+    gen_suspension_expr_impl(cg, expr, locals);
+    cg->genexpr_locals = saved_locals;
+}
+
+/* ジェネレータ式（genexpr）のfor節ターゲットが束縛する名前を集める。
+ * タプル/リストのアンパック（for x, y in pairs）とその入れ子に対応する。 */
+static bool gen_genexp_collect_target(P2C_Map *locals, P2C_Map *targets, P2C_AstExpr *target) {
+    if (!target) return false;
+    if (target->base.type == AST_NAME) {
+        map_set_name(locals, target->base.u.name.name);
+        map_set_name(targets, target->base.u.name.name);
+        return true;
+    }
+    if (target->base.type == AST_TUPLE || target->base.type == AST_LIST) {
+        P2C_Vector *elts = target->base.type == AST_TUPLE ? target->base.u.tuple.elts : target->base.u.list.elts;
+        for (size_t i = 0; i < p2c_vec_len(elts); i++) {
+            if (!gen_genexp_collect_target(locals, targets, (P2C_AstExpr*)p2c_vec_get(elts, i))) return false;
+        }
+        return true;
+    }
+    return false;
+}
+
+/* ジェネレータ式のターゲット束縛。for節のターゲットは単純名だけでなく
+ * タプル/リストのアンパック（for x, y in pairs）や入れ子も取り得るため、
+ * 要素を添字で取り出してジェネレータのローカルへ書き戻す。nseqは入れ子の
+ * 展開で作る一時変数名を一意にするための連番。 */
+static void gen_genexp_bind_target(P2C_CodeGen *cg, int id, const char *item_expr, P2C_AstExpr *target, size_t *nseq) {
+    if (!target) return;
+    if (target->base.type == AST_NAME) {
+        indent(cg); write_str(cg, "p2c_generator_local_set(generator, \""); write_str(cg, target->base.u.name.name);
+        write_str(cg, "\", "); write_str(cg, item_expr); write_str(cg, ");"); write_newline(cg);
+        return;
+    }
+    if (target->base.type == AST_TUPLE || target->base.type == AST_LIST) {
+        P2C_Vector *elts = target->base.type == AST_TUPLE ? target->base.u.tuple.elts : target->base.u.list.elts;
+        for (size_t i = 0; i < p2c_vec_len(elts); i++) {
+            P2C_AstExpr *elt = (P2C_AstExpr*)p2c_vec_get(elts, i);
+            char item[64];
+            if (!elt) continue;
+            if (elt->base.type == AST_STARRED || elt->base.type == AST_ATTRIBUTE || elt->base.type == AST_SUBSCRIPT) {
+                codegen_set_error(cg, P2C_ERR_NOT_IMPLEMENTED,
+                                  "generator expression for-targets support names and tuple/list unpacking only");
+                continue;
+            }
+            snprintf(item, sizeof(item), "_p2c_genexp_unpack_%d_%zu", id, (*nseq)++);
+            indent(cg); write_str(cg, "P2C_Object *"); write_str(cg, item); write_str(cg, " = p2c_subscript_get(");
+            write_str(cg, item_expr); write_str(cg, ", p2c_obj_from_int("); emit_usize(cg, i); write_str(cg, "));"); write_newline(cg);
+            gen_genexp_bind_target(cg, id, item, elt, nseq);
+        }
+        return;
+    }
+    codegen_set_error(cg, P2C_ERR_NOT_IMPLEMENTED,
+                      "generator expression for-targets support names and tuple/list unpacking only");
+}
+
+/* ジェネレータ式を、複数のfor節・タプルターゲット・ifフィルタに対応した
+ * ジェネレータ（ステップ関数）へ変換する。
+ *
+ * ステップ関数は入れ子ループを「今どの段（for節）を進めているか」を表す
+ * levelローカルとswitchで表現する。
+ *   - 段kのイテレータはジェネレータのローカルに保持し、未生成（None）なら
+ *     その段に入った時点で作る。Pythonの「最も外側のiterableだけを生成時に
+ *     評価し、内側はループ到達時に評価する」規則に対応する。
+ *   - 最内段で要素をyieldし、再開時はlevelが最内段のままなので同じ
+ *     イテレータから続きを取り出せる。
+ *   - 段のイテレータが尽きたら（StopIteration）そのイテレータを捨てて1つ外側の
+ *     段へ戻る。最外段が尽きたらジェネレータを終了する。
+ */
 static void gen_generator_expression(P2C_CodeGen *cg, P2C_AstExpr *expr) {
     P2C_Vector *generators = expr->base.u.comprehension.generators;
-    P2C_AstComprehensionGen *gen;
     P2C_Map *locals;
+    P2C_Map *targets;
     P2C_String *saved_current;
     int saved_indent;
     int id;
     char step_name[64];
+    char level_local[64];
     char iter_local[64];
     size_t capture_count = 0;
+    size_t clause_count = generators ? p2c_vec_len(generators) : 0;
     if (cg->current == cg->forward && cg->closure_env_var) {
         codegen_set_error(cg, P2C_ERR_NOT_IMPLEMENTED, "generator expression capture inside nested closures is not yet supported");
         write_str(cg, "&P2C_None");
         return;
     }
-    if (!generators || p2c_vec_len(generators) != 1) {
-        codegen_set_error(cg, P2C_ERR_NOT_IMPLEMENTED, "generator expression currently supports one for-clause");
+    if (clause_count == 0) {
+        codegen_set_error(cg, P2C_ERR_NOT_IMPLEMENTED, "generator expression requires at least one for-clause");
         write_str(cg, "&P2C_None");
         return;
     }
-    gen = (P2C_AstComprehensionGen*)p2c_vec_get(generators, 0);
-    if (!gen || !gen->target || gen->target->base.type != AST_NAME) {
-        codegen_set_error(cg, P2C_ERR_NOT_IMPLEMENTED, "generator expression currently requires a simple name target");
+    /* 1節あたり1つのcase節を生成する実装のため、実用上限を設けて明示的に診断する。 */
+    if (clause_count > 8) {
+        codegen_set_error(cg, P2C_ERR_NOT_IMPLEMENTED, "generator expression supports at most 8 for-clauses");
         write_str(cg, "&P2C_None");
         return;
     }
     locals = p2c_map_new(cg->alloc, p2c_hash_str, p2c_eq_str);
-    if (!locals) { codegen_set_error(cg, P2C_ERR_NOMEM, "could not allocate generator expression locals"); write_str(cg, "&P2C_None"); return; }
-    map_set_name(locals, gen->target->base.u.name.name);
+    targets = p2c_map_new(cg->alloc, p2c_hash_str, p2c_eq_str);
+    if (!locals || !targets) {
+        codegen_set_error(cg, P2C_ERR_NOMEM, "could not allocate generator expression locals");
+        free_name_map(locals);
+        free_name_map(targets);
+        write_str(cg, "&P2C_None");
+        return;
+    }
+    for (size_t k = 0; k < clause_count; k++) {
+        P2C_AstComprehensionGen *clause = (P2C_AstComprehensionGen*)p2c_vec_get(generators, k);
+        if (!clause || !clause->target ||
+            !gen_genexp_collect_target(locals, targets, clause->target)) {
+            codegen_set_error(cg, P2C_ERR_NOT_IMPLEMENTED,
+                              "generator expression for-targets support names and tuple/list unpacking only");
+            free_name_map(locals);
+            free_name_map(targets);
+            write_str(cg, "&P2C_None");
+            return;
+        }
+    }
+    /* 外側スコープの名前（クロージャ変数・セル）を取り込む。ターゲット名は
+     * ジェネレータのローカルが優先されるため除外する。 */
     if (cg->declared_vars) for (size_t i = 0; i < cg->declared_vars->bucket_count; i++) for (P2C_MapEntry *entry = cg->declared_vars->buckets[i]; entry; entry = entry->next) {
         const char *name = (const char*)entry->key;
-        if (strcmp(name, gen->target->base.u.name.name) != 0 && !map_has_name(locals, name)) { map_set_name(locals, name); capture_count++; }
+        if (!map_has_name(locals, name)) { map_set_name(locals, name); capture_count++; }
     }
     if (cg->closure_env_names) for (size_t i = 0; i < cg->closure_env_names->bucket_count; i++) for (P2C_MapEntry *entry = cg->closure_env_names->buckets[i]; entry; entry = entry->next) {
         const char *name = (const char*)entry->key;
-        if (strcmp(name, gen->target->base.u.name.name) != 0 && !map_has_name(locals, name)) { map_set_name(locals, name); capture_count++; }
+        if (!map_has_name(locals, name)) { map_set_name(locals, name); capture_count++; }
     }
     id = ++cg->generator_expression_counter;
     snprintf(step_name, sizeof(step_name), "_p2c_genexp_step_%d", id);
-    snprintf(iter_local, sizeof(iter_local), "__p2c_genexp_iter_%d", id);
+    snprintf(level_local, sizeof(level_local), "__p2c_genexp_level_%d", id);
+    snprintf(iter_local, sizeof(iter_local), "__p2c_genexp_iter_%d_0", id);
     saved_current = cg->current;
     saved_indent = cg->indent_level;
     cg->current = cg->forward;
     cg->indent_level = 0;
-    indent(cg); write_str(cg, "static P2C_Object *"); write_str(cg, step_name); write_str(cg, "(P2C_Object *generator) {"); write_newline(cg); push_indent(cg);
-    indent(cg); write_str(cg, "P2C_Object *_p2c_genexp_iter = p2c_generator_local_get(generator, \""); write_str(cg, iter_local); write_str(cg, "\");"); write_newline(cg);
-    write_line(cg, "for (;;) {"); push_indent(cg);
-    write_line(cg, "P2C_ExceptFrame _p2c_genexp_ef;");
-    write_line(cg, "P2C_Object * volatile _p2c_genexp_item = NULL;");
-    write_line(cg, "_p2c_genexp_ef.prev = p2c_exc_stack; _p2c_genexp_ef.exc = NULL; p2c_exc_stack = &_p2c_genexp_ef;");
-    write_line(cg, "if (P2C_SETJMP(_p2c_genexp_ef.env) == 0) { _p2c_genexp_item = p2c_builtin_next(_p2c_genexp_iter); p2c_exc_stack = _p2c_genexp_ef.prev; } else { P2C_Object *_p2c_genexp_exc = _p2c_genexp_ef.exc; p2c_exc_stack = _p2c_genexp_ef.prev; if (p2c_exc_name_match(_p2c_genexp_exc, \"StopIteration\")) return p2c_generator_finish(generator, &P2C_None); p2c_raise(_p2c_genexp_exc); return p2c_generator_finish(generator, &P2C_None); }");
-    indent(cg); write_str(cg, "p2c_generator_local_set(generator, \""); write_str(cg, gen->target->base.u.name.name); write_str(cg, "\", _p2c_genexp_item);"); write_newline(cg);
-    for (size_t i = 0; i < p2c_vec_len(gen->ifs); i++) {
-        indent(cg); write_str(cg, "if (!p2c_obj_is_truthy("); gen_suspension_expr(cg, (P2C_AstExpr*)p2c_vec_get(gen->ifs, i), locals); write_str(cg, ")) continue;"); write_newline(cg);
+    indent(cg); write_str(cg, "static P2C_Object *"); write_str(cg, step_name); write_str(cg, "(P2C_Object *generator) {"); write_newline(cg);
+    push_indent(cg);
+    write_line(cg, "for (;;) {");
+    push_indent(cg);
+    indent(cg); write_str(cg, "int _p2c_genexp_level = (int)p2c_obj_as_int(p2c_generator_local_get(generator, \""); write_str(cg, level_local); write_str(cg, "\"));"); write_newline(cg);
+    write_line(cg, "switch (_p2c_genexp_level) {");
+    push_indent(cg);
+    for (size_t k = 0; k < clause_count; k++) {
+        P2C_AstComprehensionGen *clause = (P2C_AstComprehensionGen*)p2c_vec_get(generators, k);
+        char iter_name[64];
+        char value_name[64];
+        size_t bind_seq = 0;
+        snprintf(iter_name, sizeof(iter_name), "__p2c_genexp_iter_%d_%zu", id, k);
+        snprintf(value_name, sizeof(value_name), "_p2c_genexp_value_%zu", k);
+        indent(cg); write_str(cg, "case "); emit_usize(cg, k); write_str(cg, ": {"); write_newline(cg);
+        push_indent(cg);
+        indent(cg); write_str(cg, "P2C_Object *_p2c_genexp_iter_"); emit_usize(cg, k);
+        write_str(cg, " = p2c_generator_local_get(generator, \""); write_str(cg, iter_name); write_str(cg, "\");"); write_newline(cg);
+        indent(cg); write_str(cg, "if (_p2c_genexp_iter_"); emit_usize(cg, k); write_str(cg, " == &P2C_None) { _p2c_genexp_iter_");
+        emit_usize(cg, k); write_str(cg, " = p2c_builtin_iter(");
+        gen_suspension_expr(cg, clause->iter, locals);
+        write_str(cg, "); p2c_generator_local_set(generator, \""); write_str(cg, iter_name);
+        write_str(cg, "\", _p2c_genexp_iter_"); emit_usize(cg, k); write_str(cg, "); }"); write_newline(cg);
+        /* next()は例外フレームで包む。StopIterationは段の終わりを意味する。 */
+        indent(cg); write_str(cg, "P2C_ExceptFrame _p2c_genexp_ef_"); emit_usize(cg, k); write_str(cg, ";"); write_newline(cg);
+        indent(cg); write_str(cg, "P2C_Object * volatile _p2c_genexp_value_"); emit_usize(cg, k); write_str(cg, " = NULL;"); write_newline(cg);
+        indent(cg); write_str(cg, "_p2c_genexp_ef_"); emit_usize(cg, k); write_str(cg, ".prev = p2c_exc_stack; _p2c_genexp_ef_");
+        emit_usize(cg, k); write_str(cg, ".exc = NULL; p2c_exc_stack = &_p2c_genexp_ef_"); emit_usize(cg, k); write_str(cg, ";"); write_newline(cg);
+        indent(cg); write_str(cg, "if (P2C_SETJMP(_p2c_genexp_ef_"); emit_usize(cg, k); write_str(cg, ".env) == 0) { _p2c_genexp_value_");
+        emit_usize(cg, k); write_str(cg, " = p2c_builtin_next(_p2c_genexp_iter_"); emit_usize(cg, k);
+        write_str(cg, "); p2c_exc_stack = _p2c_genexp_ef_"); emit_usize(cg, k); write_str(cg, ".prev; } else { P2C_Object *_p2c_genexp_exc_");
+        emit_usize(cg, k); write_str(cg, " = _p2c_genexp_ef_"); emit_usize(cg, k); write_str(cg, ".exc; p2c_exc_stack = _p2c_genexp_ef_");
+        emit_usize(cg, k); write_str(cg, ".prev; if (p2c_exc_name_match(_p2c_genexp_exc_"); emit_usize(cg, k); write_str(cg, ", \"StopIteration\")) { ");
+        if (k == 0) {
+            write_str(cg, "return p2c_generator_finish(generator, &P2C_None);");
+        } else {
+            write_str(cg, "p2c_generator_local_set(generator, \""); write_str(cg, iter_name);
+            write_str(cg, "\", &P2C_None); p2c_generator_local_set(generator, \""); write_str(cg, level_local);
+            write_str(cg, "\", p2c_obj_from_int("); emit_usize(cg, k - 1); write_str(cg, ")); continue;");
+        }
+        write_str(cg, " } p2c_raise(_p2c_genexp_exc_"); emit_usize(cg, k);
+        write_str(cg, "); return p2c_generator_finish(generator, &P2C_None); }"); write_newline(cg);
+        gen_genexp_bind_target(cg, id, value_name, clause->target, &bind_seq);
+        for (size_t i = 0; i < p2c_vec_len(clause->ifs); i++) {
+            indent(cg); write_str(cg, "if (!p2c_obj_is_truthy(");
+            gen_suspension_expr(cg, (P2C_AstExpr*)p2c_vec_get(clause->ifs, i), locals);
+            write_str(cg, ")) continue;"); write_newline(cg);
+        }
+        if (k + 1 < clause_count) {
+            indent(cg); write_str(cg, "p2c_generator_local_set(generator, \""); write_str(cg, level_local);
+            write_str(cg, "\", p2c_obj_from_int("); emit_usize(cg, k + 1); write_str(cg, ")); continue;"); write_newline(cg);
+        } else {
+            indent(cg); write_str(cg, "return p2c_generator_yield(generator, ");
+            gen_suspension_expr(cg, expr->base.u.comprehension.elt, locals);
+            write_str(cg, ", 0);"); write_newline(cg);
+        }
+        pop_indent(cg); write_line(cg, "}");
     }
-    indent(cg); write_str(cg, "return p2c_generator_yield(generator, "); gen_suspension_expr(cg, expr->base.u.comprehension.elt, locals); write_str(cg, ", 0);"); write_newline(cg);
+    pop_indent(cg); write_line(cg, "}");
     pop_indent(cg); write_line(cg, "}");
     pop_indent(cg); write_line(cg, "}"); write_newline(cg);
     cg->current = saved_current;
     cg->indent_level = saved_indent;
-    write_str(cg, "p2c_generator_new_with_locals("); write_str(cg, step_name); write_str(cg, ", false, (const char*[]){\""); write_str(cg, iter_local); write_str(cg, "\"");
+    /* ジェネレータ本体を作る。ローカルはlevel・最外段のイテレータと、
+     * 外側スコープから取り込む名前。最外段のiterableはここで評価する
+     * （Pythonでは最も外側のiterableだけが生成時に評価される）。 */
+    write_str(cg, "p2c_generator_new_with_locals("); write_str(cg, step_name); write_str(cg, ", false, (const char*[]){\"");
+    write_str(cg, level_local); write_str(cg, "\", \""); write_str(cg, iter_local); write_str(cg, "\"");
     for (size_t i = 0; i < locals->bucket_count; i++) for (P2C_MapEntry *entry = locals->buckets[i]; entry; entry = entry->next) {
         const char *name = (const char*)entry->key;
-        if (strcmp(name, gen->target->base.u.name.name) == 0) continue;
+        if (map_has_name(targets, name)) continue;
         write_str(cg, ", \""); write_str(cg, name); write_str(cg, "\"");
     }
-    write_str(cg, "}, (P2C_Object*[]){p2c_builtin_iter("); gen_expr(cg, gen->iter); write_str(cg, ")");
+    write_str(cg, "}, (P2C_Object*[]){p2c_obj_from_int(0), p2c_builtin_iter(");
+    gen_expr(cg, ((P2C_AstComprehensionGen*)p2c_vec_get(generators, 0))->iter);
+    write_str(cg, ")");
     for (size_t i = 0; i < locals->bucket_count; i++) for (P2C_MapEntry *entry = locals->buckets[i]; entry; entry = entry->next) {
         const char *name = (const char*)entry->key;
-        if (strcmp(name, gen->target->base.u.name.name) == 0) continue;
+        if (map_has_name(targets, name)) continue;
         write_str(cg, ", ");
         if (map_has_name(cg->closure_env_names, name) && !map_has_name(cg->declared_vars, name) && cg->closure_env_var) {
             write_str(cg, "p2c_cell_get(p2c_dict_get("); write_str(cg, cg->closure_env_var); write_str(cg, ", p2c_obj_from_str(\""); write_str(cg, name); write_str(cg, "\")))");
@@ -12013,9 +12273,11 @@ static void gen_generator_expression(P2C_CodeGen *cg, P2C_AstExpr *expr) {
             write_ident(cg, name);
         }
     }
-    write_str(cg, "}, "); emit_usize(cg, capture_count + 1); write_str(cg, ")");
+    write_str(cg, "}, "); emit_usize(cg, capture_count + 2); write_str(cg, ")");
     free_name_map(locals);
+    free_name_map(targets);
 }
+
 
 static void gen_suspension_local_set(P2C_CodeGen *cg, P2C_AstExpr *target, P2C_AstExpr *value, P2C_Map *locals) {
     if (!target || target->base.type != AST_NAME) {
@@ -12771,10 +13033,10 @@ static void gen_stmt(P2C_CodeGen *cg, P2C_AstStmt *stmt) {
                     wrote = true;
                     p2c_str_append(cg->forward, "P2C_Object *");
                     P2C_AstArg *arg = (P2C_AstArg*)p2c_vec_get(fd->args, i);
-                    p2c_str_append(cg->forward, arg->name);
+                    p2c_str_append(cg->forward, mangle_ident(arg->name));
                 }
-                if (fd->vararg) { if (wrote) p2c_str_append(cg->forward, ", "); wrote = true; p2c_str_append(cg->forward, "P2C_Object *"); p2c_str_append(cg->forward, fd->vararg); }
-                if (fd->kwarg) { if (wrote) p2c_str_append(cg->forward, ", "); p2c_str_append(cg->forward, "P2C_Object *"); p2c_str_append(cg->forward, fd->kwarg); }
+                if (fd->vararg) { if (wrote) p2c_str_append(cg->forward, ", "); wrote = true; p2c_str_append(cg->forward, "P2C_Object *"); p2c_str_append(cg->forward, mangle_ident(fd->vararg)); }
+                if (fd->kwarg) { if (wrote) p2c_str_append(cg->forward, ", "); p2c_str_append(cg->forward, "P2C_Object *"); p2c_str_append(cg->forward, mangle_ident(fd->kwarg)); }
             }
             if (nfixed == 0 && !fd->vararg && !fd->kwarg) p2c_str_append(cg->forward, "void");
             p2c_str_append(cg->forward, ");\n");
@@ -12786,10 +13048,10 @@ static void gen_stmt(P2C_CodeGen *cg, P2C_AstStmt *stmt) {
                     wrote = true;
                     write_str(cg, "P2C_Object *");
                     P2C_AstArg *arg = (P2C_AstArg*)p2c_vec_get(fd->args, i);
-                    write_str(cg, arg->name);
+                    write_ident(cg, arg->name);
                 }
-                if (fd->vararg) { if (wrote) write_str(cg, ", "); wrote = true; write_str(cg, "P2C_Object *"); write_str(cg, fd->vararg); }
-                if (fd->kwarg) { if (wrote) write_str(cg, ", "); write_str(cg, "P2C_Object *"); write_str(cg, fd->kwarg); }
+                if (fd->vararg) { if (wrote) write_str(cg, ", "); wrote = true; write_str(cg, "P2C_Object *"); write_ident(cg, fd->vararg); }
+                if (fd->kwarg) { if (wrote) write_str(cg, ", "); write_str(cg, "P2C_Object *"); write_ident(cg, fd->kwarg); }
             }
             if (nfixed == 0 && !fd->vararg && !fd->kwarg) write_str(cg, "void");
             write_str(cg, ") {"); write_newline(cg); push_indent(cg);
@@ -12797,10 +13059,10 @@ static void gen_stmt(P2C_CodeGen *cg, P2C_AstStmt *stmt) {
              * -Wunused-parameter が -Werror 下でコンパイルエラーになる。
              * 常に(void)キャストしておけば、実際に使われる場合でも無害。 */
             for (size_t i = 0; i < nfixed; i++) {
-                indent(cg); write_str(cg, "(void)"); write_str(cg, ((P2C_AstArg*)p2c_vec_get(fd->args, i))->name); write_str(cg, ";"); write_newline(cg);
+                indent(cg); write_str(cg, "(void)"); write_ident(cg, ((P2C_AstArg*)p2c_vec_get(fd->args, i))->name); write_str(cg, ";"); write_newline(cg);
             }
-            if (fd->vararg) { indent(cg); write_str(cg, "(void)"); write_str(cg, fd->vararg); write_str(cg, ";"); write_newline(cg); }
-            if (fd->kwarg) { indent(cg); write_str(cg, "(void)"); write_str(cg, fd->kwarg); write_str(cg, ";"); write_newline(cg); }
+            if (fd->vararg) { indent(cg); write_str(cg, "(void)"); write_ident(cg, fd->vararg); write_str(cg, ";"); write_newline(cg); }
+            if (fd->kwarg) { indent(cg); write_str(cg, "(void)"); write_ident(cg, fd->kwarg); write_str(cg, ";"); write_newline(cg); }
             P2C_Map *saved_declared = cg->declared_vars;
             P2C_Map *saved_nonlocal_names = cg->nonlocal_names;
             P2C_Map *saved_cell_names = cg->cell_names;
@@ -12836,14 +13098,35 @@ static void gen_stmt(P2C_CodeGen *cg, P2C_AstStmt *stmt) {
             break;
         }
         case AST_CLASSDEF: {
+            /* ネストしたクラス定義は外側クラス名を前置したC名（Outer__Inner）で
+             * シンボルを分離する。モジュール直下のクラスは従来通りクラス名
+             * そのものを使う。名前長はソース依存で上限が無いため、切り詰めが
+             * 起きないようcodegenアロケータ上に確保する。 */
             const char *cname = n->u.classdef.name;
+            if (cg->current_class) {
+                size_t nested_cname_len = strlen(cg->current_class) + 2 + strlen(n->u.classdef.name);
+                char *nested_cname = (char*)p2c_alloc(cg->alloc, nested_cname_len + 1);
+                if (!nested_cname) {
+                    codegen_set_error(cg, P2C_ERR_NOMEM, "could not allocate nested class C name");
+                    break;
+                }
+                /* 長さは上で確定済み（外側名 + "__" + 内側名）。GCCの
+                 * -Wformat-truncation はsnprintfの長さ計算を追えないため、
+                 * 明示的な長さで組み立てる。 */
+                {
+                    size_t outer_len = strlen(cg->current_class);
+                    memcpy(nested_cname, cg->current_class, outer_len);
+                    nested_cname[outer_len] = '_';
+                    nested_cname[outer_len + 1] = '_';
+                    memcpy(nested_cname + outer_len + 2, n->u.classdef.name,
+                           nested_cname_len - outer_len - 2 + 1);
+                }
+                cname = nested_cname;
+            }
             /* super()解決用に、このクラスのメソッド本体を生成する間だけ
-             * current_class/current_class_baseを設定する（ネストしたクラス定義は
-             * 別の場所で非対応と案内しているため、単純な保存・復元でよい）。 */
+             * current_class/current_class_baseを設定する。 */
             const char *saved_current_class = cg->current_class;
-            const char *saved_current_class_base = cg->current_class_base;
             cg->current_class = cname;
-            cg->current_class_base = (const char*)p2c_map_get(cg->class_bases, cname);
             p2c_str_append_fmt(cg->forward, "static P2C_Object *%s = NULL;\n", cname);
             p2c_str_append_fmt(cg->forward, "static P2C_Object* %s__ctor(P2C_Object **args, size_t nargs);\n", cname);
             p2c_str_append_fmt(cg->forward, "static P2C_Object* %s__classobj(void);\n", cname);
@@ -12870,6 +13153,50 @@ static void gen_stmt(P2C_CodeGen *cg, P2C_AstStmt *stmt) {
                     p2c_str_append_fmt(cg->forward, "static P2C_Object* %s__%s__kwadapter(P2C_Object *self, P2C_Object **args, size_t nargs, const char **kw_names, P2C_Object **kw_values, size_t nkw);\n", cname, fd->name);
                 }
             }
+            /* ネストしたクラスの定義は外側クラスの__classobj()から参照するため、
+             * メソッド本体より先にファイルスコープへ生成しておく。 */
+            for (size_t i = 0; i < p2c_vec_len(n->u.classdef.body); i++) {
+                P2C_AstStmt *nested_member = (P2C_AstStmt*)p2c_vec_get(n->u.classdef.body, i);
+                if (nested_member->base.type != AST_CLASSDEF) continue;
+                P2C_String *saved_nested_current = cg->current;
+                int saved_nested_indent = cg->indent_level;
+                cg->current = cg->toplevel;
+                cg->indent_level = 0;
+                gen_stmt(cg, nested_member);
+                write_newline(cg);
+                cg->current = saved_nested_current;
+                cg->indent_level = saved_nested_indent;
+            }
+            /* このクラスの本体で可視なネストクラス（Python名 -> C名）。
+             * Python仕様ではクラススコープの名前はメソッド本体から見えないため、
+             * in_class_bodyがfalseのときの参照は明示的に診断する。 */
+            P2C_Map *saved_nested_aliases = cg->nested_class_aliases;
+            bool saved_in_class_body = cg->in_class_body;
+            P2C_Map *own_nested_aliases = p2c_map_new(cg->alloc, p2c_hash_str, p2c_eq_str);
+            if (!own_nested_aliases) codegen_set_error(cg, P2C_ERR_NOMEM, "could not allocate nested class alias map");
+            for (size_t i = 0; own_nested_aliases && i < p2c_vec_len(n->u.classdef.body); i++) {
+                P2C_AstStmt *nested_member = (P2C_AstStmt*)p2c_vec_get(n->u.classdef.body, i);
+                if (nested_member->base.type != AST_CLASSDEF) continue;
+                size_t nested_name_len = strlen(nested_member->base.u.classdef.name);
+                size_t alias_len = strlen(cname) + 2 + nested_name_len;
+                char *key_dup = p2c_alloc(cg->alloc, nested_name_len + 1);
+                char *val_dup = p2c_alloc(cg->alloc, alias_len + 1);
+                if (key_dup && val_dup) {
+                    strcpy(key_dup, nested_member->base.u.classdef.name);
+                    /* C名は 外側C名 + "__" + 内側Python名（alias_lenで長さ確定済み）。 */
+                    {
+                        size_t outer_len = strlen(cname);
+                        memcpy(val_dup, cname, outer_len);
+                        val_dup[outer_len] = '_';
+                        val_dup[outer_len + 1] = '_';
+                        memcpy(val_dup + outer_len + 2, nested_member->base.u.classdef.name,
+                               alias_len - outer_len - 2 + 1);
+                    }
+                    p2c_map_insert(own_nested_aliases, key_dup, val_dup);
+                }
+            }
+            cg->nested_class_aliases = own_nested_aliases;
+            cg->in_class_body = false;
             for (size_t i = 0; i < p2c_vec_len(n->u.classdef.body); i++) {
                 P2C_AstStmt *member = (P2C_AstStmt*)p2c_vec_get(n->u.classdef.body, i);
                 if (member->base.type != AST_FUNCTIONDEF) continue;
@@ -12916,7 +13243,7 @@ static void gen_stmt(P2C_CodeGen *cg, P2C_AstStmt *stmt) {
                  * （例: def __iter__(self): return iter([1,2,3]) のようにselfを
                  * 使わないメソッド）。常に(void)キャストしておく。 */
                 for (size_t j = 0; j < p2c_vec_len(fd->args); j++) {
-                    indent(cg); write_str(cg, "(void)"); write_str(cg, ((P2C_AstArg*)p2c_vec_get(fd->args, j))->name); write_str(cg, ";"); write_newline(cg);
+                    indent(cg); write_str(cg, "(void)"); write_ident(cg, ((P2C_AstArg*)p2c_vec_get(fd->args, j))->name); write_str(cg, ";"); write_newline(cg);
                 }
                 if (fd->vararg) { indent(cg); write_str(cg, "(void)"); write_ident(cg, fd->vararg); write_str(cg, ";"); write_newline(cg); }
                 if (fd->kwarg) { indent(cg); write_str(cg, "(void)"); write_ident(cg, fd->kwarg); write_str(cg, ";"); write_newline(cg); }
@@ -13041,7 +13368,7 @@ static void gen_stmt(P2C_CodeGen *cg, P2C_AstStmt *stmt) {
             }
             write_line(cg, "{NULL, NULL, NULL}"); pop_indent(cg); write_line(cg, "};");
             indent(cg); write_str(cg, "static P2C_Object* "); write_str(cg, cname); write_str(cg, "__classobj(void) {"); write_newline(cg); push_indent(cg);
-            indent(cg); write_str(cg, "if (!"); write_str(cg, cname); write_str(cg, ") "); write_str(cg, cname); write_str(cg, " = p2c_class_new(\""); write_str(cg, cname); write_str(cg, "\", "); write_str(cg, cname); write_str(cg, "__ctor, "); write_str(cg, cname); write_str(cg, "__methods, ");
+            indent(cg); write_str(cg, "if (!"); write_str(cg, cname); write_str(cg, ") "); write_str(cg, cname); write_str(cg, " = p2c_class_new(\""); write_str(cg, n->u.classdef.name); write_str(cg, "\", "); write_str(cg, cname); write_str(cg, "__ctor, "); write_str(cg, cname); write_str(cg, "__methods, ");
             if (p2c_vec_len(n->u.classdef.bases) > 0) {
                 write_str(cg, "\"");
                 bool wrote_any = false;
@@ -13056,8 +13383,22 @@ static void gen_stmt(P2C_CodeGen *cg, P2C_AstStmt *stmt) {
                 write_str(cg, "\"");
             } else write_str(cg, "NULL");
             write_str(cg, ");"); write_newline(cg);
+            /* クラス本体の文はPython同様に上から順に評価する。ネストしたclassの
+             * 定義はその場で外側クラスの属性として登録し、クラス本体の式からは
+             * その名前で参照できるようにする。 */
+            cg->in_class_body = true;
             for (size_t i = 0; i < p2c_vec_len(n->u.classdef.body); i++) {
                 P2C_AstStmt *member = (P2C_AstStmt*)p2c_vec_get(n->u.classdef.body, i);
+                if (member->base.type == AST_CLASSDEF) {
+                    const char *nested_alias = nested_class_alias(cg, member->base.u.classdef.name);
+                    if (!nested_alias) {
+                        codegen_set_error(cg, P2C_ERR_NOT_IMPLEMENTED, "could not resolve nested class name");
+                        continue;
+                    }
+                    indent(cg); write_str(cg, "if (!"); write_str(cg, nested_alias); write_str(cg, ") "); write_str(cg, nested_alias); write_str(cg, " = "); write_str(cg, nested_alias); write_str(cg, "__classobj();"); write_newline(cg);
+                    indent(cg); write_str(cg, "p2c_setattr("); write_str(cg, cname); write_str(cg, ", \""); write_str(cg, member->base.u.classdef.name); write_str(cg, "\", "); write_str(cg, nested_alias); write_str(cg, ");"); write_newline(cg);
+                    continue;
+                }
                 if (member->base.type == AST_ASSIGN && p2c_vec_len(member->base.u.assign.targets) == 1) {
                     P2C_AstExpr *t = (P2C_AstExpr*)p2c_vec_get(member->base.u.assign.targets, 0);
                     if (t->base.type == AST_NAME) {
@@ -13065,6 +13406,7 @@ static void gen_stmt(P2C_CodeGen *cg, P2C_AstStmt *stmt) {
                     }
                 }
             }
+            cg->in_class_body = false;
             indent(cg); write_str(cg, "return "); write_str(cg, cname); write_str(cg, ";"); write_newline(cg);
             pop_indent(cg); write_line(cg, "}"); write_newline(cg);
             indent(cg); write_str(cg, "static P2C_Object* "); write_str(cg, cname); write_str(cg, "__ctor(P2C_Object **args, size_t nargs) {"); write_newline(cg); push_indent(cg);
@@ -13098,6 +13440,13 @@ static void gen_stmt(P2C_CodeGen *cg, P2C_AstStmt *stmt) {
                         const char *bn = extract_base_name(b);
                         if (!bn) continue;
                         const char *inherited = (const char*)p2c_map_get(cg->class_init_adapter, bn);
+                        if (!inherited && saved_current_class) {
+                            /* 基底が同じ外側クラスのネストクラスである場合、
+                             * 解決済み__init__は前置済みC名で登録されている。 */
+                            char nested_base[512];
+                            snprintf(nested_base, sizeof(nested_base), "%s__%s", saved_current_class, bn);
+                            inherited = (const char*)p2c_map_get(cg->class_init_adapter, nested_base);
+                        }
                         if (inherited) { snprintf(own_init_name, sizeof(own_init_name), "%s", inherited); resolved_init = own_init_name; }
                     }
                 }
@@ -13112,7 +13461,9 @@ static void gen_stmt(P2C_CodeGen *cg, P2C_AstStmt *stmt) {
             }
             write_line(cg, "return self;"); pop_indent(cg); write_line(cg, "}"); write_newline(cg);
             cg->current_class = saved_current_class;
-            cg->current_class_base = saved_current_class_base;
+            cg->nested_class_aliases = saved_nested_aliases;
+            cg->in_class_body = saved_in_class_body;
+            if (own_nested_aliases) free_name_map(own_nested_aliases);
             break;
         }
         case AST_IMPORT:
@@ -13395,6 +13746,11 @@ P2C_Result p2c_codegen_expr(P2C_CodeGen *cg, P2C_AstExpr *expr, P2C_String *out)
 #ifndef PYTHON_CODE_TO_C_NO_STDLIB
 #define _GNU_SOURCE
 #define _POSIX_C_SOURCE 200809L
+/* 機能マクロが要求水準を満たしているかを確認する（-Wunused-macros への対処と、
+ * 古い環境で暗黙に別の宣言へ落ちることを防ぐ役割を兼ねる）。 */
+#if _POSIX_C_SOURCE < 200112L
+#error "python_code_to_c requires POSIX.1-2001 or later (strtok_r, strdup, snprintf)"
+#endif
 #endif
 #include <stddef.h>
 #ifndef INT64_MAX
@@ -13443,7 +13799,9 @@ void *p2c_heap_alloc_raw(size_t size) {
         heap_failures++;
         return NULL;
     }
-    P2C_HeapBlockHeader *hdr = (P2C_HeapBlockHeader*)(heap_start + heap_used);
+    /* 埋め込み用リニアヒープのブロックはヘッダ長がアライン倍数なので整列している。
+     * char* からの直接キャストは -Wcast-align=strict を誤検出させるため void* を経由する。 */
+    P2C_HeapBlockHeader *hdr = (P2C_HeapBlockHeader*)(void*)(heap_start + heap_used);
     heap_used += total;
     if (heap_used > heap_peak) heap_peak = heap_used;
     hdr->size  = size;
@@ -13951,6 +14309,7 @@ static void gc_free_obj_data(P2C_Object *obj) {
         case OBJ_CLASS:
             p2c_heap_free(obj->u.v_class.name);
             p2c_heap_free(obj->u.v_class.base_name);
+            p2c_heap_free(obj->u.v_class.mro);
             free_map_shallow(obj->u.v_class.attrs);
             break;
         case OBJ_INSTANCE:
@@ -14938,6 +15297,8 @@ P2C_Object* p2c_class_new(const char *name, P2C_CallableFn ctor, P2C_MethodDef *
     o->u.v_class.methods = methods;
     o->u.v_class.attrs = new_attr_map();
     o->u.v_class.base_name = p2c_strdup_local(base_name ? base_name : "");
+    /* MROキャッシュは初回のメソッド・属性解決時に計算する（未計算はNULL）。 */
+    o->u.v_class.mro = NULL;
     if (!o->u.v_class.name || !o->u.v_class.attrs || !o->u.v_class.base_name) {
         p2c_heap_free(o->u.v_class.name);
         p2c_heap_free(o->u.v_class.base_name);
@@ -15031,50 +15392,376 @@ static P2C_Object* p2c_find_class_by_name(const char *name) {
     return NULL;
 }
 
-/* base_nameはカンマ区切りで複数の基底クラス名を保持しうる（多重継承対応）。
- * 各基底クラスを左から順に（Pythonの単純なMRO近似として）再帰的に探索し、
- * 最初に見つかったメソッドを返す。 */
-static P2C_MethodDef* p2c_find_method_in_chain(P2C_Object *cls_obj, const char *name) {
-    if (!cls_obj) return NULL;
-    P2C_MethodDef *m = cls_obj->u.v_class.methods;
-    while (m && m->name) {
-        if (strcmp(m->name, name) == 0) return m;
-        m++;
+/* ---- クラス階層のC3線形化（PythonのMRO） ------------------------------
+ * 継承関係は名前文字列（"Base" や "Left,Right"）で保持しているため、名前から
+ * p2c_find_class_by_name() でクラスオブジェクトを引き、Pythonと同じC3線形化
+ *     L(C) = C + merge(L(B1), ..., L(Bn), [B1, ..., Bn])
+ * を計算する。ダイヤモンド継承
+ *     class A:        def who(self): ...
+ *     class B(A):     pass
+ *     class C(A):     def who(self): ...
+ *     class D(B, C):  pass
+ * ではPythonは C.who を選ぶ（MROは D, B, C, A）。以前は「左の基底から順に
+ * 深さ優先で再帰する」近似だったため A.who を選び、CPythonと静かに異なる
+ * 結果を返していた。
+ *
+ * 計算結果はクラスごとに一度だけ求め、v_class.mro へ「自分以外の名前を解決順に
+ * カンマで連結した文字列」としてキャッシュする（基底関係はクラス生成時に確定し、
+ * 以後変化しないため再計算は不要）。
+ *
+ * 破綻した階層（循環、深さ・幅・アリーナの上限超過、mergeの失敗）では従来と
+ * 同じ深さ優先の訪問順をキャッシュする。このときの解決結果は以前の実装と
+ * 一致する（安全側へのフォールバック）。
+ */
+#define P2C_MRO_MAX_NAMES 32
+#define P2C_MRO_MAX_BASES 8
+#define P2C_MRO_MAX_DEPTH 12
+/* アリーナはMRO計算中だけ使う一時領域。組込み（カーネルスタックが数KB）でも
+ * 収まるよう、各再帰フレームの作業配列は小さく、アリーナも4KB未満に抑える。 */
+#define P2C_MRO_ARENA_BYTES 3072
+
+typedef struct {
+    const char *names[P2C_MRO_MAX_NAMES];
+    size_t count;
+} P2C_NameList;
+
+typedef struct {
+    char *base;
+    size_t used;
+} P2C_MroArena;
+
+/* MRO文字列（"B,C,A"形式）をコピーせずに走査するための範囲。 */
+typedef struct {
+    const char *ptr;
+    size_t len;
+} P2C_NameSpan;
+
+/* クラス名はクラスオブジェクトやbase_nameに紐づく文字列を指すだけでよいが、
+ * strtok_rが書き換える一時バッファは関数を抜けると消えるため、線形化の間だけ
+ * 有効なアリーナへコピーして寿命を揃える。 */
+static const char* p2c_mro_intern(P2C_MroArena *arena, const char *text, size_t len) {
+    if (!arena || !text) return NULL;
+    if (len + 1u > (size_t)P2C_MRO_ARENA_BYTES - arena->used) return NULL;
+    char *slot = arena->base + arena->used;
+    memcpy(slot, text, len);
+    slot[len] = '\0';
+    arena->used += len + 1u;
+    return slot;
+}
+
+static bool p2c_name_list_add(P2C_NameList *list, const char *name) {
+    if (!list || !name || !name[0]) return false;
+    for (size_t i = 0; i < list->count; i++) {
+        if (strcmp(list->names[i], name) == 0) return true;
     }
+    if (list->count >= P2C_MRO_MAX_NAMES) return false;
+    list->names[list->count] = name;
+    list->count++;
+    return true;
+}
+
+static bool p2c_name_list_has_from(const P2C_NameList *list, size_t from, const char *name) {
+    for (size_t i = from; i < list->count; i++) {
+        if (strcmp(list->names[i], name) == 0) return true;
+    }
+    return false;
+}
+
+/* C3のmerge。lists[0..nlists-1]の先頭から、他のどのリストの末尾にも現れない
+ * 名前を1つずつ取り出してoutへ移す。取り出せる名前が無ければ階層が一貫して
+ * いない（循環など）ためfalseを返す。 */
+static bool p2c_c3_merge(P2C_NameList *const *lists, size_t nlists, P2C_NameList *out) {
+    size_t remaining = 0;
+    for (size_t i = 0; i < nlists; i++) remaining += lists[i]->count;
+    while (remaining > 0) {
+        bool took = false;
+        for (size_t i = 0; i < nlists && !took; i++) {
+            if (lists[i]->count == 0) continue;
+            const char *candidate = lists[i]->names[0];
+            bool blocked = false;
+            for (size_t j = 0; j < nlists && !blocked; j++) {
+                if (j == i || lists[j]->count == 0) continue;
+                if (p2c_name_list_has_from(lists[j], 1, candidate)) blocked = true;
+            }
+            if (blocked) continue;
+            if (!p2c_name_list_add(out, candidate)) return false;
+            for (size_t j = 0; j < nlists; j++) {
+                if (lists[j]->count > 0 && strcmp(lists[j]->names[0], candidate) == 0) {
+                    memmove(&lists[j]->names[0], &lists[j]->names[1],
+                            (lists[j]->count - 1) * sizeof(const char*));
+                    lists[j]->count--;
+                }
+            }
+            remaining = 0;
+            for (size_t j = 0; j < nlists; j++) remaining += lists[j]->count;
+            took = true;
+        }
+        if (!took) return false;
+    }
+    return true;
+}
+
+/* outの先頭には自分自身の名前が入る。 */
+static bool p2c_c3_linearize(P2C_Object *cls_obj, P2C_NameList *out, P2C_MroArena *arena, int depth) {
+    if (!cls_obj || !out || !arena || depth > P2C_MRO_MAX_DEPTH) return false;
+    if (!p2c_name_list_add(out, cls_obj->u.v_class.name)) return false;
     const char *bases = cls_obj->u.v_class.base_name;
-    if (!bases || !bases[0]) return NULL;
+    if (!bases || !bases[0]) return true;
     char buf[512];
     size_t blen = strlen(bases);
-    if (blen >= sizeof(buf)) blen = sizeof(buf) - 1;
-    memcpy(buf, bases, blen);
-    buf[blen] = '\0';
+    if (blen >= sizeof(buf)) return false;
+    memcpy(buf, bases, blen + 1u);
+    P2C_NameList direct;
+    P2C_NameList sub_lists[P2C_MRO_MAX_BASES];
+    P2C_NameList *all_lists[P2C_MRO_MAX_BASES + 1];
+    size_t nsub = 0;
+    direct.count = 0;
     char *save = NULL;
     for (char *tok = strtok_r(buf, ",", &save); tok; tok = strtok_r(NULL, ",", &save)) {
-        P2C_Object *base_cls = p2c_find_class_by_name(tok);
-        if (base_cls) {
-            P2C_MethodDef *found = p2c_find_method_in_chain(base_cls, name);
-            if (found) return found;
+        /* 直接の基底が上限を超える階層はC3を諦めて従来の深さ優先へ委ねる
+         * （スタック使用量を有界に保つため）。 */
+        if (nsub >= P2C_MRO_MAX_BASES) return false;
+        const char *interned = p2c_mro_intern(arena, tok, strlen(tok));
+        if (!interned) return false;
+        if (!p2c_name_list_add(&direct, interned)) return false;
+        sub_lists[nsub].count = 0;
+        /* 未登録の基底（組み込み例外名など）は名前だけを1要素リストとして残し、
+         * MROには含める（解決順の比較には名前で十分なため）。 */
+        P2C_Object *base_cls = p2c_find_class_by_name(interned);
+        if (base_cls && base_cls != cls_obj) {
+            if (!p2c_c3_linearize(base_cls, &sub_lists[nsub], arena, depth + 1)) return false;
+        } else if (!p2c_name_list_add(&sub_lists[nsub], interned)) {
+            return false;
         }
+        all_lists[nsub] = &sub_lists[nsub];
+        nsub++;
+    }
+    all_lists[nsub] = &direct;
+    P2C_NameList tail;
+    tail.count = 0;
+    if (!p2c_c3_merge(all_lists, nsub + 1, &tail)) return false;
+    for (size_t i = 0; i < tail.count; i++) {
+        if (!p2c_name_list_add(out, tail.names[i])) return false;
+    }
+    return true;
+}
+
+/* C3を計算できない階層向けのフォールバック。以前の実装と同じ「左の基底から
+ * 順に深さ優先で訪問した順序」を重複除去して並べる。 */
+static bool p2c_mro_dfs_collect(P2C_Object *cls_obj, P2C_NameList *out, P2C_MroArena *arena, int depth) {
+    if (!cls_obj || !out || !arena || depth > P2C_MRO_MAX_DEPTH) return false;
+    const char *bases = cls_obj->u.v_class.base_name;
+    if (!bases || !bases[0]) return true;
+    char buf[512];
+    size_t blen = strlen(bases);
+    if (blen >= sizeof(buf)) return false;
+    memcpy(buf, bases, blen + 1u);
+    char *save = NULL;
+    for (char *tok = strtok_r(buf, ",", &save); tok; tok = strtok_r(NULL, ",", &save)) {
+        const char *interned = p2c_mro_intern(arena, tok, strlen(tok));
+        if (!interned) return false;
+        if (!p2c_name_list_add(out, interned)) return false;
+        P2C_Object *base_cls = p2c_find_class_by_name(interned);
+        if (base_cls && base_cls != cls_obj) {
+            if (!p2c_mro_dfs_collect(base_cls, out, arena, depth + 1)) return false;
+        }
+    }
+    return true;
+}
+
+/* list[from..]の名前をカンマで連結したヒープ文字列を作る。 */
+static char* p2c_mro_join(const P2C_NameList *list, size_t from) {
+    size_t total = 1u;
+    for (size_t i = from; i < list->count; i++) total += strlen(list->names[i]) + 1u;
+    char *joined = (char*)p2c_malloc_checked(total, "class MRO");
+    if (!joined) return NULL;
+    size_t pos = 0;
+    for (size_t i = from; i < list->count; i++) {
+        size_t len = strlen(list->names[i]);
+        if (i > from) joined[pos++] = ',';
+        memcpy(joined + pos, list->names[i], len);
+        pos += len;
+    }
+    joined[pos] = '\0';
+    return joined;
+}
+
+/* クラスのMRO（自分自身を除く解決順）を返す。初回だけ計算してキャッシュする。
+ * 計算自体に失敗した場合も「継承なし」を表す空文字列を返し、毎回の再計算を防ぐ。 */
+static const char* p2c_class_mro(P2C_Object *cls_obj) {
+    if (!cls_obj || !cls_obj->cls || cls_obj->cls->type_tag != OBJ_CLASS) return NULL;
+    if (cls_obj->u.v_class.mro) return cls_obj->u.v_class.mro;
+    char arena_buf[P2C_MRO_ARENA_BYTES];
+    P2C_MroArena arena;
+    P2C_NameList order;
+    arena.base = arena_buf;
+    arena.used = 0;
+    order.count = 0;
+    if (!p2c_c3_linearize(cls_obj, &order, &arena, 0)) {
+        order.count = 0;
+        arena.used = 0;
+        if (!p2c_mro_dfs_collect(cls_obj, &order, &arena, 0)) order.count = 0;
+    }
+    char *joined = p2c_mro_join(&order, 1);
+    cls_obj->u.v_class.mro = joined ? joined : p2c_strdup_local("");
+    return cls_obj->u.v_class.mro;
+}
+
+/* MRO文字列から次の名前を取り出す。offsetは呼び出し側が0で初期化し、名前が
+ * 尽きたらfalseを返す。名前はコピーしない（呼び出し中はMRO文字列が生存する）。 */
+static bool p2c_mro_next(const char *mro, size_t *offset, P2C_NameSpan *out) {
+    if (!mro || !offset || !out) return false;
+    size_t i = *offset;
+    if (mro[i] == '\0') return false;
+    size_t start = i;
+    while (mro[i] != '\0' && mro[i] != ',') i++;
+    out->ptr = mro + start;
+    out->len = i - start;
+    if (mro[i] == ',') i++;
+    *offset = i;
+    return out->len > 0;
+}
+
+static bool p2c_name_span_equals(const P2C_NameSpan *span, const char *name) {
+    if (!span || !name) return false;
+    return strlen(name) == span->len && memcmp(name, span->ptr, span->len) == 0;
+}
+
+static P2C_Object* p2c_find_class_by_span(const P2C_NameSpan *span) {
+    if (!span || span->len == 0) return NULL;
+    for (int i = 0; i < g_class_registry_count; i++) {
+        const char *name = g_class_registry_names[i];
+        if (name && p2c_name_span_equals(span, name)) return g_class_registry_objs[i];
     }
     return NULL;
 }
 
-/* isinstance / has_method 用: base_nameのカンマ区切りリストのいずれかに一致するか、
- * さらにその先の基底クラスも再帰的に確認する。 */
+static P2C_MethodDef* p2c_find_own_method(P2C_Object *cls_obj, const char *name) {
+    if (!cls_obj || !name) return NULL;
+    for (P2C_MethodDef *m = cls_obj->u.v_class.methods; m && m->name; m++) {
+        if (strcmp(m->name, name) == 0) return m;
+    }
+    return NULL;
+}
+
+/* メソッドの解決。自クラス → MRO順の基底クラス。PythonのMROに従うため、
+ * ダイヤモンド継承でも基底の選択がCPythonと一致する。 */
+static P2C_MethodDef* p2c_find_method_in_chain(P2C_Object *cls_obj, const char *name) {
+    if (!cls_obj || !name) return NULL;
+    P2C_MethodDef *own = p2c_find_own_method(cls_obj, name);
+    if (own) return own;
+    const char *mro = p2c_class_mro(cls_obj);
+    size_t offset = 0;
+    P2C_NameSpan span;
+    while (p2c_mro_next(mro, &offset, &span)) {
+        P2C_Object *base_cls = p2c_find_class_by_span(&span);
+        if (!base_cls) continue;
+        P2C_MethodDef *found = p2c_find_own_method(base_cls, name);
+        if (found) return found;
+    }
+    return NULL;
+}
+
+/* クラス本体の代入（メソッド以外のクラス属性）をMRO順に探す。
+ * Python同様、サブクラスのインスタンスから基底クラスのクラス属性が見える。 */
+static P2C_Object* p2c_class_attr_along_mro(P2C_Object *cls_obj, const char *name) {
+    if (!cls_obj || !name || !cls_obj->cls || cls_obj->cls->type_tag != OBJ_CLASS) return NULL;
+    if (cls_obj->u.v_class.attrs) {
+        P2C_Object *val = attr_map_get(cls_obj->u.v_class.attrs, name);
+        if (val) return val;
+    }
+    const char *mro = p2c_class_mro(cls_obj);
+    size_t offset = 0;
+    P2C_NameSpan span;
+    while (p2c_mro_next(mro, &offset, &span)) {
+        P2C_Object *base_cls = p2c_find_class_by_span(&span);
+        if (!base_cls || !base_cls->u.v_class.attrs) continue;
+        P2C_Object *val = attr_map_get(base_cls->u.v_class.attrs, name);
+        if (val) return val;
+    }
+    return NULL;
+}
+
+/* obj.method を値として取り出したとき（m = obj.method、sorted(key=obj.key) など）
+ * に返す「束縛メソッド」。呼び出し時は元のインスタンスをselfとしてメソッドへ
+ * 転送する。環境辞書（selfとメソッド名）を持つクロージャとして実装するため、
+ * 新しいOBJ型やGCルートを増やさずに済み、GCの走査対象
+ * （関数オブジェクトのenv辞書）にもそのまま乗る。 */
+static P2C_Object* p2c_bound_method_dispatch(P2C_Object *env, P2C_Object **args, size_t nargs) {
+    if (!env || !env->cls || env->cls->type_tag != OBJ_DICT) {
+        p2c_raise(p2c_make_exception("TypeError", "invalid bound method receiver"));
+        return &P2C_None;
+    }
+    P2C_Object *bound_self = p2c_dict_get_with_default(env, p2c_obj_from_str("self"), &P2C_None);
+    P2C_Object *bound_name = p2c_dict_get_with_default(env, p2c_obj_from_str("name"), &P2C_None);
+    if (!bound_self || bound_self == &P2C_None || !p2c_obj_is_str(bound_name)) {
+        p2c_raise(p2c_make_exception("TypeError", "invalid bound method"));
+        return &P2C_None;
+    }
+    return p2c_call_attr(bound_self, p2c_obj_as_str(bound_name), args, nargs);
+}
+
+static P2C_Object* p2c_bound_method_new(P2C_Object *self_obj, const char *name) {
+    P2C_Object *env = p2c_dict_new();
+    if (!env) return &P2C_None;
+    p2c_dict_set(env, p2c_obj_from_str("self"), self_obj);
+    p2c_dict_set(env, p2c_obj_from_str("name"), p2c_obj_from_str(name));
+    return p2c_closure_new(name, p2c_bound_method_dispatch, env);
+}
+
+/* super().method(...) の解決。Pythonでは「インスタンスの型のMRO上で、そのメソッドを
+ * 定義しているクラスの次」から探索する。defining_class（メソッド本体を書いたクラス）
+ * を受け取り、selfの実際の型のMROで defining_class の次から name を持つメソッドを
+ * 探して self を束縛して呼ぶ。コード生成時に基底チェーンを静的に辿る近似と違い、
+ * 多重継承のダイヤモンド（class D(B, C)、B(A)、C(A)）でもCPythonと同じ実装が選ばれる。 */
+P2C_Object* p2c_super_call_attr(P2C_Object *self, P2C_Object *defining_class, const char *name, P2C_Object **args, size_t nargs) {
+    if (!self || !self->cls || self->cls->type_tag != OBJ_INSTANCE || !name) {
+        p2c_raise(p2c_make_exception("TypeError", "super() requires an instance method receiver"));
+        return &P2C_None;
+    }
+    P2C_Object *klass = self->u.v_instance.klass;
+    const char *def_name = (defining_class && defining_class->cls && defining_class->cls->type_tag == OBJ_CLASS)
+        ? defining_class->u.v_class.name : NULL;
+    if (!def_name) {
+        /* 呼び出し元のクラスが分からない場合は、自クラスの次という情報が無いため、
+         * インスタンスのクラス自身（＝最も自然な既定）から探索する。 */
+        P2C_MethodDef *own = p2c_find_own_method(klass, name);
+        if (own) return own->func(self, args, nargs);
+    }
+    const char *mro = p2c_class_mro(klass);
+    size_t offset = 0;
+    P2C_NameSpan span;
+    /* MROリストは「自分自身を除く」並びなので、defining_classがインスタンスの
+     * クラス自身なら先頭から、そうでなければMRO上でdefining_classの次から探索する
+     * （Pythonの super() はメソッドを定義しているクラス自身を飛ばす）。 */
+    bool skipping = def_name != NULL &&
+        !(klass->u.v_class.name && strcmp(klass->u.v_class.name, def_name) == 0);
+    while (p2c_mro_next(mro, &offset, &span)) {
+        if (skipping) {
+            if (p2c_name_span_equals(&span, def_name)) skipping = false;
+            continue;
+        }
+        P2C_Object *base_cls = p2c_find_class_by_span(&span);
+        if (!base_cls) continue;
+        P2C_MethodDef *found = p2c_find_own_method(base_cls, name);
+        if (found) return found->func(self, args, nargs);
+    }
+    p2c_raise(p2c_make_exception("AttributeError", name));
+    return &P2C_None;
+}
+
+/* isinstance 用: クラス自身またはMRO上の基底クラス名に一致するか。
+ * MRO文字列はC3線形化（失敗時は深さ優先の訪問順）なので、名前の一致判定は
+ * 従来の再帰的な探索と同じか、より多くの基底名（未登録の基底名もMROに残る）を
+ * 見る。Pythonのisinstanceの判定に近づく方向の変更で、結果は広がるのみ。 */
 static bool p2c_class_chain_has_name(P2C_Object *cls_obj, const char *target_name) {
-    if (!cls_obj) return false;
+    if (!cls_obj || !target_name || !target_name[0]) return false;
     if (cls_obj->u.v_class.name && strcmp(cls_obj->u.v_class.name, target_name) == 0) return true;
-    const char *bases = cls_obj->u.v_class.base_name;
-    if (!bases || !bases[0]) return false;
-    char buf[512];
-    size_t blen = strlen(bases);
-    if (blen >= sizeof(buf)) blen = sizeof(buf) - 1;
-    memcpy(buf, bases, blen);
-    buf[blen] = '\0';
-    char *save = NULL;
-    for (char *tok = strtok_r(buf, ",", &save); tok; tok = strtok_r(NULL, ",", &save)) {
-        P2C_Object *base_cls = p2c_find_class_by_name(tok);
-        if (base_cls && p2c_class_chain_has_name(base_cls, target_name)) return true;
+    const char *mro = p2c_class_mro(cls_obj);
+    size_t offset = 0;
+    P2C_NameSpan span;
+    while (p2c_mro_next(mro, &offset, &span)) {
+        if (p2c_name_span_equals(&span, target_name)) return true;
     }
     return false;
 }
@@ -15102,6 +15789,9 @@ bool p2c_isinstance_of_class(P2C_Object *obj, const char *class_name) {
 
 bool p2c_isinstance_of_object(P2C_Object *obj, P2C_Object *class_obj) {
     if (!class_obj || !class_obj->cls || class_obj->cls->type_tag != OBJ_CLASS) return false;
+    /* クラスオブジェクトの同一性で判定できる場合はそれを使う。名前ベースの
+     * 判定はフォールバックとして残す（組み込み型や名前で保持された継承関係用）。 */
+    if (obj && obj->cls && obj->cls->type_tag == OBJ_INSTANCE && obj->u.v_instance.klass == class_obj) return true;
     return p2c_isinstance_of_class(obj, class_obj->u.v_class.name);
 }
 
@@ -15126,6 +15816,8 @@ P2C_Object* p2c_builtin_type(P2C_Object *obj) {
         case OBJ_SET: tn = "set"; break;
         case OBJ_INSTANCE: tn = (obj->u.v_instance.klass && obj->u.v_instance.klass->u.v_class.name) ? obj->u.v_instance.klass->u.v_class.name : "object"; break;
         case OBJ_EXCEPTION: tn = obj->u.v_exception.type_name ? obj->u.v_exception.type_name : "Exception"; break;
+        case OBJ_CLASS: tn = "type"; break;
+        case OBJ_MODULE: tn = "module"; break;
         default: break;
     }
     /* 実際のtypeオブジェクトは表現していないため、print(type(x))で表示した際に
@@ -16732,6 +17424,14 @@ void p2c_runtime_free(void *ptr) { p2c_heap_free(ptr); }
 
 void p2c_raise(P2C_Object *exc) {
     if (!exc) exc = p2c_make_exception("RuntimeError", "unknown error");
+    if (!exc) {
+        /* 例外オブジェクトの生成自体に失敗した場合（メモリ枯渇）。NULLを
+         * 例外として伝播させるとハンドラ側で落ちるため、ここで安全に停止する
+         * （-fanalyzer が指摘した経路）。 */
+        p2c_platform_write("Exception\n: out of memory while creating exception object\n");
+        p2c_platform_abort("unhandled exception");
+        return;
+    }
     if (p2c_exc_stack) { p2c_exc_stack->exc = exc; P2C_LONGJMP(p2c_exc_stack->env, 1); }
     if (exc->cls && exc->cls->type_tag == OBJ_EXCEPTION) {
         p2c_platform_write(exc->u.v_exception.type_name ? exc->u.v_exception.type_name : "Exception");
@@ -16793,9 +17493,11 @@ bool p2c_exc_name_match(P2C_Object *exc, const char *type_name) {
     if (!type_name || !*type_name) return true;
     if (exc->cls && exc->cls->type_tag == OBJ_EXCEPTION) return strcmp(exc->u.v_exception.type_name ? exc->u.v_exception.type_name : "", type_name) == 0 || strcmp(type_name, "Exception") == 0;
     if (exc->cls && exc->cls->type_tag == OBJ_INSTANCE && exc->u.v_instance.klass && exc->u.v_instance.klass->cls && exc->u.v_instance.klass->cls->type_tag == OBJ_CLASS) {
-        const char *name = exc->u.v_instance.klass->u.v_class.name ? exc->u.v_instance.klass->u.v_class.name : "";
-        const char *base = exc->u.v_instance.klass->u.v_class.base_name ? exc->u.v_instance.klass->u.v_class.base_name : "";
-        return strcmp(name, type_name) == 0 || strcmp(base, type_name) == 0 || strcmp(type_name, "Exception") == 0;
+        /* 以前は直接の基底名(base_name)しか比較しておらず、基底が2段以上先に
+         * ある例外階層（class A(Exception); class B(A); で except A）を捕捉
+         * できなかった。MRO上の名前と比較して階層を辿れるようにする。 */
+        if (strcmp(type_name, "Exception") == 0) return true;
+        return p2c_class_chain_has_name(exc->u.v_instance.klass, type_name);
     }
     return false;
 }
@@ -17675,13 +18377,47 @@ P2C_Object* p2c_obj_repr(P2C_Object *obj) {
     return out;
 }
 
-/* min/max/sortedで使う比較。数値だけでなく文字列の辞書式比較にも対応する
- * （p2c_obj_lt等は数値専用のため、文字列同士の比較では常にfalseになってしまう）。 */
+static bool p2c_obj_less(P2C_Object *a, P2C_Object *b);
+
+/* タプル/リスト同士の辞書式比較（Pythonの系列比較規則）。
+ * 先頭から要素ごとに比べ、最初に大小がついた要素で決まる。共通部分が等しく
+ * 長さが違う場合は短い方が小さい。
+ * 以前はタプルを整数として扱っていたため、sorted([(2, 1), (1, 1)]) や
+ * min((a, b) for ...) が黙って「比較していない」結果を返していた。 */
+static bool p2c_sequence_less(P2C_Object *a, P2C_Object *b) {
+    int64_t na = p2c_len(a);
+    int64_t nb = p2c_len(b);
+    int64_t n = na < nb ? na : nb;
+    for (int64_t i = 0; i < n; i++) {
+        P2C_Object *ea = p2c_iter_at(a, i);
+        P2C_Object *eb = p2c_iter_at(b, i);
+        if (p2c_obj_less(ea, eb)) return true;
+        if (p2c_obj_less(eb, ea)) return false;
+    }
+    return na < nb;
+}
+
+/* min/max/sortedで使う比較。数値・文字列・系列（タプル/リスト）に対応する。
+ * （p2c_obj_lt等は数値専用のため、文字列同士の比較では常にfalseになってしまう。） */
 static bool p2c_obj_less(P2C_Object *a, P2C_Object *b) {
+    bool a_seq, b_seq, a_num, b_num;
+    if (a == b) return false;
     if (a && b && p2c_obj_is_str(a) && p2c_obj_is_str(b)) {
         return strcmp(p2c_obj_as_str(a), p2c_obj_as_str(b)) < 0;
     }
-    return (p2c_obj_is_float(a) || p2c_obj_is_float(b)) ? (p2c_obj_as_float(a) < p2c_obj_as_float(b)) : (p2c_obj_as_int(a) < p2c_obj_as_int(b));
+    a_seq = a && (p2c_obj_is_tuple(a) || p2c_obj_is_list(a));
+    b_seq = b && (p2c_obj_is_tuple(b) || p2c_obj_is_list(b));
+    if (a_seq && b_seq) return p2c_sequence_less(a, b);
+    a_num = a && (p2c_obj_is_int(a) || p2c_obj_is_float(a) || p2c_obj_is_bool(a));
+    b_num = b && (p2c_obj_is_int(b) || p2c_obj_is_float(b) || p2c_obj_is_bool(b));
+    if (a_num && b_num) {
+        return (p2c_obj_is_float(a) || p2c_obj_is_float(b)) ? (p2c_obj_as_float(a) < p2c_obj_as_float(b)) : (p2c_obj_as_int(a) < p2c_obj_as_int(b));
+    }
+    /* 数値・文字列・系列以外（None、dict、インスタンス等）はPython同様に順序を
+     * 持たない。以前は整数0として比較しており、sorted()が黙って未ソートの結果を
+     * 返していたため、CPythonと同じくTypeErrorにする。 */
+    p2c_raise(p2c_make_exception("TypeError", "'<' not supported between instances of these types"));
+    return false;
 }
 
 P2C_Object* p2c_obj_abs(P2C_Object *obj) {
@@ -17907,6 +18643,48 @@ P2C_Object* p2c_builtin_int_base(P2C_Object *obj, unsigned base, const char *pre
     while (count > 0) out[pos++] = reversed[--count];
     return p2c_obj_from_str_n(out, pos);
 }
+/* キー列を使った安定マージソートの再帰部分。items/keysのlo..hi-1をソートする。
+ * 比較関数はp2c_obj_less（順序を持たない型ではTypeErrorを送出する）。 */
+static void p2c_merge_sort_run(P2C_Object **items, P2C_Object **keys, P2C_Object **tmp_items, P2C_Object **tmp_keys, size_t lo, size_t hi, bool descending) {
+    size_t mid, i, j, k;
+    if (hi - lo < 2) return;
+    mid = lo + (hi - lo) / 2;
+    p2c_merge_sort_run(items, keys, tmp_items, tmp_keys, lo, mid, descending);
+    p2c_merge_sort_run(items, keys, tmp_items, tmp_keys, mid, hi, descending);
+    i = lo; j = mid; k = lo;
+    while (i < mid && j < hi) {
+        /* 右の要素が「より小さい」ときだけ右を先に取り、それ以外は左を先に取る。
+         * これで昇順・降順いずれでも同じキーの相対順序が保たれる（安定）。 */
+        bool take_left = descending ? !p2c_obj_less(keys[i], keys[j]) : !p2c_obj_less(keys[j], keys[i]);
+        if (take_left) { tmp_items[k] = items[i]; tmp_keys[k] = keys[i]; i++; }
+        else { tmp_items[k] = items[j]; tmp_keys[k] = keys[j]; j++; }
+        k++;
+    }
+    while (i < mid) { tmp_items[k] = items[i]; tmp_keys[k] = keys[i]; i++; k++; }
+    while (j < hi) { tmp_items[k] = items[j]; tmp_keys[k] = keys[j]; j++; k++; }
+    for (k = lo; k < hi; k++) { items[k] = tmp_items[k]; keys[k] = tmp_keys[k]; }
+}
+
+/* sorted()/list.sort()の並べ替え。以前は挿入ソート（O(n^2)）だったため、
+ * 要素数の多いリストでは実用時間に収まらなかった。CPythonと同じ安定な
+ * マージソート（O(n log n)）に置き換える。 */
+static void p2c_stable_sort(P2C_Object **items, P2C_Object **keys, size_t n, bool descending) {
+    P2C_Object **tmp_items;
+    P2C_Object **tmp_keys;
+    if (n < 2) return;
+    tmp_items = (P2C_Object**)p2c_malloc_checked(n * sizeof(P2C_Object*), "sort items");
+    tmp_keys = (P2C_Object**)p2c_malloc_checked(n * sizeof(P2C_Object*), "sort keys");
+    if (!tmp_items || !tmp_keys) {
+        p2c_heap_free(tmp_items);
+        p2c_heap_free(tmp_keys);
+        p2c_raise(p2c_make_exception("MemoryError", "sorted() scratch allocation failed"));
+        return;
+    }
+    p2c_merge_sort_run(items, keys, tmp_items, tmp_keys, 0, n, descending);
+    p2c_heap_free(tmp_items);
+    p2c_heap_free(tmp_keys);
+}
+
 P2C_Object* p2c_builtin_sorted_key(P2C_Object *iterable, P2C_Object *key, P2C_Object *reverse) {
     size_t n = 0;
     bool owned = false;
@@ -17925,21 +18703,7 @@ P2C_Object* p2c_builtin_sorted_key(P2C_Object *iterable, P2C_Object *key, P2C_Ob
         tmp[i] = items[i];
         keys[i] = key && !p2c_obj_is_none(key) ? p2c_call(key, &tmp[i], 1) : tmp[i];
     }
-    for (size_t i = 1; i < n; i++) {
-        P2C_Object *item = tmp[i];
-        P2C_Object *item_key = keys[i];
-        size_t j = i;
-        while (j > 0) {
-            bool descending = reverse && p2c_obj_is_truthy(reverse);
-            bool before = descending ? p2c_obj_less(keys[j - 1], item_key) : p2c_obj_less(item_key, keys[j - 1]);
-            if (!before) break;
-            tmp[j] = tmp[j - 1];
-            keys[j] = keys[j - 1];
-            j--;
-        }
-        tmp[j] = item;
-        keys[j] = item_key;
-    }
+    p2c_stable_sort(tmp, keys, n, reverse && p2c_obj_is_truthy(reverse));
     for (size_t i = 0; i < n; i++) p2c_list_append(out, tmp[i]);
     p2c_heap_free(tmp);
     p2c_heap_free(keys);
@@ -17987,12 +18751,21 @@ P2C_Object* p2c_builtin_round(P2C_Object *x, P2C_Object *ndigits) {
     }
     /* round(x, ndigits) -> float */
     int64_t nd = p2c_obj_as_int(ndigits);
-    char fmt[32];
-    snprintf(fmt, sizeof(fmt), "%.*f", (int)(nd > 0 ? nd : 0), v);
+    /* %.*f の出力長は「値の整数部（最大約309桁）+ 小数点 + 精度」で決まるため、
+     * 精度を現実的な上限へ制限したうえで十分なバッファを確保する
+     * （CPythonのroundも桁数を制限している）。 */
+    char fmt[512];
+    int64_t precision = nd > 0 ? nd : 0;
+    if (precision > 64) precision = 64;
+    snprintf(fmt, sizeof(fmt), "%.*f", (int)precision, v);
     return p2c_obj_from_float(strtod(fmt, NULL));
 #else
+    /* freestandingではround()を使えないため、0桁丸めの近似実装にする
+     * （関数呼び出し結果を直接キャストすると -Wbad-function-cast になるため
+     * 一度変数へ受ける）。 */
     (void)ndigits;
-    return p2c_obj_from_int((int64_t)p2c_obj_as_float(x));
+    double value = p2c_obj_as_float(x);
+    return p2c_obj_from_int((int64_t)value);
 #endif
 }
 
@@ -18163,10 +18936,13 @@ P2C_Object* p2c_builtin_map(P2C_Object *fn, P2C_Object *iterable) {
     size_t n = 0; bool owned = false;
     P2C_Object **items = p2c_iter_items(iterable, &n, &owned);
     P2C_Object *out = p2c_list_new();
-    if (!fn || !fn->u.v_function.func) { if (owned) p2c_heap_free(items); return out; }
+    /* 呼び出しは必ず p2c_call 経由にする（関数オブジェクト・クロージャ・
+     * 束縛メソッド・クラスを同じ規則で扱う）。以前は v_function.func を直接
+     * 呼んでいたため、クロージャや束縛メソッド（func==NULL）を渡すと
+     * 呼び出しをスキップして空リストを返す、という静かな誤りになっていた。 */
     for (size_t i = 0; i < n; i++) {
         P2C_Object *args[1] = { items[i] };
-        P2C_Object *result = fn->u.v_function.func(args, 1);
+        P2C_Object *result = p2c_call(fn, args, 1);
         p2c_list_append(out, result ? result : &P2C_None);
     }
     if (owned) p2c_heap_free(items);
@@ -18180,12 +18956,14 @@ P2C_Object* p2c_builtin_filter(P2C_Object *fn, P2C_Object *iterable) {
     P2C_Object *out = p2c_list_new();
     for (size_t i = 0; i < n; i++) {
         bool keep;
-        if (!fn || fn == &P2C_None || !fn->u.v_function.func) {
+        if (!fn || fn == &P2C_None) {
             keep = p2c_obj_is_truthy(items[i]);
         } else {
+            /* クロージャ・束縛メソッドも呼べるよう p2c_call 経由にする
+             * （以前は v_function.func が無い述語をNone扱いして、
+             * 黙ってtruthyフィルタとして動いていた）。 */
             P2C_Object *args[1] = { items[i] };
-            P2C_Object *result = fn->u.v_function.func(args, 1);
-            keep = p2c_obj_is_truthy(result);
+            keep = p2c_obj_is_truthy(p2c_call(fn, args, 1));
         }
         if (keep) p2c_list_append(out, items[i]);
     }
@@ -18296,14 +19074,24 @@ static P2C_Object* getattr_raw(P2C_Object *obj, const char *name) {
         case OBJ_INSTANCE: {
             P2C_Object *val = attr_map_get(obj->u.v_instance.attrs, name);
             if (val) return val;
-            if (obj->u.v_instance.klass && obj->u.v_instance.klass->u.v_class.attrs) {
-                val = attr_map_get(obj->u.v_instance.klass->u.v_class.attrs, name);
-                if (val) return val;
+            /* クラス属性は基底クラスも含めてMRO順に探す（Python同様、サブクラスの
+             * インスタンスから基底クラスのクラス属性が見える）。以前は自分の
+             * クラスのattrsしか見ておらず、class B(A) のインスタンスでA側の
+             * クラス属性を読むとAttributeErrorになっていた。 */
+            val = p2c_class_attr_along_mro(obj->u.v_instance.klass, name);
+            if (val) return val;
+            /* メソッドを値として取り出す場合（m = obj.method、sorted(key=obj.key)
+             * など）は束縛メソッドを返す。以前はここでNULLを返しており、
+             * obj.method() の呼び出し形以外はAttributeErrorになっていた。 */
+            if (p2c_find_method_in_chain(obj->u.v_instance.klass, name)) {
+                return p2c_bound_method_new(obj, name);
             }
             return NULL;
         }
         case OBJ_CLASS:
-            return attr_map_get(obj->u.v_class.attrs, name);
+            /* クラスオブジェクトの属性も基底クラスを辿る（class D(B) で D.x が
+             * Bのクラス属性を見つける）。 */
+            return p2c_class_attr_along_mro(obj, name);
         case OBJ_MODULE:
             return attr_map_get(obj->u.v_module.attrs, name);
         case OBJ_EXCEPTION:
@@ -19047,9 +19835,16 @@ static void format_error_with_source(char *out, size_t out_sz, const char *kind,
     if (line_len > 200) line_len = 200; /* 極端に長い行は安全のため切り詰める */
 
     size_t used = strlen(out);
-    int m = snprintf(out + used, out_sz - used, "\n\n    %.*s\n    ", (int)line_len, line_start);
-    if (m < 0) return;
-    used = strlen(out);
+    /* 出力は out_sz で有界なので、切り詰めは仕様どおり（-Wformat-truncation の
+     * 誤検出を避けるため、snprintfを使わず明示的な長さで書き込む）。 */
+    {
+        const char *prefix = "\n\n    ";
+        const char *suffix = "\n    ";
+        for (size_t i = 0; prefix[i] && used + 1 < out_sz; i++) out[used++] = prefix[i];
+        for (size_t i = 0; i < line_len && used + 1 < out_sz; i++) out[used++] = line_start[i];
+        for (size_t i = 0; suffix[i] && used + 1 < out_sz; i++) out[used++] = suffix[i];
+        out[used] = '\0';
+    }
     /* colは1始まり。範囲外なら行頭に^を置く */
     size_t caret_pos = (col >= 1 && (size_t)(col - 1) <= line_len) ? (size_t)(col - 1) : 0;
     for (size_t i = 0; i < caret_pos && used + 1 < out_sz; i++) out[used++] = ' ';
@@ -19059,6 +19854,19 @@ static void format_error_with_source(char *out, size_t out_sz, const char *kind,
 const char* p2c_version_string(void) {
     return PYTHON_CODE_TO_C_VERSION_STRING;
 }
+
+#ifndef PYTHON_CODE_TO_C_NO_STDLIB
+/* 固定文字列を容量確認つきで連結する。ISO C99が保証する1つの文字列リテラルは
+ * 4095バイトまでなので、対応一覧は複数のリテラルへ分割してここで連結する
+ * （末尾NULを含めて初めて書き込み、入りきらない場合は何もしない）。
+ * freestanding（PYTHON_CODE_TO_C_NO_STDLIB）では機能一覧を生成しないため、
+ * 使われない関数にならないよう同じ条件で囲む。 */
+static size_t p2c_append_literal(char *dst, size_t cap, size_t used, const char *src, size_t len) {
+    if (!dst || !src || used + len + 1u > cap) return used;
+    memcpy(dst + used, src, len + 1u);
+    return used + len;
+}
+#endif
 
 const char* p2c_supported_range_string(void) {
 #ifndef PYTHON_CODE_TO_C_NO_STDLIB
@@ -19073,6 +19881,7 @@ const char* p2c_supported_range_string(void) {
             "  文:\n"
             "    if / elif / else, while (while/for else節含む), for <var> in range(...), for <var> in <list/tuple/str>、for starred unpack\n"
             "    def（デフォルト引数・キーワード引数・*args・**kwargs・キーワード専用引数対応）, return（複数値のタプル戻り値含む）, class, try / except / else / finally（try本体・except節から脱出するreturn/break/continueはfinallyを実行してから脱出）, bare raise\n"
+            "    try / except / else / finally の finally 内 return/break/continue（保留中の例外や return を上書きし、finally を実行してから脱出する）\n"
             "    match / case（literal、None、capture、wildcard、sequence/mapping/class/as/star、or-pattern、if guard）, import <mod>, from <mod> import <name>, pass, break, continue, assert, global\n"
             "    代入 (=), 代入式 (name := value), 複合代入 (+= -= *= /= //= %%=、属性・添字ターゲット含む), タプル/Starred unpack代入 (a, *mid, z = seq)、for (a, *mid, z) in seq\n"
             "    複数代入 (a = b = c = 1), セミコロン区切りの複数文 (a=1; b=2)\n"
@@ -19080,6 +19889,8 @@ const char* p2c_supported_range_string(void) {
             "    数値(int/float)・文字列・bool・None, list/dict/tuple/set リテラル, list/dict/set内包表記、隣接文字列リテラルの暗黙連結\n"
             "    算術・比較・論理・集合演算子、dictマージ (d1 | d2, d1 |= d2), 三項式 (x if c else y), f-string (f\"...\"), lambda (lambda x, y: x + y)\n"
             "    添字・スライス・属性アクセス、listスライスの代入・+=・del\n"
+            "    ジェネレータ式 (x for x in ys): 複数for節・タプルターゲット・ifフィルタに対応し、\n"
+            "      最も外側のiterableだけを生成時に評価するPythonの規則にも従う\n"
             "    class継承（メソッド・__init__の継承、多段階継承、明示的な基底クラス呼び出し ClassName.method(self,...)）\n"
             "    関数呼び出しでのキーワード引数 (foo(a=1, b=2))\n"
             "    *args（可変長位置引数）・**kwargs（可変長キーワード引数）: 関数・ネスト関数・クラスメソッドに対応\n"
@@ -19088,8 +19899,13 @@ const char* p2c_supported_range_string(void) {
             "    in / not in（list/tuple/str/dictキー）, is / is not, 連鎖比較 (1 < x < 10)\n"
             "  組み込み関数:\n"
             "    print (sep=/end=対応), len, range, input, str, int, float, bool, abs, round, min, max, sum, sorted (reverse=対応)\n"
-            "    enumerate, zip, isinstance（型のタプル対応: isinstance(x,(int,str))）, type\n"
-            "    any, all, map, filter, list, tuple, divmod, pow(base, exp, mod), format(value, spec), callable\n"
+            "    enumerate, zip, isinstance（型のタプル対応: isinstance(x,(int,str))、クラスオブジェクトや Outer.Inner も可）, type\n"
+            "    any, all, map, filter, list, tuple, divmod, pow(base, exp, mod), format(value, spec), callable\n",
+            p2c_version_string());
+        /* ISO C99が保証する1つの文字列リテラルは4095バイトまで（-Wpedantic の
+         * -Woverlength-strings が上限超過を診断する）。対応一覧はそれを超えるため
+         * 複数のリテラルに分割し、残り容量を確認しながら連結する。 */
+        static const char features_mid[] =
             "  単一値:\n"
             "    ... (Ellipsis) と Ellipsis（is/==/repr/type()/コンテナ要素に対応。def f(): ... のスタブ本体も可）\n"
             "  特殊メソッド:\n"
@@ -19105,25 +19921,35 @@ const char* p2c_supported_range_string(void) {
             "    f-string / str.format() / format() の書式指定: {:05d} {:.2f} {:>10} {:x} {:b} {:,} {:.0%%} など主要な書式に対応（括弧内の複数f-string連結を含む）\n"
             "  組み込みモジュール: math (pi, e, sqrt, sin, cos, pow)\n"
             "    pygame (ヘッドレス版: 実際の描画/音声/入力なし。init/display/time/\n"
-            "            event/draw/key/sprite/Surface/Rect等、ゲームロジック検証用)\n",
-            p2c_version_string());
-        /* -Wpedantic の -Woverlength-strings は、1つの翻訳フェーズ7文字列が
-         * ISO C99 の下限4095バイトを超えるとエラーにする。対応一覧の追記で
-         * 全体が上限へ近づいたため、未対応一覧は別のsnprintfで追記する。 */
-        size_t used = strlen(buf);
-        snprintf(buf + used, sizeof(buf) - used,
+            "            event/draw/key/sprite/Surface/Rect等、ゲームロジック検証用)\n";
+        /* 追記部分はそれぞれ4095バイト以下のリテラルに分割し、残り容量を
+         * 確認してからコピーする（静かな切り詰めを起こさない）。 */
+        static const char features_tail[] =
             "\n"
+            "  クラス:\n"
+            "    ネストしたクラス定義 (class Outer: class Inner: ...): クラス本体からはその名前で参照可、\n"
+            "      外部からは Outer.Inner 経由。生成CではC名を Outer__Inner に前置して衝突を避け、\n"
+            "      外側クラスの __classobj() が属性として登録する。クラスオブジェクトはGC管理下で\n"
+            "      新しいランタイムAPIを必要としないため、NO_STDLIB/freestandingでもそのまま動く。\n"
+            "    多重継承 (class D(B, C)): Pythonと同じC3線形化でMROを求め、ダイヤモンド継承でも基底メソッドの選択がCPythonと一致する。\n"
+            "      基底クラスのクラス属性はサブクラスのインスタンスからも見える（MRO順に探索）。\n"
+            "    束縛メソッド: m = obj.method でメソッドを取り出し、コールバック（sorted(key=...)、map()等）へ渡せる。\n"
             "  文字列エスケープ:\n"
             "    \\n \\t \\r \\v \\f \\b \\a \\\\ \\\" \\', \\ooo, \\xHH, \\uXXXX, \\UXXXXXXXX, 行継続\n"
             "    （未知のエスケープはバックスラッシュごと保持。\\N{...}はUnicode名前表が無いため診断）\n"
             "\n"
             "[未対応（診断エラーになります）]\n"
-            "  ネストしたクラス定義、クラスメソッドへのデコレータ、デコレータ関数の *args / **kwargs\n"
-            "  ジェネレータ式の複数for節・ネストクロージャ捕捉、async forの状態機械（一部のasync/awaitは対応）\n"
-            "  finally節内のreturn/break/continue、複数のstarred代入対象\n"
-            "  多重継承、複素数型、bytes/bytearray\n"
+            "  関数本体内のclass定義、クラスメソッドへのデコレータ、デコレータ関数の *args / **kwargs\n"
+            "  ネストクロージャ捕捉を行うジェネレータ式、async forの状態機械（一部のasync/awaitは対応）\n"
+            "  複数のstarred代入対象、複素数型、bytes/bytearray\n"
             "\n"
-            "詳細と既知の制限は README.md を参照してください。\n");
+            "詳細と既知の制限は README.md を参照してください。\n";
+        {
+            size_t used = strlen(buf);
+            used = p2c_append_literal(buf, sizeof(buf), used, features_mid, sizeof(features_mid) - 1u);
+            used = p2c_append_literal(buf, sizeof(buf), used, features_tail, sizeof(features_tail) - 1u);
+            (void)used;
+        }
         built = true;
     }
     return buf;

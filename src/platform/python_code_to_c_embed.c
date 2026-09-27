@@ -37,8 +37,12 @@ static unsigned char *embed_block_payload(P2C_EmbedBlock *block) {
     return (unsigned char*)block + P2C_EMBED_HEADER;
 }
 
+/* 埋め込みヒープ内のブロック境界はヘッダ長がアライン倍数であるため常に整列している。
+ * unsigned char* からの直接キャストは型からアライン要件しか読めない
+ * -Wcast-align=strict を誤検出させるため、void* を経由して「整列済みの領域を
+ * 型付きビューへ戻す」意図を明示する。 */
 static P2C_EmbedBlock *embed_payload_block(void *ptr) {
-    return (P2C_EmbedBlock*)((unsigned char*)ptr - P2C_EMBED_HEADER);
+    return (P2C_EmbedBlock*)(void*)((unsigned char*)ptr - P2C_EMBED_HEADER);
 }
 
 static bool embed_block_valid(P2C_EmbedHeap *heap, P2C_EmbedBlock *block) {
@@ -85,7 +89,7 @@ int p2c_embed_heap_init(P2C_EmbedHeap *heap, void *raw, size_t size) {
     if (usable < 2u * P2C_EMBED_HEADER + P2C_EMBED_ALIGN) return -1;
     heap->base = (unsigned char*)aligned;
     heap->capacity = usable;
-    P2C_EmbedBlock *first = (P2C_EmbedBlock*)heap->base;
+    P2C_EmbedBlock *first = (P2C_EmbedBlock*)(void*)heap->base;
     first->size = usable;
     first->magic = P2C_EMBED_MAGIC;
     first->flags = P2C_EMBED_FLAG_FREE;
@@ -140,7 +144,7 @@ void *p2c_embed_heap_alloc(P2C_EmbedHeap *heap, size_t size) {
     /* 分割: 残りが「ヘッダ + 最小ペイロード」以上あるときだけ切り分ける。 */
     size_t rest = block->size - need;
     if (rest >= P2C_EMBED_HEADER + P2C_EMBED_ALIGN) {
-        P2C_EmbedBlock *tail = (P2C_EmbedBlock*)((unsigned char*)block + need);
+        P2C_EmbedBlock *tail = (P2C_EmbedBlock*)(void*)((unsigned char*)block + need);
         tail->size = rest;
         tail->magic = P2C_EMBED_MAGIC;
         tail->flags = P2C_EMBED_FLAG_FREE;
@@ -203,7 +207,7 @@ void *p2c_embed_heap_realloc(P2C_EmbedHeap *heap, void *ptr, size_t new_size) {
         size_t rest = block->size - need;
         /* 縮小: 余りが独立ブロックとして成立するなら切り離して返す。 */
         if (rest >= P2C_EMBED_HEADER + P2C_EMBED_ALIGN) {
-            P2C_EmbedBlock *tail = (P2C_EmbedBlock*)((unsigned char*)block + need);
+            P2C_EmbedBlock *tail = (P2C_EmbedBlock*)(void*)((unsigned char*)block + need);
             tail->size = rest;
             tail->magic = P2C_EMBED_MAGIC;
             tail->next = NULL;
@@ -215,7 +219,7 @@ void *p2c_embed_heap_realloc(P2C_EmbedHeap *heap, void *ptr, size_t new_size) {
     }
     /* 拡張: 直後の空きブロックと結合できるならその場で伸ばす。 */
     size_t need = P2C_EMBED_HEADER + embed_align_up(new_size);
-    P2C_EmbedBlock *next = (P2C_EmbedBlock*)((unsigned char*)block + block->size);
+    P2C_EmbedBlock *next = (P2C_EmbedBlock*)(void*)((unsigned char*)block + block->size);
     if (embed_block_valid(heap, next) && (next->flags & P2C_EMBED_FLAG_FREE) &&
         block->size + next->size >= need) {
         size_t combined = block->size + next->size;
@@ -230,7 +234,7 @@ void *p2c_embed_heap_realloc(P2C_EmbedHeap *heap, void *ptr, size_t new_size) {
         heap->used += need - (old_payload + P2C_EMBED_HEADER);
         if (heap->used > heap->peak) heap->peak = heap->used;
         if (rest >= P2C_EMBED_HEADER + P2C_EMBED_ALIGN) {
-            P2C_EmbedBlock *tail = (P2C_EmbedBlock*)((unsigned char*)block + need);
+            P2C_EmbedBlock *tail = (P2C_EmbedBlock*)(void*)((unsigned char*)block + need);
             tail->size = rest;
             tail->magic = P2C_EMBED_MAGIC;
             tail->next = NULL;

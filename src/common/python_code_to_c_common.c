@@ -450,7 +450,10 @@ P2C_Allocator* p2c_linear_allocator(void *buffer, size_t size) {
     lc->size = size - sizeof(LinearCtx) - sizeof(P2C_Allocator);
     lc->used = 0;
     
-    P2C_Allocator *a = (P2C_Allocator*)((char*)buffer + sizeof(LinearCtx));
+    /* bufferはP2C_ALIGN_UP8済みで、sizeof(LinearCtx)もポインタ整列の倍数なので
+     * 実体は整列している。char*からの直接キャストは型情報から整列要件しか
+     * 読めない-Wcast-align=strictが誤検出するため、void*を経由して意図を明示する。 */
+    P2C_Allocator *a = (P2C_Allocator*)(void*)((char*)buffer + sizeof(LinearCtx));
     a->ctx = lc;
     a->alloc = linear_alloc;
     a->free = linear_free;
@@ -525,7 +528,8 @@ P2C_Allocator* p2c_pool_allocator(void *buffer, size_t buf_size, size_t obj_size
     pc->buf_size = buf_size - sizeof(PoolCtx) - sizeof(P2C_Allocator);
     pc->obj_count = 0;
     
-    P2C_Allocator *a = (P2C_Allocator*)((char*)buffer + sizeof(PoolCtx));
+    /* 上と同じ理由（pool用の整列済みバッファ、sizeof(PoolCtx)はポインタ整列の倍数）。 */
+    P2C_Allocator *a = (P2C_Allocator*)(void*)((char*)buffer + sizeof(PoolCtx));
     a->ctx = pc;
     a->alloc = pool_alloc;
     a->free = pool_free;

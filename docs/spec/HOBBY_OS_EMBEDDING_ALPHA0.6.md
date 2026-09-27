@@ -195,6 +195,7 @@ P2C_Result r = python_to_c(python_source, NULL, &generated);
 | `make test-embed-generated` | `--embed-entry` 生成モジュールをカーネル相当ドライバで実行し、CPythonと出力差分比較 |
 | `make test-hobby-os-template` | テンプレートのコンパイル（警告即エラー）とライブラリ化 |
 | `make test-crlf` | 改行コード（LF/CRLF/CR）に対して生成Cが完全一致すること |
+| `make test-baremetal-generated` | ベアメタル例（ネストしたクラス定義を含む `examples/baremetal/baremetal_hello.py`）が `PYTHON_CODE_TO_C_NO_STDLIB` のfreestandingで変換・オブジェクト化できること |
 | `make test-allocator-injection` | カーネルアロケータの注入（`p2c_platform_set_allocator`／`p2c_set_default_allocator`）が変換器コアとランタイムの両方へ効くこと、注入が失敗する場合だけ静的フォールバックへ落ちること |
 | `make test-setjmp-hook` | `P2C_SETJMP`/`P2C_LONGJMP` を差し替えた状態で、ランタイムと生成Cの例外機構がフックを通ること |
 | `make CC=clang test-single-header-freestanding` | 単一ヘッダの freestanding 実装部がHosted参照を持たないこと |

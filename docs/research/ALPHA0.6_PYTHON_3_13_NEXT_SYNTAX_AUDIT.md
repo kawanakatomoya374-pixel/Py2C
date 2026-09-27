@@ -13,12 +13,27 @@ Python 3.13の完全文法は、function/class definitionに任意個のdecorato
 | 優先度 | 構文 | 判断 | 理由 |
 |---|---|---|---|
 | P0 | decorator | **module-level function/classで実装済み** | parser、AST、semantic、codegen、GC root、single-headerへ接続し、上から下への評価・下から上への適用をC366–C372で検証。nested/method/vararg/keyword-callは明示診断 |
-| P1 | multi-context `async with` | 次の優先候補 | 通常withのnesting設計とasync with state machineを結合する必要があり、exception cleanup順の状態数が増える |
+| P0 | nested class definition | **実装済み（C461–C479）** | クラス本体の直下の`class`をC名`Outer__Inner`へ解決し、外側クラスの`__classobj()`が評価順に属性登録する。parser変更なし、新しいランタイムAPI・GCルートなしで組込み構成でも動く。メソッド本体からのクラススコープ参照と関数本体内の`class`定義は明示診断 |
+| P1 | multi-context `async with` | **実装済み（C373–C383）** | itemごとのenter/exit stateを生成し、enter途中・body例外・exit例外の逆順cleanupを検証済み |
 | P2 | async comprehension | 後続対象 | implicit scope、async iterator、await、複数停止点を同時に実装する必要がある |
 | P3 | `except*` / ExceptionGroup | 設計先行 | subgroup split/mergeとtraceback意味論を持つruntimeが必要 |
 | P4 | bytes / complex / ellipsis / `@` | 値モデル先行 | lexer/parser受理だけでは不十分で、object typeと演算意味論が必要 |
+| P5 | 複数for節のgenerator expression / メソッドデコレータ | 次の候補 | 前者は既存のstep関数state machineの入れ子化、後者はdescriptor相当のメソッドフラグとgetattr経路が必要。受理だけでは完了としない |
+> decoratorはmodule-level function/classの安全な範囲で実装し、Clang/GCC full-build、ASan/UBSan、strict C11、freestanding、single-header、C01–C372のCPython差分を通過した。複数contextを持つ`async with`もC373–C383で実装済みである。ネストしたクラス定義はC461–C479に加え、`make test-embed-generated`（`examples/embed/embed_boot.py`）と`make test-baremetal-generated`（`examples/baremetal/baremetal_hello.py`）で、カーネル側ヒープだけを与えた組込み構成でも検証している。次の候補は、メソッドデコレータ（`@property`/`@staticmethod`/`@classmethod`）、関数本体内の`class`定義、デコレータ関数側の`*args`/`**kwargs`、複素数型、`bytes`/`bytearray`である（複数for節のgenerator expressionと多重継承のC3線形化はC506–C525で実装済み）。いずれの候補もparser受理だけでは完了とせず、AST、semantic、codegen、runtime/GC、strict diagnostics、CPython差分を一貫して実装できない場合は理由付きdiagnosticを維持する。
 
-> decoratorはmodule-level function/classの安全な範囲で実装し、Clang/GCC full-build、ASan/UBSan、strict C11、freestanding、single-header、C01–C372のCPython差分を通過した。次の候補は、複数contextを持つ`async with`である。いずれの候補もparser受理だけでは完了とせず、AST、semantic、codegen、runtime/GC、strict diagnostics、CPython差分を一貫して実装できない場合は理由付きdiagnosticを維持する。
+## 2026-09-28 追加監査: ネストしたクラス定義
+
+Pythonのgrammarは`classdef`をsuiteの一行として許可するため、クラス本体の直下にも`class`を書ける。本実装はこれを次の規則でlowerする。
+
+| 対象 | 今回の判断 | 安全境界 |
+|---|---|---|
+| `class Outer: class Inner:` | 実装済み | C名を`Outer__Inner`に前置してシンボルを分離する。Python名は`p2c_class_new`の表示名として維持 |
+| `Outer.Inner`による外部参照 | 実装済み | 外側クラスの`__classobj()`が`p2c_setattr`で属性登録するため、既存の属性解決経路だけで動く |
+| クラス本体での`alias = Inner` | 実装済み | クラス本体の文を上から下へ評価し、その文脈でだけ見える「Python名→C名」マップで解決する |
+| メソッド本体からのクラススコープ参照 | 明示診断 | Pythonでは`NameError`。黙って未定義C識別子を出さない |
+| 関数本体の中の`class`定義 | 明示診断 | Cの入れ子関数定義になり得ないため、意味解析で拒否する |
+| 同じ単純名の別の外側クラス | 実装済み | C名が前置されるため衝突しない（`Left__Node`と`Right__Node`） |
+| 基底クラスのクラス属性の継承 | 対象外（既知の制限） | 継承で引き継がれるのはメソッドと`__init__`のみ（本変更前からの制限） |
 
 ## References
 

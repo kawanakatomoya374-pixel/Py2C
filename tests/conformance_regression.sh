@@ -106,4 +106,12 @@ run_differential_case C384-C402 tests/finally_unwind_alpha06.py 19
 run_differential_case C403-C428 tests/builtin_gap_alpha06.py 26
 run_differential_case C429-C443 tests/ellipsis_alpha06.py 15
 run_differential_case C444-C460 tests/string_escapes_alpha06.py 17
-printf '%s\n' 'conformance_regression_ok: 460 semantic assertions passed'
+run_differential_case C461-C479 tests/nested_class_alpha06.py 19
+run_differential_case C480-C486 tests/c_identifier_collision_alpha06.py 7
+run_differential_case C487-C493 tests/multiple_inheritance_alpha06.py 7
+run_differential_case C494-C499 tests/bound_method_alpha06.py 6
+run_differential_case C500-C505 tests/finally_control_flow_alpha06.py 6
+run_differential_case C506-C515 tests/generator_expression_multi_alpha06.py 10
+run_differential_case C516-C525 tests/tuple_ordering_alpha06.py 10
+run_differential_case C526-C528 tests/super_mro_alpha06.py 3
+printf '%s\n' 'conformance_regression_ok: 528 semantic assertions passed'
