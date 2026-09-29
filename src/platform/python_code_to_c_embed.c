@@ -439,6 +439,10 @@ int p2c_embed_start(const P2C_EmbedConfig *config) {
 #ifdef P2C_EMBED_PROVIDE_LIBC_HEAP
         p2c_embed_heap_set_default(config->heap);
 #endif
+        /* 適応GCの上限をヒープ容量に合わせる。小さなヒープでしきい値が
+         * 伸びすぎると収集が止まり、枯渇してpanic経路へ入ってしまう
+         * （例: 32KiB のヒープで 4MiB まで伸ばすと回収が起きない）。 */
+        p2c_gc_set_adaptive_limit(config->heap_size / 4u);
     }
 
     g_embed_platform.alloc = embed_alloc;

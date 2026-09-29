@@ -43,6 +43,7 @@ static volatile int panic_seen;
 static volatile int panic_reason_ok;
 
 static void test_panic(const char *reason, void *user) {
+    trace_stage('!');
     (void)user;
     panic_seen = 1;
     panic_reason_ok = (reason && strstr(reason, "out of memory") != NULL) ? 1 : 0;
@@ -264,14 +265,19 @@ static P2C_Object *program_exhaust(void) {
 static int check_oom_notification(void) {
     trace_stage('O');
     P2C_EmbedConfig cfg;
-    config_for(&cfg, heap_storage, 4096);
+    /* 組込みモジュール（math等）の登録には数KBのヒープが必要なので、
+     * 枯渇テストでも初期化が完了する大きさを確保する（以前は4096で足りていた）。 */
+    config_for(&cfg, heap_storage, 32768);
     cfg.raise_memory_error = false;         /* NULLを返すだけの従来動作 */
     cfg.enable_gc = false;                  /* 枯渇を確実にする */
     oom_notifications = 0;
     oom_last_request = 0;
     if (p2c_embed_start(&cfg) != 0) return 70;
+    trace_stage('a');
     p2c_runtime_set_oom_handler(counting_oom, NULL);
+    trace_stage('b');
     if (!p2c_embed_run_program(program_exhaust)) return 71;
+    trace_stage('c');
     if (oom_notifications == 0) return 72;
     if (oom_last_request == 0) return 73;
     if (embed_heap.failures == 0) return 74;
@@ -285,7 +291,8 @@ static int check_oom_notification(void) {
 static int check_oom_to_memory_error(void) {
     trace_stage('M');
     P2C_EmbedConfig cfg;
-    config_for(&cfg, heap_storage, 4096);
+    /* 枯渇テストでも初期化（組込みモジュール登録）が完了するヒープ量を与える。 */
+    config_for(&cfg, heap_storage, 32768);
     cfg.raise_memory_error = true;
     cfg.enable_gc = false;
     if (p2c_embed_start(&cfg) != 0) return 80;
@@ -314,7 +321,9 @@ static int check_oom_to_memory_error(void) {
 static int check_panic_path(void) {
     trace_stage('P');
     P2C_EmbedConfig cfg;
-    config_for(&cfg, heap_storage, 4096);
+    /* panic経路のテストでも、初期化（組込みモジュール登録）が完了する量を与える。
+     * 枯渇は program_exhaust() で意図的に起こす。 */
+    config_for(&cfg, heap_storage, 32768);
     cfg.raise_memory_error = true;
     cfg.enable_gc = false;
     if (p2c_embed_start(&cfg) != 0) return 90;

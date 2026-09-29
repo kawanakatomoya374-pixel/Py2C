@@ -3,7 +3,9 @@
  * 依存ライブラリなし（POSIXソケットのみ）で動く python_code_to_c_httpd.c の上に、
  * python_code_to_c/c2py APIを呼び出すルーティングを実装している。
  */
+#ifndef _POSIX_C_SOURCE
 #define _POSIX_C_SOURCE 200809L
+#endif
 #include "tools/python_code_to_c_gui_web.h"
 #include "tools/python_code_to_c_httpd.h"
 #include "tools/python_code_to_c_runtime_locate.h"

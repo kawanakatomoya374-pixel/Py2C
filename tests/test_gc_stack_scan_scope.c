@@ -19,7 +19,9 @@
  * 実スタックでの厳密検証は非サニタイザビルドで行う。
  */
 #if !defined(_GNU_SOURCE)
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE /* pthread_getattr_np / pthread_attr_getstack に必要 */
+#endif
 #endif
 #include "runtime/python_code_to_c_runtime.h"
 

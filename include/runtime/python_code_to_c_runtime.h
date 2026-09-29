@@ -67,11 +67,26 @@ typedef struct P2C_ClassDef {
 typedef P2C_Object* (*P2C_MethodKwFn)(P2C_Object *self, P2C_Object **args, size_t nargs,
                                       const char **kw_names, P2C_Object **kw_values, size_t nkw);
 
+/* メソッドの種類。インスタンスメソッドは先頭引数に self（インスタンス）を、
+ * staticmethodは引数を受け取らず（selfを渡さない）、classmethodは先頭引数に
+ * クラスオブジェクトを受け取り、propertyは属性読み出し時に自己を束縛して
+ * 呼び出されるゲッターとして扱う。
+ * P2C_MethodDef の末尾メンバなので、既存の位置指定初期化子
+ * {"name", func, kwfunc} は自動的に P2C_METHOD_INSTANCE になる。 */
+enum {
+    P2C_METHOD_INSTANCE = 0,
+    P2C_METHOD_STATIC = 1,
+    P2C_METHOD_CLASS = 2,
+    P2C_METHOD_PROPERTY = 3
+};
+
 typedef struct P2C_MethodDef {
     const char *name;
     P2C_Object* (*func)(P2C_Object *self, P2C_Object **args, size_t nargs);
     /* NULLならキーワード引数は受理しない既存メソッド。 */
     P2C_MethodKwFn kwfunc;
+    /* P2C_METHOD_* のいずれか（末尾に追加したフィールド）。 */
+    int kind;
 } P2C_MethodDef;
 
 typedef struct P2C_DictEntry {
@@ -377,6 +392,32 @@ void p2c_gc_set_enabled(bool enabled);
 bool p2c_gc_is_enabled(void);
 /* 自動発火のしきい値（前回の収集からの累積確保バイト数）を設定する。 */
 void p2c_gc_set_threshold(size_t bytes);
+/* しきい値の自動調整（適応GC）。有効時は「収集してもほとんど解放されない」
+ * 状況でしきい値を倍々に伸ばし（〜上限 4MiB）、よく解放される状況では
+ * 基準値へ戻していく。長時間動くタスクでの「収集のしすぎ」を避ける。
+ * p2c_gc_set_threshold() は基準値と現在値の両方を設定し、成長回数を0に戻す。
+ * 既定は有効（無効化する場合は false）。 */
+void p2c_gc_set_adaptive(bool enabled);
+/* 適応GCがしきい値を伸ばせる上限（バイト）。0で既定（4MiB）へ戻す。
+ * 組込みではヒープ容量の1/4程度に設定すると枯渇しにくい
+ * （p2c_embed_start() が自動設定する）。 */
+void p2c_gc_set_adaptive_limit(size_t max_threshold);
+size_t p2c_gc_adaptive_limit(void);
+bool p2c_gc_is_adaptive(void);
+/* GC統計。診断・カーネルのメモリ見積り・回帰テスト用。 */
+typedef struct {
+    size_t collections;         /* 累計収集回数 */
+    size_t objects;             /* 現在追跡中のオブジェクト数 */
+    size_t peak_objects;        /* 追跡オブジェクト数の最大値 */
+    size_t last_freed;          /* 直近の収集で解放した数 */
+    size_t threshold;           /* 現在の自動収集しきい値（バイト） */
+    size_t base_threshold;      /* 基準しきい値（バイト） */
+    size_t threshold_growths;   /* 適応GCがしきい値を伸ばした回数 */
+    size_t oom_resets;          /* OOMでしきい値を基準値へ戻した回数 */
+    size_t scanned_words;       /* 直近の収集で走査したスタック語数 */
+    size_t temp_roots;          /* 直近の収集でルート化したTLS一時値の数 */
+} P2C_GcStats;
+void p2c_gc_stats(P2C_GcStats *out);
 size_t p2c_gc_object_count(void);      /* 現在GCが追跡中のオブジェクト数 */
 size_t p2c_gc_collections_run(void);   /* これまでに実行された収集回数 */
 size_t p2c_gc_last_freed(void);        /* 直近の収集で解放されたオブジェクト数 */
@@ -387,6 +428,14 @@ size_t p2c_gc_last_temp_roots(void);   /* 直近の収集でルート化したTL
                                         * （式評価中の左オペランドと処理中の例外）。
                                         * 0なら式の途中から参照できる一時値がない */
 size_t p2c_gc_root_count(void);
+
+/* ── 未対応構文のフォールバック (--fallback) ─────────────────────
+ * 変換器が対応していない構文の代わりに生成されるスタブ。この式/文が
+ * 実際に実行されたときだけ NotImplementedError になり、到達しなければ
+ * プログラムはそのまま動く（＝未対応構文を含んでいてもビルドは通る）。
+ * where は "line 12" のような位置、what は "expression" 等の種別。 */
+P2C_Object* p2c_fallback_expr(const char *where, const char *what);
+void p2c_fallback_stmt(const char *where, const char *what);
 size_t p2c_gc_root_capacity(void);
 bool p2c_gc_is_collecting(void);        /* 回収処理の再入を検査する */
 
@@ -434,9 +483,11 @@ void longjmp(jmp_buf env, int val);
  * 実装なので、必ずマクロで各呼び出し地点へ展開する（関数でラップすると
  * 保存したフレームが既に無効になっていて未定義動作になる）。
  * __builtin_longjmp は常に 1 を返すため、longjmp(env, val) の val は
- * 1 に固定される（ランタイム/生成コードは == 0 判定のみを使う）。 */
+ * 1 に固定される（ランタイム/生成コードは == 0 判定のみを使う）。
+ * tcc (__TINYC__) はこれらの組み込みを持たないため対象外とし、libc の
+ * setjmp/longjmp（ホスト構成）またはカーネル実装（NO_LIBC_STUBS）を使う。 */
 #if !defined(setjmp) && !defined(PYTHON_CODE_TO_C_NO_COMPILER_SETJMP) && \
-    (defined(__GNUC__) || defined(__clang__))
+    (defined(__GNUC__) || defined(__clang__)) && !defined(__TINYC__)
 #  define setjmp(env) __builtin_setjmp((void**)(env))
 #  define longjmp(env, val) ((void)(val), __builtin_longjmp((void**)(env), 1))
 #  define P2C_HAVE_COMPILER_SETJMP 1

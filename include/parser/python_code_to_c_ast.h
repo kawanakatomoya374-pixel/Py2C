@@ -1,3 +1,8 @@
+/* --fallback で未対応構文の代わりに parser が作る名前ノードの接頭辞。
+ * この接頭辞で始まる AST_NAME は codegen がランタイムの
+ * p2c_fallback_expr() 呼び出し（実行時に NotImplementedError）へ変換する。 */
+#define P2C_UNSUPPORTED_NAME_PREFIX "_p2c_unsupported_"
+
 #ifndef PYTHON_CODE_TO_C_AST_H
 #define PYTHON_CODE_TO_C_AST_H
 

@@ -265,6 +265,13 @@ static P2C_Result visit_expr(P2C_Semantic *sem, P2C_AstExpr *expr, P2C_Type **ou
     
     switch (n->type) {
         case AST_NAME: {
+            /* --fallback が作る未対応構文のスタブ名は、変数ではないため
+             * 名前解決の対象外（codegenがランタイム呼び出しへ変換する）。 */
+            if (n->u.name.name &&
+                strncmp(n->u.name.name, P2C_UNSUPPORTED_NAME_PREFIX,
+                        strlen(P2C_UNSUPPORTED_NAME_PREFIX)) == 0) {
+                break;
+            }
             P2C_Symbol *sym = p2c_symtab_lookup(sem->symtab, n->u.name.name);
             if (!sym) {
                 char buf[256];
@@ -562,17 +569,40 @@ static P2C_Result visit_stmt(P2C_Semantic *sem, P2C_AstStmt *stmt) {
         case AST_FUNCTIONDEF: {
             if (n->u.functiondef.decorator_list && p2c_vec_len(n->u.functiondef.decorator_list) > 0) {
                 P2C_SymbolScope *enclosing = p2c_symtab_current_scope(sem->symtab);
-                if (!enclosing || enclosing->scope_type != SCOPE_MODULE) {
-                    set_sem_error(sem, "decorators are currently supported only on module-level functions", n->line, n->col);
-                    return P2C_ERR_SEMANTIC;
+                bool is_method_decorator = false;
+                if (enclosing && enclosing->scope_type == SCOPE_CLASS) {
+                    /* クラス本体内のメソッドデコレータは、メソッド種別を指定する
+                     * 組込みの3つ（@staticmethod/@classmethod/@property）だけを受理する。
+                     * 任意のデコレータ適用（呼び出しと再束縛）はクラス本体では
+                     * 未対応のため、明示的に診断する。 */
+                    for (size_t di = 0; di < p2c_vec_len(n->u.functiondef.decorator_list); di++) {
+                        P2C_AstExpr *dec = (P2C_AstExpr*)p2c_vec_get(n->u.functiondef.decorator_list, di);
+                        const char *dn = (dec && dec->base.type == AST_NAME) ? dec->base.u.name.name : NULL;
+                        if (!dn || (strcmp(dn, "staticmethod") != 0 &&
+                                    strcmp(dn, "classmethod") != 0 &&
+                                    strcmp(dn, "property") != 0)) {
+                            set_sem_error(sem, "only @staticmethod, @classmethod, and @property are supported as method decorators", n->line, n->col);
+                            return P2C_ERR_SEMANTIC;
+                        }
+                    }
+                    is_method_decorator = true;
+                } else {
+                    if (!enclosing || enclosing->scope_type != SCOPE_MODULE) {
+                        set_sem_error(sem, "decorators are currently supported only on module-level functions", n->line, n->col);
+                        return P2C_ERR_SEMANTIC;
+                    }
+                    if (n->u.functiondef.vararg || n->u.functiondef.kwarg) {
+                        set_sem_error(sem, "decorated functions with *args or **kwargs are not supported yet", n->line, n->col);
+                        return P2C_ERR_SEMANTIC;
+                    }
                 }
-                if (n->u.functiondef.vararg || n->u.functiondef.kwarg) {
-                    set_sem_error(sem, "decorated functions with *args or **kwargs are not supported yet", n->line, n->col);
-                    return P2C_ERR_SEMANTIC;
-                }
-                for (size_t i = 0; i < p2c_vec_len(n->u.functiondef.decorator_list); i++) {
-                    P2C_Result decorator_result = visit_expr(sem, (P2C_AstExpr*)p2c_vec_get(n->u.functiondef.decorator_list, i), NULL);
-                    if (decorator_result != P2C_OK) return decorator_result;
+                /* メソッド種別デコレータは組込みの意味を持つため、デコレータ式の
+                 * 名前解決（visit_expr）は行わない（staticmethod等は変数ではない）。 */
+                if (!is_method_decorator) {
+                    for (size_t i = 0; i < p2c_vec_len(n->u.functiondef.decorator_list); i++) {
+                        P2C_Result decorator_result = visit_expr(sem, (P2C_AstExpr*)p2c_vec_get(n->u.functiondef.decorator_list, i), NULL);
+                        if (decorator_result != P2C_OK) return decorator_result;
+                    }
                 }
             }
             /* クラスメソッドの *args / **kwargs はadapterでtuple/dictへ束縛する。 */

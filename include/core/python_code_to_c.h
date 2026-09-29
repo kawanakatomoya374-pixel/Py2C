@@ -24,6 +24,11 @@ typedef struct {
     bool include_runtime;   /* ランタイムコードを含める */
     bool debug_comments;    /* 元のPythonコードをコメントとして挿入 */
     bool strict_c11;        /* GNU拡張を使う構文を拒否するISO C11モード */
+    /* 未対応構文のフォールバック（--fallback）。
+     * true のとき、codegenが扱えない構文を「実行時に NotImplementedError を
+     * 送出するスタブ」へ置き換えて変換を続行する（ビルドは失敗させない）。
+     * false（既定）では、黙って不正な値を作らず変換エラーとして報告する。 */
+    bool fallback_unsupported;
     int indent_spaces;      /* 出力Cコードのインデント */
     /* NULL以外なら int main(void) の代わりに、カーネルから呼び出せる
      * "P2C_Object *<name>(void)" を生成する（CLI: --embed-entry <name>）。

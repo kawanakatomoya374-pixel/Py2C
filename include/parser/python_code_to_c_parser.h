@@ -33,6 +33,12 @@ const char* p2c_parser_error_msg(P2C_Parser *par);
 /* メインエントリ：モジュール全体をパース */
 P2C_AstModule* p2c_parser_parse_module(P2C_Parser *par, P2C_Result *out_err);
 
+/* --fallback: 未対応構文（bytes/複素数リテラル等）をエラーにせず、
+ * 実行時に NotImplementedError を送出するスタブへ置き換える。
+ * 既定は無効（明確な診断を返す）。 */
+void p2c_parser_set_fallback(bool enabled);
+bool p2c_parser_fallback_enabled(void);
+
 /* 個別パース関数（再帰下降） */
 P2C_AstStmt* p2c_parser_stmt(P2C_Parser *par, P2C_Result *out_err);
 P2C_AstExpr* p2c_parser_expr(P2C_Parser *par, P2C_Result *out_err);

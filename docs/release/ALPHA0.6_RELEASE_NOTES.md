@@ -61,7 +61,7 @@ Alpha0.6の自己テストは、単一ヘッダーだけをincludeする翻訳�
 
 | 品質ゲート | 結果 |
 |---|---|
-| CPython差分コンフォーマンス | **C01–C528、528件一致** |
+| CPython差分コンフォーマンス | **C01–C549、549件一致** |
 | GCC一括構築 | `make CC=gcc full-build` 合格 |
 | GCC全回帰 | `make CC=gcc test` 合格 |
 | Clang一括構築 | `make CC=clang full-build` 合格 |
@@ -79,7 +79,7 @@ Alpha0.6の自己テストは、単一ヘッダーだけをincludeする翻訳�
 
 ## 追加構文と厳格化（2026-09-28の第2ラウンド）
 
-第2ラウンドで、多重継承の**C3線形化MRO**、基底クラスのクラス属性の継承、**束縛メソッド**（`m = obj.method`）、`finally`内の`return`/`break`/`continue`、**複数for節・タプルターゲットを持つジェネレータ式**を追加し、`sorted()`/`min()`/`max()`のタプル・リスト比較と安定マージソート（O(n log n)）を実装しました。CPython差分は**528アサーション**（C487–C528を追加）へ増え、全一致です。
+第2ラウンドで、多重継承の**C3線形化MRO**、基底クラスのクラス属性の継承、**束縛メソッド**（`m = obj.method`）、`finally`内の`return`/`break`/`continue`、**複数for節・タプルターゲットを持つジェネレータ式**を追加し、`sorted()`/`min()`/`max()`のタプル・リスト比較と安定マージソート（O(n log n)）を実装しました。CPython差分は**549アサーション**（C487–C549を追加）へ増え、全一致です。
 
 ビルドはさらに厳格化し、`-Wcast-align=strict`、`-Wlogical-op`、`-Wduplicated-cond/-branches`、`-Wstrict-overflow=2`、`-Wformat-overflow=2`/`-Wformat-truncation=2`/`-Wstringop-overflow=4`、`-Wuse-after-free=3`、`-Wjump-misses-init`、`-Wswitch-default`、`-Wunused-macros` などを追加（追加分の28警告はすべて修正）。ホスト向けに実行時ハードニング（`-fstack-protector-strong`、`-fstack-clash-protection`、`-D_FORTIFY_SOURCE=3`）を既定適用し、組込み向けに `make test-stack-usage`（フレーム上限4096バイト）と `make test-analyzer`（GCC `-fanalyzer`）を新設しました。`-fanalyzer` が検出した例外生成失敗時のNULL参照1件も修正しています。詳細は[厳格ビルドと静的検査](../testing/STRICT_BUILD_AND_ANALYSIS_ALPHA0.6.md)を参照してください。
 

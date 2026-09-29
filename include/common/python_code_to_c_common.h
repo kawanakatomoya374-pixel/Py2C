@@ -25,7 +25,26 @@ extern "C" {
 #include <string.h>
 #include <stdarg.h>
 #else
-/* 標準ライブラリなし環境用の最小限の型定義 */
+/* 標準ライブラリなし環境用の最小限の型定義。
+ *
+ * ただしコンパイラが提供する型定義ヘッダ（stdint.h/stddef.h/stdbool.h）が
+ * 使える環境（TinyCCなど）では、そちらを使わないと typedef の再定義が
+ * エラーになる（例: tcc の stddef.h は int64_t も定義する）。
+ *   - TinyCC (__TINYC__) では既定でコンパイラのヘッダを使う
+ *   - 明示的に切り替える場合は PYTHON_CODE_TO_C_USE_COMPILER_TYPES（使う）/
+ *     PYTHON_CODE_TO_C_NO_COMPILER_HEADERS（使わない）を定義する
+ *   - どちらのヘッダも無いカーネル（-nostdinc 等）は既定（自前定義）のまま */
+#if defined(__TINYC__) && !defined(PYTHON_CODE_TO_C_NO_COMPILER_HEADERS)
+#  ifndef PYTHON_CODE_TO_C_USE_COMPILER_TYPES
+#    define PYTHON_CODE_TO_C_USE_COMPILER_TYPES 1
+#  endif
+#endif
+
+#ifdef PYTHON_CODE_TO_C_USE_COMPILER_TYPES
+#include <stddef.h>
+#include <stdint.h>
+#include <stdbool.h>
+#else
 typedef unsigned long size_t;
 typedef signed long ptrdiff_t;
 typedef unsigned char uint8_t;
@@ -41,6 +60,7 @@ typedef uint8_t bool;
 #define true 1
 #define false 0
 #define NULL ((void*)0)
+#endif
 
 /* Allocator ABI supplied by the hosted runtime or target OS adapter. */
 void *malloc(size_t size);
@@ -83,11 +103,33 @@ int toupper(int c);
 long long strtoll(const char *nptr, char **endptr, int base);
 double strtod(const char *nptr, char **endptr);
 double floor(double x);
+double ceil(double x);
+double trunc(double x);
+double fabs(double x);
 double fmod(double x, double y);
 double pow(double x, double y);
 double sqrt(double x);
+double cbrt(double x);
+double hypot(double x, double y);
+double copysign(double x, double y);
+double ldexp(double x, int exp);
 double sin(double x);
 double cos(double x);
+double tan(double x);
+double asin(double x);
+double acos(double x);
+double atan(double x);
+double atan2(double y, double x);
+double exp(double x);
+double expm1(double x);
+double log(double x);
+double log2(double x);
+double log10(double x);
+double log1p(double x);
+double erf(double x);
+double erfc(double x);
+double tgamma(double x);
+double lgamma(double x);
 int snprintf(char *str, size_t size, const char *format, ...);
 int vsnprintf(char *str, size_t size, const char *format, va_list ap);
 #endif

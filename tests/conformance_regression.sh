@@ -2,6 +2,9 @@
 set -eu
 
 CC=${CC:-cc}
+# 出力先（build/tests）は他のターゲットの clean で消えることがあるため、
+# 呼び出し側に依存せずここで用意する。
+mkdir -p build/tests
 P2C_COMPILER=${P2C_COMPILER:-./build/python-code-to-c}
 P2C_TEST_CFLAGS=${P2C_TEST_CFLAGS:--Wall -Wextra -Werror -std=gnu11}
 P2C_TEST_LDFLAGS=${P2C_TEST_LDFLAGS:-}
@@ -21,7 +24,7 @@ run_differential_case() {
 
     python3 "$pyfile" > "$pyout"
     "$P2C_COMPILER" "$pyfile" -o "$cfile"
-    "$CC" -I./include $P2C_TEST_CFLAGS "$cfile" \
+    $CC -I./include $P2C_TEST_CFLAGS "$cfile" \
         src/runtime/python_code_to_c_runtime.c \
         src/common/python_code_to_c_common.c \
         src/platform/python_code_to_c_platform.c \
@@ -114,4 +117,6 @@ run_differential_case C500-C505 tests/finally_control_flow_alpha06.py 6
 run_differential_case C506-C515 tests/generator_expression_multi_alpha06.py 10
 run_differential_case C516-C525 tests/tuple_ordering_alpha06.py 10
 run_differential_case C526-C528 tests/super_mro_alpha06.py 3
-printf '%s\n' 'conformance_regression_ok: 528 semantic assertions passed'
+run_differential_case C529-C538 tests/method_decorators_alpha06.py 10
+run_differential_case C539-C549 tests/math_module_alpha06.py 11
+printf '%s\n' 'conformance_regression_ok: 549 semantic assertions passed'

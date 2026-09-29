@@ -69,6 +69,30 @@ static void set_unsupported_error(P2C_Parser *p, const char *feature, const char
     set_error(p, buf);
 }
 
+/* --fallback（未対応構文をランタイムスタブへ置換）の有効/無効。
+ * 変換器は単一スレッドなのでファイルスコープで足りる。 */
+static bool g_parser_fallback = false;
+
+void p2c_parser_set_fallback(bool enabled) { g_parser_fallback = enabled; }
+bool p2c_parser_fallback_enabled(void) { return g_parser_fallback; }
+
+/* 未対応構文の代わりに「呼ぶとNotImplementedErrorになる」名前ノードを作る。
+ * codegen が接頭辞を見て p2c_fallback_expr() へ変換する。 */
+static P2C_AstExpr* unsupported_stub_expr(P2C_Parser *p, P2C_Token *tok, const char *feature) {
+    char name[160];
+    size_t len;
+    P2C_AstExpr *expr = p2c_ast_expr_new(p->alloc, AST_NAME,
+                                         tok ? tok->line : 0u, tok ? tok->col : 0u);
+    if (!expr) return NULL;
+    snprintf(name, sizeof(name), P2C_UNSUPPORTED_NAME_PREFIX "%s",
+             feature ? feature : "construct");
+    len = strlen(name);
+    expr->base.u.name.name = (char*)p2c_alloc(p->alloc, len + 1u);
+    if (!expr->base.u.name.name) return NULL;
+    memcpy(expr->base.u.name.name, name, len + 1u);
+    return expr;
+}
+
 static bool is_at_end(P2C_Parser *p) {
     P2C_Token *tok = CURRENT(p);
     return !tok || tok->type == TOK_EOF;
@@ -635,12 +659,30 @@ static P2C_AstExpr* parse_atom(P2C_Parser *p, P2C_Result *err) {
         }
         default:
             if (tok->type == TOK_UNKNOWN && tok->text && strcmp(tok->text, "complexliteral") == 0) {
+                if (g_parser_fallback) {
+                    /* 未対応トークンを消費してからスタブ式を返す
+                     * （消費しないと呼び出し側が同じトークンを見続ける）。 */
+                    NEXT(p);
+                    return unsupported_stub_expr(p, tok, "complex literal");
+                }
                 set_unsupported_error(p, "complex number literals (e.g. 2j, 3.5J)",
                     "python_code_to_c has no complex number type. Consider using a (real, imag) tuple or two separate float variables instead.");
             } else if (tok->type == TOK_UNKNOWN && tok->text && strcmp(tok->text, "bytesliteral") == 0) {
+                if (g_parser_fallback) {
+                    /* 未対応トークンを消費してからスタブ式を返す
+                     * （消費しないと呼び出し側が同じトークンを見続ける）。 */
+                    NEXT(p);
+                    return unsupported_stub_expr(p, tok, "bytes literal");
+                }
                 set_unsupported_error(p, "bytes literals (b\"...\")",
                     "python_code_to_c has no bytes type. Consider using a regular str or a list of ints instead.");
             } else if (tok->type == TOK_UNKNOWN && tok->text && strcmp(tok->text, "unicodenamedescape") == 0) {
+                if (g_parser_fallback) {
+                    /* 未対応トークンを消費してからスタブ式を返す
+                     * （消費しないと呼び出し側が同じトークンを見続ける）。 */
+                    NEXT(p);
+                    return unsupported_stub_expr(p, tok, "unicode name escape");
+                }
                 set_unsupported_error(p, "\\N{...} unicode name escapes",
                     "the Unicode name table is not embedded. Use \\uXXXX / \\UXXXXXXXX codepoint escapes instead.");
             } else if (tok->type == TOK_UNKNOWN && tok->text && strcmp(tok->text, "invalidhexescape") == 0) {

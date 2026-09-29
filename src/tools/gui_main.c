@@ -16,7 +16,9 @@
  * 端末でも問題なく動作するよう出力はプレーンテキストにフォールバック
  * 可能な作りにしています。
  */
+#ifndef _DEFAULT_SOURCE
 #define _DEFAULT_SOURCE
+#endif
 #include "tools/python_code_to_c_gui_web.h"
 #include "tools/python_code_to_c_httpd.h"
 #include <stdio.h>

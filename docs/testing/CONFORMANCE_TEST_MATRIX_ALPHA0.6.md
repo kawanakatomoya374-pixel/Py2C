@@ -343,6 +343,8 @@ CPython差分とは別に、組込み統合の契約を実行時検証する。
 | H08 | `make test-setjmp-hook` | ランタイム本体と生成Cの例外機構が`P2C_SETJMP`/`P2C_LONGJMP`だけを通ること（オーバーライドしたフックの呼び出し回数で検証） |
 | H09 | `make test-heap-unification` | NO_STDLIB構成（ランタイム同梱スタブ）で、スタブの`malloc/realloc/calloc/free`がカーネルアロケータへ委譲されること、`p2c_heap_alloc()`のブロックとraw mallocのブロックが相互に解放できること、プラットフォーム未設定時はスタブの線形ヒープが唯一のヒープになること、ヒープ未設定では確保がNULLを返すこと |
 | C526–C528 | super()のMRO解決：ダイヤモンド継承（class D(B, C)、B(A)、C(A)）でBのsuper()が実体の型のMROに従ってCを選ぶこと、単一継承でのsuper()、super().__init__()による基底初期化 | コード生成時に基底チェーンを静的に辿っていたことによる誤解決 |
+| C529–C538 | メソッドデコレータ：@staticmethod（クラス経由・インスタンス経由の呼び出し）、@classmethod（cls を受け取りクラス属性を更新／生成）、@property（読み出しでゲッター実行）、propertyのMRO継承とオーバーライド、propertyへの代入がAttributeErrorになること、束縛したpropertyの取り出し | メソッド種別のディスパッチ漏れ、propertyの優先順位（インスタンス属性より先）、setter未実装時の属性隠蔽 |
+| C539–C549 | math モジュール拡充：floor/ceil/trunc/fabs/fmod/hypot/copysign/ldexp/degrees/radians/log/log2/log10/log(2引数)/exp/expm1/log1p/tan/isnan/isinf/isfinite/fsum/prod/factorial/gcd/isqrt/comb/perm/cbrt/erf/gamma | freestandingでのlibm宣言漏れ、判定マクロ依存（isnan/isinf）、整数オーバーフロー検査 |
 | H10 | make test-stack-usage | freestandingランタイムと共通層のすべてのフレームが STACK_USAGE_LIMIT（既定4096バイト）以下であること（-Wstack-usage と -Werror の併用） |
 | H11 | make test-analyzer | GCC -fanalyzer でコンパイラコアとランタイムの欠陥（解放後利用・NULL経路・確保失敗の取り違え）がないこと。実行時間が長いため任意実行 |
 

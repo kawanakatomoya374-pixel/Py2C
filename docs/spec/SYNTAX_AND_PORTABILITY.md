@@ -22,6 +22,30 @@ Alpha0.6は、ホストOSと自作OSで共有できるC11コアを維持し、Py
 | 型構文 | soft keyword `type Alias[params] = expression`、型パラメータ既定値、TypeVarTuple、ParamSpecを型消去で受理。`typing.TypeAliasType`などの実行時型aliasは非対応 |
 | ランタイム | コンテナ、GC追跡されるexception cause、small-int cache、状態機械ジェネレータ、固定長FIFO協調スケジューラ、math、ヘッドレスpygame API |
 
+## 未対応構文のフォールバック（`--fallback`）
+
+未対応構文は既定で**位置付きの明確な診断**を出して停止します（不正なCを出力しない
+方針）。ビルドを止めたくない場合は `--fallback` を指定すると、未対応の箇所が
+**実行時に `NotImplementedError` を送出するスタブ**へ置き換わり、変換とビルドは成功します。
+
+- 対象: parser レベル（`bytes` リテラル、複素数リテラル、`\N{...}`）と
+  codegen レベルの未対応式・未対応文
+- 到達しなければそのまま動く（未対応機能を使わない経路を試せる）
+- 到達した場合は `NotImplementedError: unsupported <種別> at line N (converted with --fallback)`
+- 回帰: `make test-fallback`（strict診断 / 未到達で動作 / 到達でNotImplementedError）
+
+## GC（適応しきい値と統計）
+
+自動収集のしきい値は状況に応じて調整されます。
+
+- 収集してもほとんど解放されない（`freed * 4 < live`）→ しきい値を倍々に伸ばす（上限4MiB）
+- よく解放できる（`freed > live / 2`）→ 基準値へ25%ずつ戻す
+- `p2c_gc_set_threshold(bytes)` は基準値と現在値を同時に設定（成長回数をリセット）
+- `p2c_gc_set_adaptive(false)` で固定しきい値に戻す
+- `p2c_gc_stats(&stats)` で収集回数・追跡数・ピーク・現在のしきい値・成長回数・
+  走査スタック語数・TLS一時ルート数を取得
+- 回帰: `make test-gc-adaptive`（同一負荷で固定しきい値と比較。実測 96回→9回）
+
 ## 意図的な制限
 
 デコレータ、`yield from`への`send`、`throw`、`close`、委譲戻り値、async generator、`async for`、`async with`、Task、キャンセル、I/O待機、複素数、bytes/bytearray、レキシカルクロージャと`nonlocal`捕捉は未対応です。多重継承は`class D(B, C)`と`super()`を含めて対応しますが、直接基底8個・MROの名前32個・線形化の深さ12段を上限とし、超える階層は深さ優先順へフォールバックします（`Makefile`の`P2C_MRO_*`）。pattern matchingではclass pattern、属性をたどるvalue pattern、任意の`collections.abc.Mapping`実装、複数star pattern、OR枝ごとに異なるcapture集合は未対応であり、移植性を保つ明示診断または互換フォールバックの対象です。`yield [value]`、`yield from iterable`、`async def`、単純な`await coroutine_call()`、`asyncio.run()`は対応しますが、停止点をネストした制御構造・複合式へ置く完全な状態分割は対象外です。整数は64ビット固定幅であり、CPythonの任意精度整数とは異なり範囲外で`OverflowError`になります。文字列はUTF-8バイト列として保持し、`len()`・添字・スライスは**バイト単位**です（CPythonのコードポイント単位とは異なります）。`\N{...}`（Unicode名前エスケープ）は名前表を持たないため明示診断し、`\uXXXX`/`\UXXXXXXXX`を使用してください。二項式とf-string連結は順序保証済みですが、多引数呼出しおよび一部リテラル要素に副作用を置いた場合の全経路は未保証です。list/set/dict内包表記とlambdaは現在のC出力方式に依存するため、厳格なISO C11のみで生成コードをコンパイルする構成では無効化または代替バックエンドを選ぶ必要があります。これはコンパイラコアのfreestandingビルドとは別の、生成コードのバックエンド制約です。`frozenset`は上表の通りsetへフォールバックするため、不変コンテナが必須のコードでは使用しないでください。
@@ -34,4 +58,4 @@ GC管理オブジェクトをOSの非同期キューや描画状態が保持す�
 
 ## 検証
 
-`make full-build` はクリーン状態からHosted CLI、ローカルGUI、freestandingコア、生成済み単一ヘッダーを、`-Werror`、`-Wpedantic`、`-Wshadow`、`-Wformat=2`、`-Wstrict-prototypes`、`-Wmissing-prototypes`、`-Wold-style-definition`、`-Wredundant-decls`、`-Wundef`、`-Wconversion`、`-Wsign-conversion`、`-Wcast-qual`、`-Wwrite-strings`、`-Wdouble-promotion`、`-Wvla`、`-Wfloat-equal`を含む警告即エラー設定（`-Wswitch-enum`と`-Wnull-dereference`は除外理由を`Makefile`へ明記）で構築します。`make test` はスモーク、GC・GUI Cテスト、64ビット整数境界テスト、プラットフォーム出力アダプタ、ジェネレータ・協調asyncランタイム、静的ヒープ・platform write・GC・awaitを通すベアメタル実行ハーネス、変換済みベアメタルPython例のfreestanding C11コンパイル、starred unpack、set回帰、for starred unpack、`print`キーワード、文字列探索範囲、`split(maxsplit)`、`strip(chars)`、prefix/suffix範囲、partition、文字種判定、splitlines、expandtabs、制御文字リテラル・repr、高次dict/set、list拡張、UTF-8 `ord`/`chr`、`bin`/`oct`/`hex`、開始値付き`sum`、`divmod`/`pow(a,b,mod)`/`format`/`callable`、`...`（Ellipsis）、文字列エスケープ（8進/16進/`\u`/`\U`/行継続/未知エスケープ）、Python 3.13型パラメータ・`type`文の型消去変換、位置専用引数、`yield from`、`raise from`、try/finally脱出順序の回帰、sequence/mapping/as/star/OR/guardとmapping `**rest`を含むHosted・strict C11・freestanding単一ヘッダー検証、**528件のCPython意味論差分コーパス**、既定3 seed・各48操作の決定的dict/set差分ファジング、strict C11・ネスト関数診断、ホストGUI、freestandingコア、自作OS統合ゲート（`p2c_embed` のヒープ・ライフサイクル・GC安全側停止・OOM・panic、カーネル提供setjmp/longjmp、カーネル相当環境での変換器コア実行、`--embed-entry`生成モジュールのCPython差分、組み込みテンプレートのコンパイル、LF/CRLF/CRでの生成C一致）の構築を実行します。GCCとClangの両方で`make full-build`と`make test`を通すことを品質基準とし、GCCがない環境でも`make CC=clang test-single-header-c11`で単一ヘッダーを`-pedantic-errors`の厳格C11として自己完結検証でき、`make CC=clang test-single-header-freestanding`でHosted allocator・出力・時刻参照のない実装部を検査できます。setはCPythonと異なり挿入順で内部保持・表示します。そのため順序を仕様としない集合の差分テストでは、`sorted()`で正規化して比較します。`make freestanding` は標準Cライブラリを使わないコア静的ライブラリを構築し、`make run INPUT=...` はHosted変換・コンパイル・実行を一括化します。ファジングのseed、失敗最小化、固定回帰への昇格は `docs/CONTAINER_FUZZING_ALPHA0.6.md` に定義します。
+`make full-build` はクリーン状態からHosted CLI、ローカルGUI、freestandingコア、生成済み単一ヘッダーを、`-Werror`、`-Wpedantic`、`-Wshadow`、`-Wformat=2`、`-Wstrict-prototypes`、`-Wmissing-prototypes`、`-Wold-style-definition`、`-Wredundant-decls`、`-Wundef`、`-Wconversion`、`-Wsign-conversion`、`-Wcast-qual`、`-Wwrite-strings`、`-Wdouble-promotion`、`-Wvla`、`-Wfloat-equal`を含む警告即エラー設定（`-Wswitch-enum`と`-Wnull-dereference`は除外理由を`Makefile`へ明記）で構築します。`make test` はスモーク、GC・GUI Cテスト、64ビット整数境界テスト、プラットフォーム出力アダプタ、ジェネレータ・協調asyncランタイム、静的ヒープ・platform write・GC・awaitを通すベアメタル実行ハーネス、変換済みベアメタルPython例のfreestanding C11コンパイル、starred unpack、set回帰、for starred unpack、`print`キーワード、文字列探索範囲、`split(maxsplit)`、`strip(chars)`、prefix/suffix範囲、partition、文字種判定、splitlines、expandtabs、制御文字リテラル・repr、高次dict/set、list拡張、UTF-8 `ord`/`chr`、`bin`/`oct`/`hex`、開始値付き`sum`、`divmod`/`pow(a,b,mod)`/`format`/`callable`、`...`（Ellipsis）、文字列エスケープ（8進/16進/`\u`/`\U`/行継続/未知エスケープ）、Python 3.13型パラメータ・`type`文の型消去変換、位置専用引数、`yield from`、`raise from`、try/finally脱出順序の回帰、sequence/mapping/as/star/OR/guardとmapping `**rest`を含むHosted・strict C11・freestanding単一ヘッダー検証、**549件のCPython意味論差分コーパス**、既定3 seed・各48操作の決定的dict/set差分ファジング、strict C11・ネスト関数診断、ホストGUI、freestandingコア、自作OS統合ゲート（`p2c_embed` のヒープ・ライフサイクル・GC安全側停止・OOM・panic、カーネル提供setjmp/longjmp、カーネル相当環境での変換器コア実行、`--embed-entry`生成モジュールのCPython差分、組み込みテンプレートのコンパイル、LF/CRLF/CRでの生成C一致）の構築を実行します。GCCとClangの両方で`make full-build`と`make test`を通すことを品質基準とし、GCCがない環境でも`make CC=clang test-single-header-c11`で単一ヘッダーを`-pedantic-errors`の厳格C11として自己完結検証でき、`make CC=clang test-single-header-freestanding`でHosted allocator・出力・時刻参照のない実装部を検査できます。setはCPythonと異なり挿入順で内部保持・表示します。そのため順序を仕様としない集合の差分テストでは、`sorted()`で正規化して比較します。`make freestanding` は標準Cライブラリを使わないコア静的ライブラリを構築し、`make run INPUT=...` はHosted変換・コンパイル・実行を一括化します。ファジングのseed、失敗最小化、固定回帰への昇格は `docs/CONTAINER_FUZZING_ALPHA0.6.md` に定義します。

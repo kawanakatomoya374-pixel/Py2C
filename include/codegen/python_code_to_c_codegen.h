@@ -20,6 +20,9 @@ typedef struct {
      * ランタイム初期化・GC初期化・shutdownは呼び出し側(カーネル)の責務になり、
      * 生成エントリはモジュールグローバルのルート登録と本体実行だけを行う。 */
     const char *embed_entry;
+    /* 未対応構文を「実行時に NotImplementedError を送出するスタブ」へ
+     * 置き換えて変換を続行する（--fallback）。既定falseは変換エラー。 */
+    bool fallback_unsupported;
 } P2C_CodeGenOptions;
 
 extern const P2C_CodeGenOptions P2C_DEFAULT_OPTIONS;

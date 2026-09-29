@@ -60,6 +60,8 @@ WARN_CFLAGS ?= -Wall -Wextra -Werror -Wpedantic \
 HOSTED_HARDEN ?= -fstack-protector-strong -fstack-clash-protection -D_FORTIFY_SOURCE=3
 CFLAGS ?= -std=c11 -O2 $(HOSTED_HARDEN) $(WARN_CFLAGS)
 CPPFLAGS ?= -I./include
+# 依存関係生成。TinyCCは -MMD/-MP を持たないため、tcc構成では DEPFLAGS= で無効化する。
+DEPFLAGS ?= -MMD -MP
 LDFLAGS ?=
 LDLIBS ?= -lm
 SANITIZER_CFLAGS ?= -fsanitize=address,undefined -fno-omit-frame-pointer -g
@@ -82,7 +84,7 @@ SRC := $(shell find src -type f -name '*.c' ! -path 'src/tools/gui_main.c' | sor
 OBJFILES := $(patsubst src/%.c,$(OBJ)/%.o,$(SRC))
 DEPS := $(OBJFILES:.o=.d)
 
-.PHONY: all help check-tools gui run run-gui clean test test-sanitizers test-parser-sanitizers test-gc-lifecycle test-gc-allocation-failure test-gc-leaks test-gc-stack-scan-scope test-gc-temp-roots install freestanding freestanding-clean test-set test-set-comprehension-c11 test-decorator-diagnostics test-conformance test-container-fuzz test-portability full-build single-header test-single-header test-single-header-c11 test-single-header-freestanding test-integer-overflow test-platform-adapter test-generator-async-runtime test-async-generator test-baremetal-runtime test-baremetal-exceptions test-baremetal-build test-baremetal-generated test-py313-syntax test-embed-runtime test-freestanding-setjmp test-embed-compile test-embed-generated test-hobby-os-template test-crlf test-allocator-injection test-setjmp-hook test-heap-unification test-stack-usage test-analyzer
+.PHONY: all help check-tools gui run run-gui clean test test-sanitizers test-parser-sanitizers test-gc-lifecycle test-gc-allocation-failure test-gc-leaks test-gc-stack-scan-scope test-gc-temp-roots test-gc-adaptive test-fallback install freestanding freestanding-clean test-set test-set-comprehension-c11 test-decorator-diagnostics test-conformance test-container-fuzz test-portability full-build single-header test-single-header test-single-header-c11 test-single-header-c99 test-single-header-tcc test-single-header-freestanding test-integer-overflow test-platform-adapter test-generator-async-runtime test-async-generator test-baremetal-runtime test-baremetal-exceptions test-baremetal-build test-baremetal-generated test-py313-syntax test-embed-runtime test-embed-baseline test-freestanding-setjmp test-embed-compile test-embed-generated test-hobby-os-template test-crlf test-allocator-injection test-setjmp-hook test-heap-unification test-stack-usage test-analyzer test-hobbyos-libc c99 tcc check-tcc test-c99 test-tcc elf elf-full hobbyos hobbyos-elf
 all: $(BUILD)/python-code-to-c
 	@mkdir -p bin
 	@ln -sf ../$(BUILD)/python-code-to-c bin/python_code_to_c
@@ -116,6 +118,15 @@ help:
 	@printf '%s\n' '  make check-tools                 Verify the configured compiler, archiver, and Python launcher.'
 	@printf '%s\n' '  make test-stack-usage            Check the freestanding runtime frames stay within STACK_USAGE_LIMIT.'
 	@printf '%s\n' '  make test-analyzer               Run GCC -fanalyzer over the compiler core and runtime.'
+	@printf '%s\n' '  make c99                         Build the CLI as strict C99 (GCC -std=c99 -pedantic -Wall -Wextra -Werror).'
+	@printf '%s\n' '  make test-c99                    Run the CPython-differential corpus built and compiled as C99.'
+	@printf '%s\n' '  make test-single-header-c99      Build and run the single header as strict C99 (GCC -pedantic-errors).'
+	@printf '%s\n' '  make test-single-header-tcc      Build the single header with TinyCC (hosted run + freestanding).'
+	@printf '%s\n' '  make test-embed-baseline         Measure the heap needed by p2c_embed_start() (embed import baseline).'
+	@printf '%s\n' '  make tcc | test-tcc              Build/run with TinyCC (CC=tcc; requires tcc on PATH or TCC=path).'
+	@printf '%s\n' '  make elf                         Build the complete, statically linked CLI ELF plus its manifest.'
+	@printf '%s\n' '  make hobbyos elf                 Build the freestanding HobbyOS ELF (no libc, kernel hooks).'
+	@printf '%s\n' '  make hobbyos-elf                 Same as "make hobbyos elf" (explicit target name).'
 
 check-tools:
 	@command -v "$(CC)" >/dev/null || { printf '%s\n' "compiler not found: $(CC)" >&2; exit 1; }
@@ -143,7 +154,7 @@ $(BUILD)/python-code-to-c: $(OBJFILES)
 
 $(OBJ)/%.o: src/%.c
 	@mkdir -p $(@D)
-	$(CC) $(CPPFLAGS) $(CFLAGS) -MMD -MP -c $< -o $@
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(DEPFLAGS) -c $< -o $@
 
 # Build the compiler core without hosted OS facilities. A target OS supplies
 # allocation, I/O, diagnostics and process hooks through platform callbacks.
@@ -165,6 +176,28 @@ test-single-header-c11: single-header
 	@mkdir -p build/tests
 	$(CC) $(CPPFLAGS) $(CFLAGS) -pedantic-errors tests/test_single_header.c $(LDLIBS) -o build/tests/test_single_header_c11
 	build/tests/test_single_header_c11
+
+# 単一ヘッダーがC99（GCC -pedantic-errors）でも完全にビルド・実行できることを確認する。
+test-single-header-c99: single-header
+	@mkdir -p build/tests
+	$(CC) -I./include -std=c99 -pedantic-errors -Wall -Wextra -Werror -O2 \
+		tests/test_single_header.c $(LDLIBS) -o build/tests/test_single_header_c99
+	build/tests/test_single_header_c99
+	@printf '%s\n' 'single_header_c99_ok'
+
+# 単一ヘッダーがTinyCCでも完全にビルドできることを確認する（hosted + freestanding）。
+# tccは -ffreestanding を持たないため、NO_STDLIB定義だけで freestanding 構成を作る。
+test-single-header-tcc: single-header check-tcc
+	@mkdir -p build/tests
+	$(TCC) -I./include -std=c99 -O2 -Wall -Werror \
+		tests/test_single_header.c $(LDLIBS) -o build/tests/test_single_header_tcc
+	build/tests/test_single_header_tcc
+	$(TCC) -I./include -DPYTHON_CODE_TO_C_NO_STDLIB -std=c99 -O2 -Wall -Werror \
+		-c tests/test_single_header_freestanding.c -o build/tests/test_single_header_freestanding_tcc.o
+	@if nm -u build/tests/test_single_header_freestanding_tcc.o | grep -E '(^| )U (malloc|realloc|free|fwrite|fputs|clock)$$' >/dev/null; then \
+		echo 'tcc freestanding single header has hosted libc references' >&2; exit 1; \
+	fi
+	@printf '%s\n' 'single_header_tcc_ok'
 
 test-single-header-freestanding: single-header
 	@mkdir -p build/tests
@@ -208,8 +241,13 @@ test: all
 	$(MAKE) test-decorator-diagnostics
 	$(MAKE) test-single-header
 	$(MAKE) test-single-header-c11
+	$(MAKE) test-single-header-c99
 	$(MAKE) test-single-header-freestanding
+	$(MAKE) test-gc-adaptive
+	$(MAKE) test-fallback
 	$(MAKE) test-stack-usage
+	$(MAKE) test-hobbyos-libc
+	$(MAKE) test-c99
 	$(MAKE) test-conformance
 	$(MAKE) test-container-fuzz
 	sh tests/audit_regression.sh
@@ -217,6 +255,7 @@ test: all
 
 test-sanitizers:
 	$(MAKE) clean
+	@mkdir -p build/tests
 	$(MAKE) BUILD=build/sanitize OBJ=obj/sanitize CFLAGS="$(CFLAGS) $(SANITIZER_CFLAGS)" LDFLAGS="$(LDFLAGS) $(SANITIZER_CFLAGS)" test-parser-sanitizers
 	$(MAKE) BUILD=build/sanitize OBJ=obj/sanitize CFLAGS="$(CFLAGS) $(SANITIZER_CFLAGS)" LDFLAGS="$(LDFLAGS) $(SANITIZER_CFLAGS)" test-gc-lifecycle
 	$(MAKE) BUILD=build/sanitize OBJ=obj/sanitize CFLAGS="$(CFLAGS) $(SANITIZER_CFLAGS)" LDFLAGS="$(LDFLAGS) $(SANITIZER_CFLAGS)" test-gc-allocation-failure
@@ -277,6 +316,20 @@ test-gc-allocation-failure:
 	@mkdir -p $(BUILD)/tests
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/test_gc_allocation_failure.c src/runtime/python_code_to_c_runtime.c src/common/python_code_to_c_common.c src/platform/python_code_to_c_platform.c src/platform/python_code_to_c_platform_hosted.c src/platform/python_code_to_c_gui.c src/modules/python_code_to_c_pygame.c $(LDFLAGS) -Wl,--wrap=malloc -Wl,--wrap=calloc -Wl,--wrap=realloc $(LDLIBS) -o $(BUILD)/tests/test_gc_allocation_failure
 	$(SANITIZER_ENV) $(BUILD)/tests/test_gc_allocation_failure
+
+# 適応GC（しきい値の自動調整）の回帰。固定しきい値と比較して収集回数が減り、
+# 追跡オブジェクト数のピークが上限内に収まることを確認する。
+# 未対応構文のフォールバック（--fallback）の回帰。
+test-fallback:
+	P2C_COMPILER=$(BUILD)/python-code-to-c CC="$(CC)" sh tests/fallback_regression_alpha06.sh
+
+test-gc-adaptive:
+	@mkdir -p $(BUILD)/tests
+	$(CC) -I./include -DPYTHON_CODE_TO_C_NO_PYGAME -std=c11 -O2 $(WARN_CFLAGS) \
+		tests/test_gc_adaptive.c src/runtime/python_code_to_c_runtime.c \
+		src/common/python_code_to_c_common.c src/platform/python_code_to_c_platform.c \
+		src/platform/python_code_to_c_platform_hosted.c $(LDLIBS) -o $(BUILD)/tests/test_gc_adaptive
+	$(BUILD)/tests/test_gc_adaptive
 
 test-gc-leaks:
 	@mkdir -p build/tests
@@ -358,6 +411,19 @@ test-baremetal-runtime:
 # 自作OS統合ファサード(p2c_embed)の回帰: 境界タグ付きヒープ、ライフサイクル、
 # GCの安全側停止、OOM通知とMemoryError化。NO_STDLIB + カーネル提供setjmpで、
 # Hostedプラットフォームを一切使わずに検証する。
+# 組込みランタイムの初期化（組込みモジュール登録）に必要なヒープ量を実測して表示する。
+# カーネル側がヒープサイズを見積もるための資料（既定構成では約18KB）。
+test-embed-baseline:
+	@mkdir -p $(BUILD)/tests
+	$(CC) -I./include -I./examples/embed -DPYTHON_CODE_TO_C_NO_STDLIB -DPYTHON_CODE_TO_C_NO_PYGAME \
+		-DPYTHON_CODE_TO_C_NO_LIBC_STUBS -DP2C_EMBED_PROVIDE_LIBC_HEAP -DP2C_EMBED_PROVIDE_PLATFORM_COMPAT \
+		-ffreestanding -fno-builtin -fno-stack-protector -std=c11 -O2 -Wall -Wextra \
+		tests/measure_embed_baseline.c examples/embed/x86_64_setjmp.c \
+		src/runtime/python_code_to_c_runtime.c src/common/python_code_to_c_common.c \
+		src/platform/python_code_to_c_platform.c src/platform/python_code_to_c_embed.c \
+		$(LDLIBS) -o $(BUILD)/tests/measure_embed_baseline
+	$(BUILD)/tests/measure_embed_baseline
+
 test-embed-runtime:
 	@mkdir -p build/tests
 	$(CC) -I./include -I./examples/embed -std=c11 -O2 $(WARN_CFLAGS) -c examples/embed/host_stack_bounds.c -o build/tests/host_stack_bounds.o
@@ -471,6 +537,7 @@ test-stack-usage:
 # 取り違えなどを関数間で追跡する。実行時間が長いため既定のtestには含めず、
 # 明示的に実行する（-Werror で指摘を失敗として扱う）。
 test-analyzer:
+	@mkdir -p $(BUILD)/tests
 	$(CC) -I./include -std=c11 -O0 $(WARN_CFLAGS) -fanalyzer -Wno-analyzer-too-complex -c src/core/python_code_to_c.c -o $(BUILD)/tests/analyzer_core.o
 	$(CC) -I./include -std=c11 -O0 $(WARN_CFLAGS) -fanalyzer -Wno-analyzer-too-complex -c src/runtime/python_code_to_c_runtime.c -o $(BUILD)/tests/analyzer_runtime.o
 	@printf '%s\n' 'analyzer_ok: -fanalyzer reported no defects'
@@ -483,6 +550,151 @@ test-baremetal-generated: all
 	@mkdir -p build/baremetal
 	./build/python-code-to-c examples/baremetal/baremetal_hello.py -o build/baremetal/baremetal_hello.generated.c
 	$(CC) -I./include -DPYTHON_CODE_TO_C_NO_STDLIB -DPYTHON_CODE_TO_C_NO_PYGAME -ffreestanding -fno-builtin -fno-stack-protector -std=c11 -O2 $(WARN_CFLAGS) -c build/baremetal/baremetal_hello.generated.c -o build/baremetal/baremetal_hello.generated.o
+
+# ── C99 / TinyCC 構成 (Alpha0.6) ───────────────────────────────────────────
+# 既定ビルドはC11＋厳格警告（-Wconversion等）のまま維持し、C99専用コンパイラ
+# （TinyCC等）向けのビルド経路を別ターゲットとして用意する。C99では使えない
+# 厳格警告はC99構成では有効化せず、C99で意味のある最小限
+# （-Wall -Wextra -Werror -pedantic）に留める。C11側の厳格基準は不変なので、
+# 品質ゲートが緩むことはない。
+C99_CFLAGS ?= -std=c99 -O2 -D_POSIX_C_SOURCE=200809L -D_GNU_SOURCE -Wall -Wextra -Werror -pedantic
+C99_BUILD ?= build/c99
+C99_OBJ ?= obj/c99
+# 生成Cは内包表記でGNU statement expressionを使うため-pedanticは付けない
+# （--c11 は変換時にその構文を拒否する）。C99コンパイラでも受理される。
+C99_GENERATED_CFLAGS ?= -std=c99 -Wall -Wextra -Werror -D_POSIX_C_SOURCE=200809L
+TCC ?= tcc
+# TinyCC が解釈できる警告だけを有効化する（-Wconversion等のGCC固有の厳格警告は
+# tccでは意味が異なるため、C11厳格ビルド側にだけ残す）。
+TCC_CFLAGS ?= -std=c99 -O2 -D_POSIX_C_SOURCE=200809L -D_GNU_SOURCE -Wall -Werror \
+	-Wunsupported -Wwrite-strings -Wshadow -Wformat -Wbounds
+TCC_BUILD ?= build/tcc
+TCC_OBJ ?= obj/tcc
+# TinyCC で NO_STDLIB（カーネル/組込み）構成のソースをコンパイルできることの確認用。
+# -Wunsupported は付けない: カーネル向けテンプレートが使うアセンブリのディレクティブ
+# （.size 等）をTinyCCが「未対応」として警告し、-Werrorで落ちるため。
+TCC_FREESTANDING_CFLAGS ?= -std=c99 -O2 -Wall -Werror -Wwrite-strings \
+	-I./include -I./templates/hobby_os -I./examples/embed \
+	-DPYTHON_CODE_TO_C_NO_STDLIB -DPYTHON_CODE_TO_C_NO_PYGAME \
+	-DP2C_EMBED_PROVIDE_LIBC_HEAP -DP2C_EMBED_PROVIDE_PLATFORM_COMPAT
+
+c99:
+	$(MAKE) CC="$(CC)" BUILD="$(C99_BUILD)" OBJ="$(C99_OBJ)" CFLAGS="$(C99_CFLAGS)" all gui
+	@printf '%s\n' "c99_build_ok: $(C99_BUILD)/python-code-to-c $(C99_BUILD)/python-code-to-c-gui"
+check-tcc:
+	@command -v $(firstword $(TCC)) >/dev/null || { printf '%s\n' "TinyCC not found: $(firstword $(TCC)) (install tcc, or pass TCC=/path/to/tcc)" >&2; exit 1; }
+	@printf '%s\n' "toolchain_ok: TCC=$(TCC)"
+
+tcc: check-tcc
+	$(MAKE) CC="$(TCC)" BUILD="$(TCC_BUILD)" OBJ="$(TCC_OBJ)" DEPFLAGS= CFLAGS="$(TCC_CFLAGS)" all gui
+	@printf '%s\n' "tcc_build_ok: $(TCC_BUILD)/python-code-to-c $(TCC_BUILD)/python-code-to-c-gui"
+
+# C99でビルドした変換器で、CPython差分コーパス全体（528アサーション）を変換し、
+# 生成CもC99としてコンパイル・実行して一致を確認する。
+test-c99: c99
+	P2C_COMPILER=$(C99_BUILD)/python-code-to-c P2C_TEST_CFLAGS="$(C99_GENERATED_CFLAGS)" CC="$(CC)" sh tests/conformance_regression.sh
+
+# TinyCCでカーネル/組込み構成（NO_STDLIB）のソースもコンパイルできることを確認する。
+# 生成物はリンクしない（カーネル側の実装をリンクする前提のため、コンパイル検証まで）。
+test-tcc-freestanding: check-tcc
+	@mkdir -p $(TCC_BUILD)/freestanding
+	$(TCC) $(TCC_FREESTANDING_CFLAGS) -c src/common/python_code_to_c_common.c \
+		-o $(TCC_BUILD)/freestanding/common.o
+	$(TCC) $(TCC_FREESTANDING_CFLAGS) -c src/runtime/python_code_to_c_runtime.c \
+		-o $(TCC_BUILD)/freestanding/runtime.o
+	$(TCC) $(TCC_FREESTANDING_CFLAGS) -c src/platform/python_code_to_c_platform.c \
+		-o $(TCC_BUILD)/freestanding/platform.o
+	$(TCC) $(TCC_FREESTANDING_CFLAGS) -c src/platform/python_code_to_c_embed.c \
+		-o $(TCC_BUILD)/freestanding/embed.o
+	$(TCC) $(TCC_FREESTANDING_CFLAGS) -c templates/hobby_os/embed/hobby_os_libc.c \
+		-o $(TCC_BUILD)/freestanding/hobbyos_libc.o
+	$(TCC) $(TCC_FREESTANDING_CFLAGS) -c examples/embed/x86_64_setjmp.c \
+		-o $(TCC_BUILD)/freestanding/x86_64_setjmp.o
+	$(TCC) $(TCC_FREESTANDING_CFLAGS) -c templates/hobby_os/embed/hobby_os_entry.c \
+		-o $(TCC_BUILD)/freestanding/hobbyos_entry.o
+	@printf '%s\n' 'tcc_freestanding_ok: NO_STDLIB core, templates and setjmp compiled with TinyCC'
+
+# TinyCCで変換器本体と生成Cの両方をビルドして同じ差分コーパスを通す。単一ヘッダーも確認する。
+test-tcc: tcc test-single-header-tcc test-tcc-freestanding
+	P2C_COMPILER=$(TCC_BUILD)/python-code-to-c P2C_TEST_CFLAGS="-std=c99 -Wall -D_POSIX_C_SOURCE=200809L" CC="$(TCC)" sh tests/conformance_regression.sh
+
+# ── ELF 生成 (Alpha0.6) ────────────────────────────────────────────────────
+# make elf           : 完全版（ホスト機能込み・libc静的リンク）の自己完結ELF
+# make hobbyos elf    : HobbyOS向け（libcなし・p2c_embed＋カーネルフック）のELF
+# make hobbyos-elf    : 上と同じ（明示的なターゲット名）
+# どちらもロードマップ/セクション構成を readelf で検査し、マニフェスト
+# (*.elf.txt) を残す。HobbyOS向けELFは INTERP セグメントを持たず、未定義
+# シンボルも持たない（ランタイム同梱の最小libcとカーネルフックだけで動く）。
+ELF_BUILD ?= build/elf
+ELF_CFLAGS ?= -static -fno-pie -no-pie
+ELF_LDFLAGS ?= -static -no-pie
+HOBBYOS_ELF_BUILD ?= build/hobbyos
+HOBBYOS_ELF_PROGRAM ?= examples/embed/embed_boot.py
+HOBBYOS_ELF_ENTRY ?= p2c_hobbyos_program
+HOBBYOS_ELF_LDFLAGS ?= -nostdlib -static -no-pie -Wl,--build-id=none -Wl,-e,p2c_hobbyos_entry -T templates/hobby_os/hobbyos.ld -lgcc
+
+hobbyos:
+	@printf '%s\n' 'hobbyos は修飾ターゲットです。`make hobbyos elf` または `make hobbyos-elf` でHobbyOS向けELFを作ります。'
+
+# `make elf` は素の完全版ELF、`make hobbyos elf` はHobbyOS向けELFを作る。
+ifneq ($(filter hobbyos,$(MAKECMDGOALS)),)
+elf: hobbyos-elf
+else
+elf: elf-full
+endif
+
+elf-full: all
+	@mkdir -p $(ELF_BUILD)
+	$(CC) $(CFLAGS) $(ELF_CFLAGS) $(LDFLAGS) $(OBJFILES) $(LDLIBS) -o $(ELF_BUILD)/python-code-to-c
+	@if readelf -l $(ELF_BUILD)/python-code-to-c | grep -q INTERP; then \
+		printf '%s\n' 'elf_full_error: static ELF unexpectedly has an INTERP segment' >&2; exit 1; \
+	fi
+	@printf '%s\n' "file: $$(file -b $(ELF_BUILD)/python-code-to-c)" > $(ELF_BUILD)/python-code-to-c.elf.txt
+	@printf '%s\n' '--- readelf -h ---' >> $(ELF_BUILD)/python-code-to-c.elf.txt
+	@readelf -h $(ELF_BUILD)/python-code-to-c >> $(ELF_BUILD)/python-code-to-c.elf.txt
+	@printf '%s\n' '--- segment summary ---' >> $(ELF_BUILD)/python-code-to-c.elf.txt
+	@readelf -lW $(ELF_BUILD)/python-code-to-c | grep -E 'Type|LOAD|INTERP' >> $(ELF_BUILD)/python-code-to-c.elf.txt || true
+	@$(ELF_BUILD)/python-code-to-c --supported | head -1
+	@printf '%s\n' "elf_full_ok: $(ELF_BUILD)/python-code-to-c (static, manifest=$(ELF_BUILD)/python-code-to-c.elf.txt)"
+
+# HobbyOS向けELFが要求する数学・書式化スタブ（templates/hobby_os/embed/hobby_os_libc.c）を
+# ホストのlibm/libcと比較して検証する。シンボルは -include で stub_ 前置へ改名する。
+test-hobbyos-libc:
+	@mkdir -p $(BUILD)/tests
+	$(CC) -I./include -std=c11 -O2 -Wall -Wextra -Werror \
+		-DP2C_HOBBYOS_LIBC_PREFIX \
+		templates/hobby_os/embed/hobby_os_libc.c tests/test_hobbyos_libc.c \
+		$(LDLIBS) -o $(BUILD)/tests/test_hobbyos_libc
+	$(BUILD)/tests/test_hobbyos_libc
+
+hobbyos-elf: all
+	@mkdir -p $(HOBBYOS_ELF_BUILD)
+	./$(BUILD)/python-code-to-c $(HOBBYOS_ELF_PROGRAM) --embed-entry $(HOBBYOS_ELF_ENTRY) -o $(HOBBYOS_ELF_BUILD)/program.c
+	$(CC) -I./include -I./templates/hobby_os -ffreestanding -fno-builtin -fno-stack-protector -std=c11 -O2 \
+		-DPYTHON_CODE_TO_C_NO_STDLIB -DPYTHON_CODE_TO_C_NO_PYGAME \
+		-DP2C_EMBED_PROVIDE_PLATFORM_COMPAT \
+		-Wall -Wextra -Werror \
+		$(HOBBYOS_ELF_BUILD)/program.c \
+		src/runtime/python_code_to_c_runtime.c \
+		src/common/python_code_to_c_common.c \
+		src/platform/python_code_to_c_platform.c \
+		src/platform/python_code_to_c_embed.c \
+		templates/hobby_os/embed/hobby_os_entry.c \
+		templates/hobby_os/embed/hobby_os_libc.c \
+		$(HOBBYOS_ELF_LDFLAGS) -o $(HOBBYOS_ELF_BUILD)/python-code-to-c-hobbyos.elf
+	@if readelf -l $(HOBBYOS_ELF_BUILD)/python-code-to-c-hobbyos.elf | grep -q INTERP; then \
+		printf '%s\n' 'hobbyos_elf_error: ELF must not contain an INTERP segment' >&2; exit 1; \
+	fi
+	@if nm -u $(HOBBYOS_ELF_BUILD)/python-code-to-c-hobbyos.elf | grep -q ' U '; then \
+		printf '%s\n' 'hobbyos_elf_error: ELF has undefined symbols (kernel hooks required):' >&2; \
+		nm -u $(HOBBYOS_ELF_BUILD)/python-code-to-c-hobbyos.elf >&2; exit 1; \
+	fi
+	@printf '%s\n' "file: $$(file -b $(HOBBYOS_ELF_BUILD)/python-code-to-c-hobbyos.elf)" > $(HOBBYOS_ELF_BUILD)/python-code-to-c-hobbyos.elf.txt
+	@printf '%s\n' '--- readelf -h ---' >> $(HOBBYOS_ELF_BUILD)/python-code-to-c-hobbyos.elf.txt
+	@readelf -h $(HOBBYOS_ELF_BUILD)/python-code-to-c-hobbyos.elf >> $(HOBBYOS_ELF_BUILD)/python-code-to-c-hobbyos.elf.txt
+	@printf '%s\n' '--- sections ---' >> $(HOBBYOS_ELF_BUILD)/python-code-to-c-hobbyos.elf.txt
+	@readelf -SW $(HOBBYOS_ELF_BUILD)/python-code-to-c-hobbyos.elf >> $(HOBBYOS_ELF_BUILD)/python-code-to-c-hobbyos.elf.txt
+	@printf '%s\n' "hobbyos_elf_ok: $(HOBBYOS_ELF_BUILD)/python-code-to-c-hobbyos.elf (elf_entry=p2c_hobbyos_entry, program=$(HOBBYOS_ELF_ENTRY), manifest=$(HOBBYOS_ELF_BUILD)/python-code-to-c-hobbyos.elf.txt)"
 
 install: all
 	install -Dm755 $(BUILD)/python-code-to-c $(DESTDIR)/usr/local/bin/python-code-to-c

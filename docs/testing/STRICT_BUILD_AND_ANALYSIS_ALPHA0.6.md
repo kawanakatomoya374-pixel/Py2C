@@ -85,7 +85,7 @@ GCCの `-fanalyzer` をコンパイラコアとランタイムへ適用します
 
 ```sh
 make full-build          # CLI/GUI/freestanding/単一ヘッダーを -Werror で構築
-make test                # ホスト・GC・baremetal・embed・conformance(528)・fuzz・audit
+make test                # ホスト・GC・baremetal・embed・conformance(549)・fuzz・audit
 make test-sanitizers     # ASan/UBSan で parser/GC/conformance
 make test-gc-leaks       # LeakSanitizer で複数epochのリーク検査
 make test-stack-usage    # スタックフレーム上限

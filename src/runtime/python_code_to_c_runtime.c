@@ -3,8 +3,12 @@
  * 単一ヘッダーを ISO C11 のまま保ち、取り込み先の OS へ POSIX/GNU 拡張を
  * 持ち込まないため。 */
 #ifndef PYTHON_CODE_TO_C_NO_STDLIB
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
+#ifndef _POSIX_C_SOURCE
 #define _POSIX_C_SOURCE 200809L
+#endif
 /* 機能マクロが要求水準を満たしているかを確認する（-Wunused-macros への対処と、
  * 古い環境で暗黙に別の宣言へ落ちることを防ぐ役割を兼ねる）。 */
 #if _POSIX_C_SOURCE < 200112L
@@ -128,7 +132,7 @@ void longjmp(jmp_buf env, int val) {
 
 static void free_none(P2C_Object *obj) { (void)obj; }
 static P2C_Object* str_none(P2C_Object *obj) { (void)obj; return NULL; }
-static P2C_MethodDef no_methods[] = { {NULL, NULL, NULL} };
+static P2C_MethodDef no_methods[] = { {NULL, NULL, NULL, P2C_METHOD_INSTANCE} };
 
 /* GC: 他のP2C_Object*を直接保持しうる型（コンテナ・インスタンス・クラス・
  * モジュール）は、自分が指している子オブジェクトそれぞれについて
@@ -248,6 +252,16 @@ static bool         g_gc_collecting  = false; /* GC再入防止 */
 static void        *g_gc_stack_bottom = NULL; /* スタックスキャンの基点 (main の SF 内) */
 static bool         g_gc_enabled     = true;
 static size_t       g_gc_threshold   = 256 * 1024; /* 自動収集しきい値 (bytes) */
+static size_t       g_gc_threshold_base = 256 * 1024; /* 基準しきい値（適応GCの下限） */
+static bool         g_gc_adaptive    = true;   /* しきい値の自動調整（既定で有効） */
+static size_t       g_gc_threshold_growths = 0; /* 適応GCがしきい値を伸ばした回数 */
+static size_t       g_gc_peak_objects = 0;      /* 追跡オブジェクト数の最大値 */
+static size_t       g_gc_oom_resets   = 0;      /* OOMでしきい値を基準値へ戻した回数 */
+/* 適応GCの上限。これ以上は伸ばさない（メモリを抱え込みすぎないため）。
+ * 組込み（カーネル）では利用可能なヒープが小さいので、p2c_embed_start() が
+ * p2c_gc_set_adaptive_limit() でヒープ容量に応じた上限へ下げる。 */
+#define P2C_GC_THRESHOLD_MAX (4u * 1024u * 1024u)
+static size_t       g_gc_threshold_max = P2C_GC_THRESHOLD_MAX;
 static size_t       g_gc_bytes_alloc = 0;          /* 前回収集後の累積確保 bytes */
 static size_t       g_gc_collections = 0;
 static size_t       g_gc_last_freed  = 0;
@@ -354,6 +368,15 @@ void p2c_runtime_set_oom_handler(P2C_OomHandler handler, void *user) {
 }
 
 void p2c_runtime_notify_oom(size_t requested, const char *context) {
+    /* OOMは「適応GCのしきい値が大きすぎる」サインでもある。基準値へ戻して
+     * 次の確保までに必ず収集が走るようにする（小さなヒープでの枯渇を防ぐ）。
+     * これを入れないと、しきい値が伸びたまま収集が止まり、組込みヒープの
+     * タスクが MemoryError で止まる。 */
+    if (g_gc_adaptive && g_gc_threshold > g_gc_threshold_base) {
+        g_gc_threshold = g_gc_threshold_base;
+        g_gc_threshold_growths = 0;
+        g_gc_oom_resets++;
+    }
     if (!g_oom_handler || g_oom_in_handler) return;
     g_oom_in_handler = true;
     g_oom_handler(requested, context ? context : "allocation", g_oom_user);
@@ -510,6 +533,7 @@ P2C_Object* p2c_obj_new(P2C_ClassDef *cls) {
     g_gc_all = obj;
     g_gc_bytes_alloc += sizeof(P2C_Object);
     g_gc_obj_count++;
+    if (g_gc_obj_count > g_gc_peak_objects) g_gc_peak_objects = g_gc_obj_count;
     /* スタックスキャン用のアドレス範囲を更新する。 */
     {
         uintptr_t addr = (uintptr_t)obj;
@@ -1970,6 +1994,51 @@ static P2C_Object* p2c_bound_method_new(P2C_Object *self_obj, const char *name) 
     return p2c_closure_new(name, p2c_bound_method_dispatch, env);
 }
 
+/* クラス本体で @property として定義されたメソッド（ゲッター）をMRO順に探す。
+ * Pythonではpropertyはdata descriptorなので、インスタンス属性より先に解決する。 */
+static P2C_MethodDef* p2c_find_property_in_chain(P2C_Object *cls_obj, const char *name) {
+    if (!cls_obj || !name) return NULL;
+    P2C_MethodDef *own = p2c_find_own_method(cls_obj, name);
+    if (own) return own->kind == P2C_METHOD_PROPERTY ? own : NULL;
+    const char *mro = p2c_class_mro(cls_obj);
+    size_t offset = 0;
+    P2C_NameSpan span;
+    while (p2c_mro_next(mro, &offset, &span)) {
+        P2C_Object *base_cls = p2c_find_class_by_span(&span);
+        if (!base_cls) continue;
+        P2C_MethodDef *found = p2c_find_own_method(base_cls, name);
+        if (found) return found->kind == P2C_METHOD_PROPERTY ? found : NULL;
+    }
+    return NULL;
+}
+
+/* 見つかったメソッドを種別に従って呼び出す。
+ *   P2C_METHOD_STATIC   : selfを渡さない（生成Cのアダプタが先頭を無視する）
+ *   P2C_METHOD_CLASS    : 先頭にクラスオブジェクトを渡す
+ *   P2C_METHOD_PROPERTY : selfを束縛してゲッターとして呼ぶ
+ *   P2C_METHOD_INSTANCE : selfを渡す
+ * explicit_self（ClassName.method(self, ...) の形）では、インスタンスメソッドは
+ * 従来どおり args[0] を self として受け取る。 */
+static P2C_Object* p2c_invoke_found_method(P2C_MethodDef *found, P2C_Object *instance, P2C_Object *klass,
+                                          P2C_Object **args, size_t nargs, bool explicit_self) {
+    if (!found || !found->func) {
+        p2c_raise(p2c_make_exception("TypeError", "method is not callable"));
+        return &P2C_None;
+    }
+    if (explicit_self && found->kind == P2C_METHOD_INSTANCE) {
+        if (nargs < 1) {
+            p2c_raise(p2c_make_exception("TypeError", "unbound method requires an instance"));
+            return &P2C_None;
+        }
+        return found->func(args[0], args + 1, nargs - 1);
+    }
+    switch (found->kind) {
+        case P2C_METHOD_STATIC: return found->func(NULL, args, nargs);
+        case P2C_METHOD_CLASS: return found->func(klass ? klass : instance, args, nargs);
+        default: return found->func(instance, args, nargs);
+    }
+}
+
 /* super().method(...) の解決。Pythonでは「インスタンスの型のMRO上で、そのメソッドを
  * 定義しているクラスの次」から探索する。defining_class（メソッド本体を書いたクラス）
  * を受け取り、selfの実際の型のMROで defining_class の次から name を持つメソッドを
@@ -2527,16 +2596,17 @@ P2C_Object* p2c_call_attr(P2C_Object *obj, const char *name, P2C_Object **args, 
         /* ClassName.method(self, ...) の形（明示的な基底クラスメソッド呼び出し、
          * 例: Shape.__init__(self, ...)）。この場合は obj 自体がクラスオブジェクトで、
          * args[0] が self に相当する。 */
-        if (nargs >= 1) {
-            P2C_MethodDef *found = p2c_find_method_in_chain(obj, name);
-            if (found) return found->func(args[0], args + 1, nargs - 1);
+        P2C_MethodDef *found = p2c_find_method_in_chain(obj, name);
+        if (found) {
+            /* static/classメソッドはselfを要求しないため、nargs>=1に依存しない。 */
+            return p2c_invoke_found_method(found, NULL, obj, args, nargs, true);
         }
     }
     if (obj && obj->cls && obj->cls->type_tag == OBJ_INSTANCE && obj->u.v_instance.klass) {
         /* 自クラス、そこで見つからなければ基底クラス（複数可）を辿って
          * メソッドを探す（Python同様のメソッド解決順序: サブクラス→基底クラス）。 */
         P2C_MethodDef *found = p2c_find_method_in_chain(obj->u.v_instance.klass, name);
-        if (found) return found->func(obj, args, nargs);
+        if (found) return p2c_invoke_found_method(found, obj, obj->u.v_instance.klass, args, nargs, false);
     }
     /* list / str の組み込みメソッド。
      * これらはP2C_Object上の属性としては存在しないため、
@@ -3217,17 +3287,215 @@ P2C_Object* p2c_call_attr_kw(P2C_Object *obj, const char *name, P2C_Object **arg
         }
         kw_names = flat_names; kw_values = flat_values; nkw = flat_n;
     }
-    if (obj && obj->cls && obj->cls->type_tag == OBJ_INSTANCE) {
-        P2C_MethodDef *found = p2c_find_method_in_chain(obj->u.v_instance.klass, name);
+    if (obj && obj->cls && (obj->cls->type_tag == OBJ_INSTANCE || obj->cls->type_tag == OBJ_CLASS)) {
+        bool from_class = obj->cls->type_tag == OBJ_CLASS;
+        P2C_Object *klass = from_class ? obj : obj->u.v_instance.klass;
+        P2C_MethodDef *found = p2c_find_method_in_chain(klass, name);
         if (found && found->kwfunc) {
-            P2C_Object *result = found->kwfunc(obj, args, nargs, kw_names, kw_values, nkw);
-            if (owns_flat) { p2c_heap_free(flat_names); p2c_heap_free(flat_values); }
-            return result;
+            /* static/classメソッドはインスタンスを持たないため、種別に応じた
+             * レシーバ（NULLまたはクラスオブジェクト）を渡す。 */
+            P2C_Object *receiver = obj;
+            bool callable_path = true;
+            if (found->kind == P2C_METHOD_STATIC) receiver = NULL;
+            else if (found->kind == P2C_METHOD_CLASS) receiver = klass;
+            else if (from_class) callable_path = false; /* ClassName.m(self, ...) の
+                                                          * キーワード形は未対応。 */
+            if (callable_path) {
+                P2C_Object *result = found->kwfunc(receiver, args, nargs, kw_names, kw_values, nkw);
+                if (owns_flat) { p2c_heap_free(flat_names); p2c_heap_free(flat_values); }
+                return result;
+            }
         }
     }
     if (owns_flat) { p2c_heap_free(flat_names); p2c_heap_free(flat_values); }
     p2c_raise(p2c_make_exception("TypeError", "keyword arguments are not supported for this method"));
     return &P2C_None;
+}
+
+/* math モジュールの各関数。1引数/2引数のdouble関数を薄くラップする。
+ * freestanding構成では、libm相当の実装をカーネル（または-lm）が提供する契約。
+ * 引数個数の検査だけを行い、型変換はp2c_obj_as_floatに任せる。 */
+#define P2C_MATH_UNARY(name, expr) \
+    static P2C_Object* math_##name##_fn(P2C_Object **args, size_t nargs) { \
+        double x; \
+        if (nargs != 1) { p2c_raise(p2c_make_exception("TypeError", #name " expects 1 argument")); return &P2C_None; } \
+        x = p2c_obj_as_float(args[0]); \
+        (void)x; \
+        return p2c_obj_from_float(expr); \
+    }
+#define P2C_MATH_BINARY(name, expr) \
+    static P2C_Object* math_##name##_fn(P2C_Object **args, size_t nargs) { \
+        double x, y; \
+        if (nargs != 2) { p2c_raise(p2c_make_exception("TypeError", #name " expects 2 arguments")); return &P2C_None; } \
+        x = p2c_obj_as_float(args[0]); \
+        y = p2c_obj_as_float(args[1]); \
+        (void)x; (void)y; \
+        return p2c_obj_from_float(expr); \
+    }
+
+P2C_MATH_UNARY(tan, tan(x))
+P2C_MATH_UNARY(asin, asin(x))
+P2C_MATH_UNARY(acos, acos(x))
+P2C_MATH_UNARY(atan, atan(x))
+P2C_MATH_UNARY(exp, exp(x))
+P2C_MATH_UNARY(expm1, expm1(x))
+P2C_MATH_UNARY(log2, log2(x))
+P2C_MATH_UNARY(log10, log10(x))
+P2C_MATH_UNARY(log1p, log1p(x))
+P2C_MATH_UNARY(fabs, fabs(x))
+P2C_MATH_UNARY(degrees, x * (180.0 / 3.14159265358979323846))
+P2C_MATH_UNARY(radians, x * (3.14159265358979323846 / 180.0))
+P2C_MATH_BINARY(atan2, atan2(x, y))
+P2C_MATH_BINARY(hypot, hypot(x, y))
+P2C_MATH_BINARY(fmod, fmod(x, y))
+P2C_MATH_BINARY(copysign, copysign(x, y))
+P2C_MATH_UNARY(cbrt, cbrt(x))
+P2C_MATH_UNARY(erf, erf(x))
+P2C_MATH_UNARY(erfc, erfc(x))
+P2C_MATH_UNARY(gamma, tgamma(x))
+P2C_MATH_UNARY(lgamma, lgamma(x))
+P2C_MATH_BINARY(ldexp, ldexp(x, (int)y))
+#undef P2C_MATH_UNARY
+#undef P2C_MATH_BINARY
+
+/* math.log(x) / math.log(x, base) の2引数形。 */
+static P2C_Object* math_log_base_fn(P2C_Object **args, size_t nargs) {
+    double x, base;
+    if (nargs != 1 && nargs != 2) {
+        p2c_raise(p2c_make_exception("TypeError", "log expects 1 or 2 arguments"));
+        return &P2C_None;
+    }
+    x = p2c_obj_as_float(args[0]);
+    if (nargs == 1) return p2c_obj_from_float(log(x));
+    base = p2c_obj_as_float(args[1]);
+    /* 2/10 は専用のlog2/log10を使う（-Wfloat-equal対策でp2c_float_eq）。 */
+    if (p2c_float_eq(base, 2.0)) return p2c_obj_from_float(log2(x));
+    if (p2c_float_eq(base, 10.0)) return p2c_obj_from_float(log10(x));
+    return p2c_obj_from_float(log(x) / log(base));
+}
+
+/* math.floor/ceil/trunc はCPython同様にintを返す。 */
+static P2C_Object* math_floor_fn(P2C_Object **args, size_t nargs) {
+    double v;
+    if (nargs != 1) { p2c_raise(p2c_make_exception("TypeError", "floor expects 1 argument")); return &P2C_None; }
+    v = floor(p2c_obj_as_float(args[0]));
+    return p2c_obj_from_int((int64_t)v);
+}
+static P2C_Object* math_ceil_fn(P2C_Object **args, size_t nargs) {
+    double v;
+    if (nargs != 1) { p2c_raise(p2c_make_exception("TypeError", "ceil expects 1 argument")); return &P2C_None; }
+    v = ceil(p2c_obj_as_float(args[0]));
+    return p2c_obj_from_int((int64_t)v);
+}
+static P2C_Object* math_trunc_fn(P2C_Object **args, size_t nargs) {
+    double v;
+    if (nargs != 1) { p2c_raise(p2c_make_exception("TypeError", "trunc expects 1 argument")); return &P2C_None; }
+    v = trunc(p2c_obj_as_float(args[0]));
+    return p2c_obj_from_int((int64_t)v);
+}
+
+/* math.isfinite/isinf/isnan はboolを返す。
+ * isnan/isinf/isfinite はlibcのマクロで、freestanding構成（-ffreestandingや
+ * NO_STDLIBの宣言）では提供されないことがあるため、値の性質から直接判定する
+ * （NaNは自分自身と等しくない、±infは有限最大値の外側）。 */
+static bool p2c_double_is_nan(double v) { return p2c_float_ne(v, v); }
+static bool p2c_double_is_inf(double v) {
+    return v > 1.7976931348623157e308 || v < -1.7976931348623157e308;
+}
+static P2C_Object* math_isfinite_fn(P2C_Object **args, size_t nargs) {
+    double v;
+    if (nargs != 1) { p2c_raise(p2c_make_exception("TypeError", "isfinite expects 1 argument")); return &P2C_None; }
+    v = p2c_obj_as_float(args[0]);
+    return p2c_obj_from_bool(!p2c_double_is_nan(v) && !p2c_double_is_inf(v));
+}
+static P2C_Object* math_isinf_fn(P2C_Object **args, size_t nargs) {
+    if (nargs != 1) { p2c_raise(p2c_make_exception("TypeError", "isinf expects 1 argument")); return &P2C_None; }
+    return p2c_obj_from_bool(p2c_double_is_inf(p2c_obj_as_float(args[0])));
+}
+static P2C_Object* math_isnan_fn(P2C_Object **args, size_t nargs) {
+    if (nargs != 1) { p2c_raise(p2c_make_exception("TypeError", "isnan expects 1 argument")); return &P2C_None; }
+    return p2c_obj_from_bool(p2c_double_is_nan(p2c_obj_as_float(args[0])));
+}
+
+/* math.fsum(iterable) / math.prod(iterable) は要素を畳み込む。 */
+static P2C_Object* math_fsum_fn(P2C_Object **args, size_t nargs) {
+    int64_t count, i;
+    double sum = 0.0;
+    if (nargs != 1) { p2c_raise(p2c_make_exception("TypeError", "fsum expects 1 argument")); return &P2C_None; }
+    count = p2c_len(args[0]);
+    for (i = 0; i < count; i++) sum += p2c_obj_as_float(p2c_iter_at(args[0], i));
+    return p2c_obj_from_float(sum);
+}
+static P2C_Object* math_prod_fn(P2C_Object **args, size_t nargs) {
+    int64_t count, i, acc = 1;
+    if (nargs != 1) { p2c_raise(p2c_make_exception("TypeError", "prod expects 1 argument")); return &P2C_None; }
+    count = p2c_len(args[0]);
+    for (i = 0; i < count; i++) acc = acc * p2c_obj_as_int(p2c_iter_at(args[0], i));
+    return p2c_obj_from_int(acc);
+}
+
+/* math.isqrt(n) / math.comb(n, k) / math.perm(n, k)（整数演算）。 */
+static P2C_Object* math_isqrt_fn(P2C_Object **args, size_t nargs) {
+    int64_t n, low, high;
+    if (nargs != 1) { p2c_raise(p2c_make_exception("TypeError", "isqrt expects 1 argument")); return &P2C_None; }
+    n = p2c_obj_as_int(args[0]);
+    if (n < 0) { p2c_raise(p2c_make_exception("ValueError", "isqrt() argument must be nonnegative")); return &P2C_None; }
+    low = 0;
+    high = n < 3037000499 ? n + 1 : 3037000500; /* sqrt(INT64_MAX)以下に収める */
+    while (low < high) {
+        int64_t mid = low + (high - low + 1) / 2;
+        if (mid <= n / mid) low = mid; else high = mid - 1;
+    }
+    return p2c_obj_from_int(low);
+}
+static P2C_Object* math_comb_fn(P2C_Object **args, size_t nargs) {
+    int64_t n, k, i, acc = 1;
+    if (nargs != 2) { p2c_raise(p2c_make_exception("TypeError", "comb expects 2 arguments")); return &P2C_None; }
+    n = p2c_obj_as_int(args[0]);
+    k = p2c_obj_as_int(args[1]);
+    if (n < 0 || k < 0) { p2c_raise(p2c_make_exception("ValueError", "comb() requires nonnegative arguments")); return &P2C_None; }
+    if (k > n) return p2c_obj_from_int(0);
+    if (k > n - k) k = n - k;
+    for (i = 1; i <= k; i++) {
+        if (acc > INT64_MAX / (n - k + i)) { p2c_raise(p2c_make_exception("OverflowError", "comb() result too large")); return &P2C_None; }
+        acc = acc * (n - k + i) / i;
+    }
+    return p2c_obj_from_int(acc);
+}
+static P2C_Object* math_perm_fn(P2C_Object **args, size_t nargs) {
+    int64_t n, k, i, acc = 1;
+    if (nargs != 2) { p2c_raise(p2c_make_exception("TypeError", "perm expects 2 arguments")); return &P2C_None; }
+    n = p2c_obj_as_int(args[0]);
+    k = p2c_obj_as_int(args[1]);
+    if (n < 0 || k < 0) { p2c_raise(p2c_make_exception("ValueError", "perm() requires nonnegative arguments")); return &P2C_None; }
+    if (k > n) return p2c_obj_from_int(0);
+    for (i = 0; i < k; i++) {
+        if (acc > INT64_MAX / (n - i)) { p2c_raise(p2c_make_exception("OverflowError", "perm() result too large")); return &P2C_None; }
+        acc = acc * (n - i);
+    }
+    return p2c_obj_from_int(acc);
+}
+
+static P2C_Object* math_factorial_fn(P2C_Object **args, size_t nargs) {
+    int64_t n, i, acc = 1;
+    if (nargs != 1) { p2c_raise(p2c_make_exception("TypeError", "factorial expects 1 argument")); return &P2C_None; }
+    n = p2c_obj_as_int(args[0]);
+    if (n < 0) { p2c_raise(p2c_make_exception("ValueError", "factorial() not defined for negative values")); return &P2C_None; }
+    for (i = 2; i <= n; i++) {
+        if (acc > INT64_MAX / i) { p2c_raise(p2c_make_exception("OverflowError", "factorial() result too large")); return &P2C_None; }
+        acc *= i;
+    }
+    return p2c_obj_from_int(acc);
+}
+static P2C_Object* math_gcd_fn(P2C_Object **args, size_t nargs) {
+    int64_t a, b, t;
+    if (nargs != 2) { p2c_raise(p2c_make_exception("TypeError", "gcd expects 2 arguments")); return &P2C_None; }
+    a = p2c_obj_as_int(args[0]);
+    b = p2c_obj_as_int(args[1]);
+    if (a < 0) a = -a;
+    if (b < 0) b = -b;
+    while (b != 0) { t = a % b; a = b; b = t; }
+    return p2c_obj_from_int(a);
 }
 
 static P2C_Object* math_sqrt_fn(P2C_Object **args, size_t nargs) { if (nargs != 1) { p2c_raise(p2c_make_exception("TypeError", "sqrt expects 1 argument")); return &P2C_None; } return p2c_obj_from_float(sqrt(p2c_obj_as_float(args[0]))); }
@@ -3311,7 +3579,8 @@ static P2C_Object* gc_candidate_object(void *candidate) {
  * no_sanitize: 保守的スキャンは隣接する変数の "間" を意図的に読む。
  * ASan はそれを stack-buffer-overflow / use-after-scope として報告するが、
  * これは仕様上の誤検知であるため、この関数だけインスツルメントを外す。 */
-#if defined(__GNUC__) || defined(__clang__)
+/* GCC/Clangのみ属性を解釈する（tcc等のC99コンパイラでは何もしない）。 */
+#if (defined(__GNUC__) || defined(__clang__)) && !defined(__TINYC__)
 __attribute__((no_sanitize("address")))
 #endif
 static void gc_stack_scan(void *stack_lo, void *stack_hi) {
@@ -3537,11 +3806,75 @@ void p2c_gc_collect(void) {
     g_gc_bytes_alloc = 0;
     g_gc_last_freed  = freed;
     g_gc_collections++;
+
+    /* ── 4. しきい値の適応調整 ──
+     * 生存オブジェクトが多い（＝解放がほとんどない）のに毎回収集すると、
+     * 保守的スタックスキャンのコストだけが積み上がる。この場合はしきい値を
+     * 倍々に伸ばして収集頻度を下げる。逆に多く解放できたときは基準値へ
+     * 戻していき、メモリを抱え込まないようにする。 */
+    if (g_gc_adaptive) {
+        size_t live = g_gc_obj_count;
+        /* しきい値の上限は「生存集合の概算（オブジェクト1個あたりの平均確保量）」
+         * とヒープ由来の上限の小さい方にする。生存集合が小さいのにしきい値だけ
+         * 大きくなると、収集が止まって小さなヒープが枯渇する。 */
+        size_t live_bytes = live * 96u;
+        size_t cap = live_bytes < g_gc_threshold_max ? live_bytes : g_gc_threshold_max;
+        if (cap < g_gc_threshold_base) cap = g_gc_threshold_base;
+        if (freed * 4u < live && g_gc_threshold < cap) {
+            size_t next = g_gc_threshold * 2u;
+            g_gc_threshold = next > cap ? cap : next;
+            g_gc_threshold_growths++;
+        } else if (freed > live / 2u && g_gc_threshold > g_gc_threshold_base) {
+            size_t next = g_gc_threshold - g_gc_threshold / 4u;   /* 25%ずつ戻す */
+            g_gc_threshold = next < g_gc_threshold_base ? g_gc_threshold_base : next;
+        }
+    }
     g_gc_collecting  = false;
 }
 void    p2c_gc_set_enabled(bool enabled)    { g_gc_enabled   = enabled; }
 bool    p2c_gc_is_enabled(void)             { return g_gc_enabled; }
-void    p2c_gc_set_threshold(size_t bytes)  { g_gc_threshold = bytes ? bytes : 1; }
+void    p2c_gc_set_threshold(size_t bytes)  {
+    /* 基準値と現在値の両方を設定し、適応による成長をリセットする。 */
+    g_gc_threshold_base = bytes ? bytes : 1u;
+    g_gc_threshold = g_gc_threshold_base;
+    g_gc_threshold_growths = 0;
+}
+void    p2c_gc_set_adaptive(bool enabled)   { g_gc_adaptive = enabled; }
+void    p2c_gc_set_adaptive_limit(size_t max_threshold) {
+    /* 適応GCがしきい値を伸ばせる上限。カーネル/組込みではヒープ容量に合わせて
+     * 下げる（大きすぎる上限だと、小さなヒープで収集が止まり枯渇する）。 */
+    if (max_threshold == 0) max_threshold = P2C_GC_THRESHOLD_MAX;
+    g_gc_threshold_max = max_threshold < 4096u ? 4096u : max_threshold;
+    if (g_gc_threshold > g_gc_threshold_max) g_gc_threshold = g_gc_threshold_max;
+}
+size_t  p2c_gc_adaptive_limit(void)         { return g_gc_threshold_max; }
+bool    p2c_gc_is_adaptive(void)            { return g_gc_adaptive; }
+P2C_Object* p2c_fallback_expr(const char *where, const char *what) {
+    char message[192];
+    snprintf(message, sizeof(message),
+             "unsupported %s at %s (converted with --fallback)",
+             what ? what : "construct", where ? where : "unknown location");
+    p2c_raise(p2c_make_exception("NotImplementedError", message));
+    return &P2C_None;
+}
+
+void p2c_fallback_stmt(const char *where, const char *what) {
+    (void)p2c_fallback_expr(where, what);
+}
+
+void    p2c_gc_stats(P2C_GcStats *out) {
+    if (!out) return;
+    out->collections = g_gc_collections;
+    out->objects = g_gc_obj_count;
+    out->peak_objects = g_gc_peak_objects;
+    out->last_freed = g_gc_last_freed;
+    out->threshold = g_gc_threshold;
+    out->base_threshold = g_gc_threshold_base;
+    out->threshold_growths = g_gc_threshold_growths;
+    out->oom_resets = g_gc_oom_resets;
+    out->scanned_words = g_gc_scan_words;
+    out->temp_roots = g_gc_temp_roots;
+}
 bool    p2c_gc_is_collecting(void)         { return g_gc_collecting; }
 size_t  p2c_gc_object_count(void)          { return g_gc_obj_count; }
 size_t  p2c_gc_collections_run(void)       { return g_gc_collections; }
@@ -3579,13 +3912,55 @@ void p2c_runtime_init(void *heap_base, size_t heap_sz) {
         g_oom_exception = p2c_make_exception("MemoryError", "out of memory");
     }
     P2C_Object *math_mod = p2c_module_new("math");
+    /* math モジュール: 組込みでよく使う関数と定数を登録する。各関数は
+     * double を受けて double（またはint/bool）を返す薄いラッパで、
+     * 引数個数の検査だけを行う。 */
     if (math_mod) {
         p2c_module_set_attr(math_mod, "pi", p2c_obj_from_float(3.14159265358979323846));
         p2c_module_set_attr(math_mod, "e", p2c_obj_from_float(2.71828182845904523536));
+        p2c_module_set_attr(math_mod, "tau", p2c_obj_from_float(6.28318530717958647692));
+        p2c_module_set_attr(math_mod, "inf", p2c_obj_from_float(1.0 / 0.0));
+        p2c_module_set_attr(math_mod, "nan", p2c_obj_from_float(0.0 / 0.0));
         p2c_module_set_attr(math_mod, "sqrt", p2c_function_new("sqrt", math_sqrt_fn));
         p2c_module_set_attr(math_mod, "sin", p2c_function_new("sin", math_sin_fn));
         p2c_module_set_attr(math_mod, "cos", p2c_function_new("cos", math_cos_fn));
+        p2c_module_set_attr(math_mod, "tan", p2c_function_new("tan", math_tan_fn));
+        p2c_module_set_attr(math_mod, "asin", p2c_function_new("asin", math_asin_fn));
+        p2c_module_set_attr(math_mod, "acos", p2c_function_new("acos", math_acos_fn));
+        p2c_module_set_attr(math_mod, "atan", p2c_function_new("atan", math_atan_fn));
+        p2c_module_set_attr(math_mod, "atan2", p2c_function_new("atan2", math_atan2_fn));
+        p2c_module_set_attr(math_mod, "hypot", p2c_function_new("hypot", math_hypot_fn));
+        p2c_module_set_attr(math_mod, "exp", p2c_function_new("exp", math_exp_fn));
+        p2c_module_set_attr(math_mod, "expm1", p2c_function_new("expm1", math_expm1_fn));
+        p2c_module_set_attr(math_mod, "log", p2c_function_new("log", math_log_base_fn));
+        p2c_module_set_attr(math_mod, "log2", p2c_function_new("log2", math_log2_fn));
+        p2c_module_set_attr(math_mod, "log10", p2c_function_new("log10", math_log10_fn));
+        p2c_module_set_attr(math_mod, "log1p", p2c_function_new("log1p", math_log1p_fn));
         p2c_module_set_attr(math_mod, "pow", p2c_function_new("pow", math_pow_fn));
+        p2c_module_set_attr(math_mod, "fabs", p2c_function_new("fabs", math_fabs_fn));
+        p2c_module_set_attr(math_mod, "floor", p2c_function_new("floor", math_floor_fn));
+        p2c_module_set_attr(math_mod, "ceil", p2c_function_new("ceil", math_ceil_fn));
+        p2c_module_set_attr(math_mod, "trunc", p2c_function_new("trunc", math_trunc_fn));
+        p2c_module_set_attr(math_mod, "fmod", p2c_function_new("fmod", math_fmod_fn));
+        p2c_module_set_attr(math_mod, "copysign", p2c_function_new("copysign", math_copysign_fn));
+        p2c_module_set_attr(math_mod, "cbrt", p2c_function_new("cbrt", math_cbrt_fn));
+        p2c_module_set_attr(math_mod, "erf", p2c_function_new("erf", math_erf_fn));
+        p2c_module_set_attr(math_mod, "erfc", p2c_function_new("erfc", math_erfc_fn));
+        p2c_module_set_attr(math_mod, "gamma", p2c_function_new("gamma", math_gamma_fn));
+        p2c_module_set_attr(math_mod, "lgamma", p2c_function_new("lgamma", math_lgamma_fn));
+        p2c_module_set_attr(math_mod, "ldexp", p2c_function_new("ldexp", math_ldexp_fn));
+        p2c_module_set_attr(math_mod, "isqrt", p2c_function_new("isqrt", math_isqrt_fn));
+        p2c_module_set_attr(math_mod, "comb", p2c_function_new("comb", math_comb_fn));
+        p2c_module_set_attr(math_mod, "perm", p2c_function_new("perm", math_perm_fn));
+        p2c_module_set_attr(math_mod, "degrees", p2c_function_new("degrees", math_degrees_fn));
+        p2c_module_set_attr(math_mod, "radians", p2c_function_new("radians", math_radians_fn));
+        p2c_module_set_attr(math_mod, "isfinite", p2c_function_new("isfinite", math_isfinite_fn));
+        p2c_module_set_attr(math_mod, "isinf", p2c_function_new("isinf", math_isinf_fn));
+        p2c_module_set_attr(math_mod, "isnan", p2c_function_new("isnan", math_isnan_fn));
+        p2c_module_set_attr(math_mod, "fsum", p2c_function_new("fsum", math_fsum_fn));
+        p2c_module_set_attr(math_mod, "prod", p2c_function_new("prod", math_prod_fn));
+        p2c_module_set_attr(math_mod, "factorial", p2c_function_new("factorial", math_factorial_fn));
+        p2c_module_set_attr(math_mod, "gcd", p2c_function_new("gcd", math_gcd_fn));
         p2c_register_module(math_mod);
     }
 #ifndef PYTHON_CODE_TO_C_NO_PYGAME
@@ -3618,7 +3993,10 @@ void p2c_runtime_shutdown(void) {
     g_gc_last_freed = 0;
     g_gc_collecting = false;
     g_gc_enabled = true;
-    g_gc_threshold = 256 * 1024;
+    g_gc_threshold_base = 256 * 1024;
+    g_gc_threshold = g_gc_threshold_base;
+    g_gc_threshold_growths = 0;
+    g_gc_peak_objects = 0;
     g_gc_stack_bottom = NULL;
     g_gc_stack_lo = NULL;
     g_gc_stack_hi = NULL;
@@ -3765,24 +4143,46 @@ bool p2c_exc_name_match(P2C_Object *exc, const char *type_name) {
 
 static void p2c_format_float(double v, char *buf, size_t bufsz) {
 #ifndef PYTHON_CODE_TO_C_NO_STDLIB
+    char tmp[512];
     if (p2c_float_ne(v, v)) { /* NaN は自分自身と等しくない */ snprintf(buf, bufsz, "nan"); return; }
-    if (v > 1e308 * 10.0) { snprintf(buf, bufsz, "inf"); return; }
-    if (v < -1e308 * 10.0) { snprintf(buf, bufsz, "-inf"); return; }
-    /* Pythonのfloatは常に小数点を含む形式で表示される(例: 4.0)。
-     * %g は整数値になる浮動小数点数から小数点以下を省略してしまう(例: "-4")ため、
-     * 指数表記でも小数表記でもない場合は明示的に ".0" を補う。 */
-    snprintf(buf, bufsz, "%.17g", v);
-    /* 17桁精度は往復変換の安全域だが冗長になりがちなので、
-     * 短い表現で同じ値に戻るなら短縮する */
-    for (int prec = 1; prec < 17; prec++) {
-        char shorter[64];
-        snprintf(shorter, sizeof(shorter), "%.*g", prec, v);
-        double back = strtod(shorter, NULL);
-        if (p2c_float_eq(back, v)) { snprintf(buf, bufsz, "%s", shorter); break; }
+    /* 有限の最大値(DBL_MAX)より大きい＝+inf、小さい＝-inf。1e308*10のような
+     * 式は最適化でinf同士の比較になり判定できないため、境界値を直接用いる。 */
+    if (v > 1.7976931348623157e308) { snprintf(buf, bufsz, "inf"); return; }
+    if (v < -1.7976931348623157e308) { snprintf(buf, bufsz, "-inf"); return; }
+    /* CPythonのreprと同じ規則で、固定小数表記と指数表記を選ぶ:
+     *   指数部（10進）が -4 未満、または 16 以上なら指数表記。
+     * %g に任せると 100.0 が "1e+02" になったり、整数値から ".0" が落ちたりするため、
+     * 指数部を実際に取り出してモードを決め、往復変換する最短桁数を選ぶ。
+     * 出力は一度 max(16桁+精度, 指数表記) を収める十分な大きさの一時バッファへ
+     * 書き、最後に呼び出し側のバッファへ有界コピーする。 */
+    int exp10 = 0;
+    snprintf(tmp, sizeof(tmp), "%.0e", v);
+    {
+        const char *e_pos = strchr(tmp, 'e');
+        if (e_pos) exp10 = (int)strtol(e_pos + 1, NULL, 10);
     }
-    bool has_dot_or_exp = false;
-    for (char *c = buf; *c; c++) { if (*c == '.' || *c == 'e' || *c == 'E' || *c == 'n' || *c == 'i') { has_dot_or_exp = true; break; } }
-    if (!has_dot_or_exp) strcat(buf, ".0");
+    if (exp10 < -4 || exp10 >= 16) {
+        for (int prec = 0; prec <= 16; prec++) {
+            snprintf(tmp, sizeof(tmp), "%.*e", prec, v);
+            if (p2c_float_eq(strtod(tmp, NULL), v)) break;
+        }
+    } else {
+        for (int prec = 0; prec <= 17; prec++) {
+            snprintf(tmp, sizeof(tmp), "%.*f", prec, v);
+            if (p2c_float_eq(strtod(tmp, NULL), v)) break;
+        }
+        /* Pythonのfloatは常に小数点を含む形式で表示される(例: 4.0)。 */
+        if (!strchr(tmp, '.')) {
+            size_t used = strlen(tmp);
+            if (used + 2u < sizeof(tmp)) { tmp[used] = '.'; tmp[used + 1] = '0'; tmp[used + 2] = '\0'; }
+        }
+    }
+    if (bufsz > 0) {
+        size_t len = strlen(tmp);
+        if (len >= bufsz) len = bufsz - 1u;
+        memcpy(buf, tmp, len);
+        buf[len] = '\0';
+    }
 #else
     (void)v;
     snprintf(buf, bufsz, "0");
@@ -5333,6 +5733,10 @@ static P2C_Object* getattr_raw(P2C_Object *obj, const char *name) {
     if (!obj || !name || !obj->cls) return NULL;
     switch (obj->cls->type_tag) {
         case OBJ_INSTANCE: {
+            /* Python同様、@property（data descriptor）はインスタンス属性より先に
+             * 解決する。ゲッターはselfを束縛して呼び出し、値を返す。 */
+            P2C_MethodDef *prop = p2c_find_property_in_chain(obj->u.v_instance.klass, name);
+            if (prop) return p2c_invoke_found_method(prop, obj, obj->u.v_instance.klass, NULL, 0, false);
             P2C_Object *val = attr_map_get(obj->u.v_instance.attrs, name);
             if (val) return val;
             /* クラス属性は基底クラスも含めてMRO順に探す（Python同様、サブクラスの
@@ -5344,8 +5748,16 @@ static P2C_Object* getattr_raw(P2C_Object *obj, const char *name) {
             /* メソッドを値として取り出す場合（m = obj.method、sorted(key=obj.key)
              * など）は束縛メソッドを返す。以前はここでNULLを返しており、
              * obj.method() の呼び出し形以外はAttributeErrorになっていた。 */
-            if (p2c_find_method_in_chain(obj->u.v_instance.klass, name)) {
-                return p2c_bound_method_new(obj, name);
+            {
+                P2C_MethodDef *m = p2c_find_method_in_chain(obj->u.v_instance.klass, name);
+                if (m) {
+                    /* static/classメソッドはクラスへ、インスタンスメソッドはselfへ
+                     * 束縛する（呼び出し時に対応するレシーバが使われる）。 */
+                    if (m->kind == P2C_METHOD_STATIC || m->kind == P2C_METHOD_CLASS) {
+                        return p2c_bound_method_new(obj->u.v_instance.klass, name);
+                    }
+                    return p2c_bound_method_new(obj, name);
+                }
             }
             return NULL;
         }
@@ -5390,7 +5802,15 @@ P2C_Object* p2c_getattr_default(P2C_Object *obj, const char *name, P2C_Object *d
 void p2c_setattr(P2C_Object *obj, const char *name, P2C_Object *val) {
     if (!obj || !name || !obj->cls) return;
     switch (obj->cls->type_tag) {
-        case OBJ_INSTANCE: attr_map_set(obj->u.v_instance.attrs, name, val); break;
+        case OBJ_INSTANCE:
+            /* @property への代入（setter）は未対応。Python同様AttributeErrorにして、
+             * 属性を黙って上書き（propertyの隠蔽）しない。 */
+            if (obj->u.v_instance.klass && p2c_find_property_in_chain(obj->u.v_instance.klass, name)) {
+                p2c_raise(p2c_make_exception("AttributeError", "property has no setter"));
+                break;
+            }
+            attr_map_set(obj->u.v_instance.attrs, name, val);
+            break;
         case OBJ_CLASS: attr_map_set(obj->u.v_class.attrs, name, val); break;
         case OBJ_MODULE: attr_map_set(obj->u.v_module.attrs, name, val); break;
         default: p2c_raise(p2c_make_exception("AttributeError", name)); break;

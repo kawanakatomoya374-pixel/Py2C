@@ -25,7 +25,7 @@
  * On other architectures build with your own assembly instead (or keep the
  * linear-heap/hosted configuration, which uses the platform setjmp).
  */
-#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__) || defined(__TINYC__))
 
 __asm__(
     ".text\n"

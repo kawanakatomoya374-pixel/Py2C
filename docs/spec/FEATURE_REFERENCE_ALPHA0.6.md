@@ -23,6 +23,7 @@
 | `--comments` | 生成Cへ対応Python行のコメントを埋め込む |
 | `--c11` | GNU拡張を使う生成を拒否し、ISO C11対象だけを明示的に受理する |
 | `--embed-entry NAME` | `int main()` の代わりにカーネルから呼べる `P2C_Object *NAME(void)` を生成する（自作OS組み込み用。名前はC識別子のみ受理） |
+| `--fallback` | 未対応構文を、実行時に `NotImplementedError` を送出するスタブへ置き換えて変換を続行する（到達しなければそのまま動く）。既定は位置付きの明確な診断で停止 |
 
 通常のHosted生成Cは、`-I./include`、`src/runtime/python_code_to_c_runtime.c`、`src/common/python_code_to_c_common.c`、`src/platform/python_code_to_c_platform.c`、Hostedプラットフォーム実装、必要ならGUI・pygameモジュールとリンクする。`make run INPUT=path/to/file.py`はこの変換・コンパイル・実行を一括化し、`make check-tools`と`make help`はツールチェーン確認と起動ターゲット一覧を提供する。詳細な手順は [`../build/BUILD_AND_LAUNCH_ALPHA0.6.md`](../build/BUILD_AND_LAUNCH_ALPHA0.6.md) を参照する。
 
@@ -171,7 +172,7 @@ GUIは固定長の`P2C_GuiCommand`配列とテキストアリーナへ描画命�
 
 ## 8. 品質ゲート
 
-`make test`はHosted CLIのスモーク、GC/GUI C回帰、固定幅整数境界テスト、登録済みプラットフォーム出力アダプタ、ジェネレータ・協調asyncランタイム回帰、CPython差分スモーク、静的ヒープ・platform write・GC・コルーチンを通すベアメタル実行ハーネス、変換済みベアメタルPython例のfreestanding C11コンパイル、starred unpack、set回帰、set comprehensionのstrict C11期待診断、decoratorの期待診断、Python 3.13型構文の変換・厳格C11実行、Alpha0.6機能を含むHosted・厳格C11・freestanding単一ヘッダー検証、**528件のCPython差分コンフォーマンス**、固定seed・各48操作のdict/set差分ファジング、期待診断、ホストGUI、freestandingアーカイブ、自作OS統合ゲート（`make test-embed-runtime`、`make test-freestanding-setjmp`、`make test-embed-compile`、`make test-embed-generated`、`make test-hobby-os-template`、`make test-crlf`）、ならびに`make CC=clang test-sanitizers`によるASan/UBSanのparser専用回帰と460件差分を実行する。GCCとClangの両方で`make full-build`と`make test`を通すことを品質基準とし、common、platform中核、Hostedアダプタ、runtime、parser、AST、AST dump、lexer、codegen、semanticの10モジュールにはClang静的解析を追加で実行する。GCCがなくても、`make CC=clang test-single-header-c11`により単一ヘッダーだけを`-std=c11 -pedantic-errors`で自己完結ビルド・実行でき、`make CC=clang test-single-header-freestanding`により、Hosted allocator・出力・時刻シンボルを要求しない実装部をコンパイルできる。数値変換・書式化・数学関数はOS側が提供する契約である。コンフォーマンスケースの目的とIDは `docs/CONFORMANCE_TEST_MATRIX_ALPHA0.6.md` に、監査で見つけた品質課題と改善根拠は `docs/STRICT_REVIEW_ALPHA0.6.md` に記録する。
+`make test`はHosted CLIのスモーク、GC/GUI C回帰、固定幅整数境界テスト、登録済みプラットフォーム出力アダプタ、ジェネレータ・協調asyncランタイム回帰、CPython差分スモーク、静的ヒープ・platform write・GC・コルーチンを通すベアメタル実行ハーネス、変換済みベアメタルPython例のfreestanding C11コンパイル、starred unpack、set回帰、set comprehensionのstrict C11期待診断、decoratorの期待診断、Python 3.13型構文の変換・厳格C11実行、Alpha0.6機能を含むHosted・厳格C11・freestanding単一ヘッダー検証、**549件のCPython差分コンフォーマンス**、固定seed・各48操作のdict/set差分ファジング、期待診断、ホストGUI、freestandingアーカイブ、自作OS統合ゲート（`make test-embed-runtime`、`make test-freestanding-setjmp`、`make test-embed-compile`、`make test-embed-generated`、`make test-hobby-os-template`、`make test-crlf`）、ならびに`make CC=clang test-sanitizers`によるASan/UBSanのparser専用回帰と460件差分を実行する。GCCとClangの両方で`make full-build`と`make test`を通すことを品質基準とし、common、platform中核、Hostedアダプタ、runtime、parser、AST、AST dump、lexer、codegen、semanticの10モジュールにはClang静的解析を追加で実行する。GCCがなくても、`make CC=clang test-single-header-c11`により単一ヘッダーだけを`-std=c11 -pedantic-errors`で自己完結ビルド・実行でき、`make CC=clang test-single-header-freestanding`により、Hosted allocator・出力・時刻シンボルを要求しない実装部をコンパイルできる。数値変換・書式化・数学関数はOS側が提供する契約である。コンフォーマンスケースの目的とIDは `docs/CONFORMANCE_TEST_MATRIX_ALPHA0.6.md` に、監査で見つけた品質課題と改善根拠は `docs/STRICT_REVIEW_ALPHA0.6.md` に記録する。
 
 決定的コンテナファジングは品質監査で追加8 seed・各64操作、計512操作をGCC/Clang双方で実行した。seed、操作数、失敗最小化、回帰昇格の運用は [`../testing/CONTAINER_FUZZING_ALPHA0.6.md`](../testing/CONTAINER_FUZZING_ALPHA0.6.md) に定義する。
 

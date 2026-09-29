@@ -14,13 +14,16 @@
 #endif
 
 /* デフォルトオプション */
+/* 指定初期化子（C99）で書く。フィールドを追加しても順序に依存せず、
+     * -Wmissing-field-initializers も出ない（未指定は0/NULLで初期化される）。 */
 const P2C_TranspileOptions P2C_DEFAULT_TRANSPILER_OPTIONS = {
-    true,
-    true,
-    false,
-    false,
-    4,
-    NULL
+    .baremetal = true,
+    .include_runtime = true,
+    .debug_comments = false,
+    .strict_c11 = false,
+    .fallback_unsupported = false,
+    .indent_spaces = 4,
+    .embed_entry = NULL
 };
 
 /* スレッドローカルエラーバッファ（エラー行のソース表示・キャレット表示を
@@ -131,7 +134,10 @@ static size_t p2c_append_literal(char *dst, size_t cap, size_t used, const char 
 
 const char* p2c_supported_range_string(void) {
 #ifndef PYTHON_CODE_TO_C_NO_STDLIB
-    static char buf[6000];
+    /* 機能一覧は分割リテラルで追記するため、合計（約6KB）を収める容量を確保する。
+     * 溢れた場合は p2c_append_literal が静かに追記を止めるので、配列はここで
+     * 十分な大きさを確保しておく。 */
+    static char buf[8192];
     static bool built = false;
     if (!built) {
         snprintf(buf, sizeof(buf),
@@ -180,7 +186,9 @@ const char* p2c_supported_range_string(void) {
             "           find/index/rfind/rindex (start, stop対応), count(sub, start, stop), startswith, endswith, removeprefix, removesuffix, format, title, center, ljust, rjust, zfill,\n"
             "           isalpha/isdigit/isalnum/isspace/islower/isupper/isidentifier/isascii/isprintable\n"
             "    f-string / str.format() / format() の書式指定: {:05d} {:.2f} {:>10} {:x} {:b} {:,} {:.0%%} など主要な書式に対応（括弧内の複数f-string連結を含む）\n"
-            "  組み込みモジュール: math (pi, e, sqrt, sin, cos, pow)\n"
+            "  組み込みモジュール: math (pi/e/tau/inf/nan, floor, ceil, trunc, fabs, fmod, hypot, copysign, ldexp,\n"
+            "            degrees, radians, sin, cos, tan, asin, acos, atan, atan2, exp, expm1, log, log2, log10, log1p,\n"
+            "            sqrt, cbrt, pow, isnan, isinf, isfinite, fsum, prod, factorial, gcd, isqrt, comb, perm, erf, erfc, gamma, lgamma)\n"
             "    pygame (ヘッドレス版: 実際の描画/音声/入力なし。init/display/time/\n"
             "            event/draw/key/sprite/Surface/Rect等、ゲームロジック検証用)\n";
         /* 追記部分はそれぞれ4095バイト以下のリテラルに分割し、残り容量を
@@ -195,16 +203,23 @@ const char* p2c_supported_range_string(void) {
             "    多重継承 (class D(B, C)): Pythonと同じC3線形化でMROを求め、ダイヤモンド継承でも基底メソッドの選択がCPythonと一致する。\n"
             "      基底クラスのクラス属性はサブクラスのインスタンスからも見える（MRO順に探索）。\n"
             "    束縛メソッド: m = obj.method でメソッドを取り出し、コールバック（sorted(key=...)、map()等）へ渡せる。\n"
+            "    メソッドデコレータ: @staticmethod（selfを渡さない）、@classmethod（先頭にクラスオブジェクト）、\n"
+            "      @property（属性読み出しでゲッター実行・インスタンス属性より優先・setter無しの代入はAttributeError）。\n"
+            "      プロパティはMRO順に継承・オーバーライドされ、hasattr()も真になる。\n"
             "  文字列エスケープ:\n"
             "    \\n \\t \\r \\v \\f \\b \\a \\\\ \\\" \\', \\ooo, \\xHH, \\uXXXX, \\UXXXXXXXX, 行継続\n"
             "    （未知のエスケープはバックスラッシュごと保持。\\N{...}はUnicode名前表が無いため診断）\n"
             "\n"
             "[未対応（診断エラーになります）]\n"
-            "  関数本体内のclass定義、クラスメソッドへのデコレータ、デコレータ関数の *args / **kwargs\n"
+            "  関数本体内のclass定義、デコレータ関数の *args / **kwargs、メソッドへのユーザー定義デコレータ\n"
             "  ネストクロージャ捕捉を行うジェネレータ式、async forの状態機械（一部のasync/awaitは対応）\n"
             "  複数のstarred代入対象、複素数型、bytes/bytearray\n"
             "\n"
-            "詳細と既知の制限は README.md を参照してください。\n";
+            "  --fallback: 未対応構文を「実行時にNotImplementedErrorを送出するスタブ」へ\n"
+            "            置き換えて変換を続行する（到達しなければそのまま動く）。\n"
+            "  GC: 適応しきい値（収集しても解放が少なければしきい値を伸ばす。上限4MiB）。\n"
+            "      p2c_gc_set_adaptive()/p2c_gc_stats() で制御と統計取得ができる。\n"
+            "  詳細と既知の制限は README.md を参照してください。\n";
         {
             size_t used = strlen(buf);
             used = p2c_append_literal(buf, sizeof(buf), used, features_mid, sizeof(features_mid) - 1u);
@@ -331,6 +346,9 @@ static P2C_Result p2c_python_to_c_impl(const char *python_code, P2C_TranspileOpt
         return P2C_ERR_NOMEM;
     }
     
+    /* --fallback 指定時は、未対応構文をスタブへ置換して変換を続行する。 */
+    /* この関数はオプションを受け取らない（既定の strict 動作）。 */
+    p2c_parser_set_fallback(opts.fallback_unsupported);
     P2C_AstModule *module = p2c_parser_parse_module(parser, &result);
     if (result != P2C_OK || !module) {
         const char *msg = p2c_parser_error_msg(parser);
@@ -385,6 +403,7 @@ static P2C_Result p2c_python_to_c_impl(const char *python_code, P2C_TranspileOpt
     cg_opts.baremetal = opts.baremetal;
     cg_opts.debug_info = opts.debug_comments;
     cg_opts.strict_c11 = opts.strict_c11;
+    cg_opts.fallback_unsupported = opts.fallback_unsupported;
     cg_opts.indent_width = opts.indent_spaces;
     cg_opts.embed_entry = opts.embed_entry;
     
@@ -482,6 +501,9 @@ P2C_Result python_to_ast_dump(const char *python_code, char **out_dump) {
         return P2C_ERR_NOMEM;
     }
 
+    /* --fallback 指定時は、未対応構文をスタブへ置換して変換を続行する。 */
+    /* この関数はオプションを受け取らない（既定の strict 動作）。 */
+    p2c_parser_set_fallback(false);
     P2C_AstModule *module = p2c_parser_parse_module(parser, &result);
     if (result != P2C_OK || !module) {
         const char *msg = p2c_parser_error_msg(parser);

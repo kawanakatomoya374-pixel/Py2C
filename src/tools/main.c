@@ -1,5 +1,9 @@
+#ifndef _DEFAULT_SOURCE
 #define _DEFAULT_SOURCE
+#endif
+#ifndef _POSIX_C_SOURCE
 #define _POSIX_C_SOURCE 200809L
+#endif
 #include "core/python_code_to_c.h"
 #include "tools/python_code_to_c_runtime_locate.h"
 #include <stdio.h>
@@ -52,6 +56,8 @@ static void print_usage(const char *argv0) {
             "  --c11                             ... GNU拡張が必要な構文を拒否し、ISO C11対象を明示する\n"
             "  --embed-entry NAME                ... int main() の代わりにカーネルから呼べる\n"
             "                                         P2C_Object *NAME(void) を生成する（自作OS組込み用）\n"
+            "  --fallback                        ... 未対応構文を「実行時にNotImplementedErrorを\n"
+            "                                         送出するスタブ」へ置き換え、変換を続行する\n"
             "\n"
             "Examples:\n"
             "  %s sample.py -o sample.c\n"
@@ -311,6 +317,7 @@ int main(int argc, char *argv[]) {
     const char *embed_entry = NULL;
     bool want_comments = false;
     bool want_strict_c11 = false;
+    bool want_fallback = false;   /* 未対応構文をランタイムスタブへ置換 */
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-o") == 0) {
             if (i + 1 >= argc) {
@@ -330,6 +337,10 @@ int main(int argc, char *argv[]) {
             want_comments = true;
         } else if (strcmp(argv[i], "--c11") == 0) {
             want_strict_c11 = true;
+        } else if (strcmp(argv[i], "--fallback") == 0) {
+            /* 未対応構文でも変換・ビルドを失敗させない（実行時に
+             * NotImplementedError を送出するスタブを生成する）。 */
+            want_fallback = true;
         } else if (argv[i][0] == '-') {
             fprintf(stderr, "Error: unknown option '%s'\n", argv[i]);
             return 1;
@@ -353,6 +364,7 @@ int main(int argc, char *argv[]) {
     P2C_TranspileOptions tr_opts = P2C_DEFAULT_TRANSPILER_OPTIONS;
     tr_opts.debug_comments = want_comments;
     tr_opts.strict_c11 = want_strict_c11;
+    tr_opts.fallback_unsupported = want_fallback;
     tr_opts.embed_entry = embed_entry;
     P2C_Result r = python_to_c(code, &tr_opts, &c_code);
     free(code);

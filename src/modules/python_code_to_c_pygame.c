@@ -84,11 +84,11 @@ static P2C_Object* rect_contains(P2C_Object *self, P2C_Object **args, size_t nar
 }
 
 static P2C_MethodDef g_rect_methods[] = {
-    {"__init__", rect_init_method, NULL},
-    {"move", rect_move, NULL},
-    {"colliderect", rect_colliderect, NULL},
-    {"contains", rect_contains, NULL},
-    {NULL, NULL, NULL}
+    {"__init__", rect_init_method, NULL, P2C_METHOD_INSTANCE},
+    {"move", rect_move, NULL, P2C_METHOD_INSTANCE},
+    {"colliderect", rect_colliderect, NULL, P2C_METHOD_INSTANCE},
+    {"contains", rect_contains, NULL, P2C_METHOD_INSTANCE},
+    {NULL, NULL, NULL, P2C_METHOD_INSTANCE}
 };
 
 static P2C_Object* rect_classobj(void) {
@@ -146,13 +146,13 @@ static P2C_Object* surface_get_height(P2C_Object *self, P2C_Object **args, size_
 }
 
 static P2C_MethodDef g_surface_methods[] = {
-    {"__init__", surface_init_method, NULL},
-    {"fill", surface_fill, NULL},
-    {"blit", surface_blit, NULL},
-    {"get_rect", surface_get_rect, NULL},
-    {"get_width", surface_get_width, NULL},
-    {"get_height", surface_get_height, NULL},
-    {NULL, NULL, NULL}
+    {"__init__", surface_init_method, NULL, P2C_METHOD_INSTANCE},
+    {"fill", surface_fill, NULL, P2C_METHOD_INSTANCE},
+    {"blit", surface_blit, NULL, P2C_METHOD_INSTANCE},
+    {"get_rect", surface_get_rect, NULL, P2C_METHOD_INSTANCE},
+    {"get_width", surface_get_width, NULL, P2C_METHOD_INSTANCE},
+    {"get_height", surface_get_height, NULL, P2C_METHOD_INSTANCE},
+    {NULL, NULL, NULL, P2C_METHOD_INSTANCE}
 };
 
 static P2C_Object* surface_classobj(void) {
@@ -183,11 +183,11 @@ static P2C_Object* clock_init_method(P2C_Object *self, P2C_Object **args, size_t
     return &P2C_None;
 }
 static P2C_MethodDef g_clock_methods[] = {
-    {"__init__", clock_init_method, NULL},
-    {"tick", clock_tick, NULL},
-    {"tick_busy_loop", clock_tick, NULL},
-    {"get_fps", clock_get_fps, NULL},
-    {NULL, NULL, NULL}
+    {"__init__", clock_init_method, NULL, P2C_METHOD_INSTANCE},
+    {"tick", clock_tick, NULL, P2C_METHOD_INSTANCE},
+    {"tick_busy_loop", clock_tick, NULL, P2C_METHOD_INSTANCE},
+    {"get_fps", clock_get_fps, NULL, P2C_METHOD_INSTANCE},
+    {NULL, NULL, NULL, P2C_METHOD_INSTANCE}
 };
 static P2C_Object* clock_classobj(void) {
     if (!g_clock_class) g_clock_class = p2c_class_new("Clock", clock_ctor, g_clock_methods, NULL);
@@ -215,7 +215,7 @@ static P2C_Object* sprite_init_method(P2C_Object *self, P2C_Object **args, size_
     sprite_init_self(self, args, nargs);
     return &P2C_None;
 }
-static P2C_MethodDef g_sprite_methods[] = { {"__init__", sprite_init_method, NULL}, {NULL, NULL, NULL} };
+static P2C_MethodDef g_sprite_methods[] = { {"__init__", sprite_init_method, NULL, P2C_METHOD_INSTANCE}, {NULL, NULL, NULL, P2C_METHOD_INSTANCE} };
 static P2C_Object* sprite_classobj(void) {
     if (!g_sprite_class) g_sprite_class = p2c_class_new("Sprite", sprite_ctor, g_sprite_methods, NULL);
     return g_sprite_class;
@@ -261,12 +261,12 @@ static P2C_Object* group_draw(P2C_Object *self, P2C_Object **args, size_t nargs)
     return &P2C_None;
 }
 static P2C_MethodDef g_group_methods[] = {
-    {"__init__", group_init_method, NULL},
-    {"add", group_add, NULL},
-    {"sprites", group_sprites, NULL},
-    {"update", group_update, NULL},
-    {"draw", group_draw, NULL},
-    {NULL, NULL, NULL}
+    {"__init__", group_init_method, NULL, P2C_METHOD_INSTANCE},
+    {"add", group_add, NULL, P2C_METHOD_INSTANCE},
+    {"sprites", group_sprites, NULL, P2C_METHOD_INSTANCE},
+    {"update", group_update, NULL, P2C_METHOD_INSTANCE},
+    {"draw", group_draw, NULL, P2C_METHOD_INSTANCE},
+    {NULL, NULL, NULL, P2C_METHOD_INSTANCE}
 };
 static P2C_Object* group_classobj(void) {
     if (!g_group_class) g_group_class = p2c_class_new("Group", group_ctor, g_group_methods, NULL);

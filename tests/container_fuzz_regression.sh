@@ -21,7 +21,7 @@ run_one() {
     python3 "$ROOT/tests/generate_container_fuzz.py" --seed "$seed" --cases "$cases" --output "$source" >/dev/null
     python3 "$source" > "$pyout"
     "$ROOT/build/python-code-to-c" "$source" -o "$cfile"
-    "$CC" -I"$ROOT/include" -std=gnu11 -O2 -Wall -Wextra -Werror \
+    $CC -I"$ROOT/include" -std=gnu11 -O2 -Wall -Wextra -Werror \
         "$cfile" \
         "$ROOT/src/runtime/python_code_to_c_runtime.c" \
         "$ROOT/src/common/python_code_to_c_common.c" \

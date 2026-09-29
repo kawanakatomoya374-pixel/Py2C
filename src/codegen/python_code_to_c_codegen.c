@@ -13,7 +13,8 @@ const P2C_CodeGenOptions P2C_DEFAULT_OPTIONS = {
     false,
     4,
     "p2c_",
-    NULL
+    NULL,
+    false
 };
 
 static void gen_expr(P2C_CodeGen *cg, P2C_AstExpr *expr);
@@ -527,8 +528,13 @@ static void scan_stmt(P2C_CodeGen *cg, P2C_AstStmt *stmt) {
             break;
         }
         case AST_FUNCTIONDEF:
-            map_set_func_args(cg->func_args, n->u.functiondef.name, &n->u.functiondef);
-            if (cg->function_depth == 0) {
+            /* クラス本体内のメソッドは、モジュール直下の関数ではないため
+             * モジュール関数名やデコレータとして登録しない（同名のグローバルを
+             * 上書きしたり、デコレータ適用扱いにしてしまうのを防ぐ）。 */
+            if (cg->function_depth == 0 && !cg->scan_class_cname) {
+                map_set_func_args(cg->func_args, n->u.functiondef.name, &n->u.functiondef);
+            }
+            if (cg->function_depth == 0 && !cg->scan_class_cname) {
                 map_set_name(cg->module_function_names, n->u.functiondef.name);
                 if (n->u.functiondef.decorator_list && p2c_vec_len(n->u.functiondef.decorator_list) > 0) {
                     map_set_name(cg->decorated_names, n->u.functiondef.name);
@@ -766,11 +772,60 @@ static void gen_comprehension_body(P2C_CodeGen *cg, int comp_id, P2C_Vector *gen
     write_str(cg, " } }");
 }
 
+/* 未対応の式/文に遭遇したときの共通処理。
+ *   --fallback 指定時: 実行時に NotImplementedError を送出するスタブを出力し、
+ *     変換は続行する（未対応構文を含んでいてもビルドを失敗させない）。
+ *   既定: 変換エラーとして報告する。以前は式で &P2C_None、文でコメントを
+ *     出力して黙って続行していたため、未対応構文が「静かに違う動作」になる
+ *     原因になっていた（フォールバックとエラーのどちらでも、出力の整合を
+ *     保つために &P2C_None / 空文は必ず書く）。 */
+static void emit_unsupported_construct(P2C_CodeGen *cg, P2C_AstNode *n, const char *what, bool as_expr) {
+    uint32_t line = n ? n->line : 0u;
+    if (cg->opts.fallback_unsupported) {
+        if (as_expr) {
+            write_str(cg, "p2c_fallback_expr(\"line ");
+            emit_usize(cg, (size_t)line);
+            write_str(cg, "\", \"");
+            write_str(cg, what);
+            write_str(cg, "\")");
+        } else {
+            indent(cg);
+            write_str(cg, "p2c_fallback_stmt(\"line ");
+            emit_usize(cg, (size_t)line);
+            write_str(cg, "\", \"");
+            write_str(cg, what);
+            write_str(cg, "\");");
+            write_newline(cg);
+        }
+        return;
+    }
+    codegen_set_error(cg, P2C_ERR_NOT_IMPLEMENTED,
+                      "unsupported construct encountered during code generation "
+                      "(rerun with --fallback to replace it with a runtime stub)");
+    if (as_expr) {
+        write_str(cg, "&P2C_None");
+    } else {
+        indent(cg);
+        write_str(cg, "/* unsupported statement */");
+        write_newline(cg);
+    }
+}
+
 static void gen_expr(P2C_CodeGen *cg, P2C_AstExpr *expr) {
     if (!expr) { write_str(cg, "&P2C_None"); return; }
     P2C_AstNode *n = &expr->base;
     switch (n->type) {
         case AST_NAME:
+            /* --fallback（未対応構文のフォールバック）: parserが未対応リテラル等の
+             * 代わりに作った名前ノード。実行時 NotImplementedError になるスタブへ
+             * 変換する（strictモードではparserが先にエラーにするため到達しない）。 */
+            if (n->u.name.name &&
+                strncmp(n->u.name.name, P2C_UNSUPPORTED_NAME_PREFIX,
+                        strlen(P2C_UNSUPPORTED_NAME_PREFIX)) == 0) {
+                emit_unsupported_construct(cg, n,
+                    n->u.name.name + strlen(P2C_UNSUPPORTED_NAME_PREFIX), true);
+                break;
+            }
             /* genexpr（および状態機械関数）のステップ関数の中では、Pythonの
              * ローカル名をジェネレータのローカル辞書から読む。これにより
              * gen_exprが持つ組込み関数ディスパッチやタプル/辞書表示、
@@ -1773,7 +1828,8 @@ static void gen_expr(P2C_CodeGen *cg, P2C_AstExpr *expr) {
             break;
         }
         default:
-            write_str(cg, "&P2C_None");
+            /* 未対応の式。--fallback ではランタイムスタブ、既定では変換エラー。 */
+            emit_unsupported_construct(cg, n, "expression", true);
             break;
     }
 }
@@ -2404,6 +2460,43 @@ static bool suspension_stmt_list_has_await(P2C_Vector *stmts) {
         if (suspension_stmt_has_await((P2C_AstStmt*)p2c_vec_get(stmts, i))) return true;
     }
     return false;
+}
+
+/* メソッド種別（生成Cの P2C_METHOD_* と同じ値。codegenはランタイムヘッダを
+ * 取り込まないため、ここで同じ値を持つ列挙を定義する）。 */
+enum {
+    CG_METHOD_INSTANCE = 0,
+    CG_METHOD_STATIC = 1,
+    CG_METHOD_CLASS = 2,
+    CG_METHOD_PROPERTY = 3
+};
+
+/* クラス本体内のメソッド定義に付いたデコレータから、メソッド種別を求める。
+ *   @staticmethod -> CG_METHOD_STATIC  （selfを渡さない）
+ *   @classmethod   -> CG_METHOD_CLASS   （先頭引数にクラスオブジェクト）
+ *   @property      -> CG_METHOD_PROPERTY（属性読み出し時のゲッター）
+ * 上記以外のデコレータは、クラス本体では意味解析が明示診断する（ここでは
+ * 通常のインスタンスメソッドとして扱い、生成そのものは壊さない）。 */
+static int class_method_kind(P2C_AstFunctionDef *fd) {
+    if (!fd || !fd->decorator_list) return CG_METHOD_INSTANCE;
+    for (size_t i = 0; i < p2c_vec_len(fd->decorator_list); i++) {
+        P2C_AstExpr *dec = (P2C_AstExpr*)p2c_vec_get(fd->decorator_list, i);
+        if (!dec || dec->base.type != AST_NAME) continue;
+        if (strcmp(dec->base.u.name.name, "staticmethod") == 0) return CG_METHOD_STATIC;
+        if (strcmp(dec->base.u.name.name, "classmethod") == 0) return CG_METHOD_CLASS;
+        if (strcmp(dec->base.u.name.name, "property") == 0) return CG_METHOD_PROPERTY;
+    }
+    return CG_METHOD_INSTANCE;
+}
+
+/* メソッド種別を生成Cの P2C_METHOD_* 定数名へ変換する。 */
+static const char* class_method_kind_constant(int kind) {
+    switch (kind) {
+        case CG_METHOD_STATIC: return "P2C_METHOD_STATIC";
+        case CG_METHOD_CLASS: return "P2C_METHOD_CLASS";
+        case CG_METHOD_PROPERTY: return "P2C_METHOD_PROPERTY";
+        default: return "P2C_METHOD_INSTANCE";
+    }
 }
 
 static bool class_method_requires_suspension(P2C_AstFunctionDef *fd) {
@@ -3742,18 +3835,24 @@ static void gen_stmt(P2C_CodeGen *cg, P2C_AstStmt *stmt) {
                 P2C_AstStmt *member = (P2C_AstStmt*)p2c_vec_get(n->u.classdef.body, i);
                 if (member->base.type == AST_FUNCTIONDEF) {
                     P2C_AstFunctionDef *fd = &member->base.u.functiondef;
+                    int fwd_kind = class_method_kind(fd);
                     p2c_str_append_fmt(cg->forward, "static P2C_Object* %s__%s(", cname, fd->name);
+                    if (fwd_kind == CG_METHOD_STATIC) {
+                        /* staticmethodのC関数は、ランタイムが種別に従って先頭へNULLを
+                         * 渡すため、未使用の先頭パラメータを1つ受け取る。 */
+                        p2c_str_append(cg->forward, "P2C_Object *_p2c_static_self");
+                    }
                     for (size_t j = 0; j < p2c_vec_len(fd->args); j++) {
-                        if (j) p2c_str_append(cg->forward, ", ");
+                        if (j || fwd_kind == CG_METHOD_STATIC) p2c_str_append(cg->forward, ", ");
                         p2c_str_append(cg->forward, "P2C_Object *");
                         p2c_str_append(cg->forward, ((P2C_AstArg*)p2c_vec_get(fd->args, j))->name);
                     }
                     if (fd->vararg) {
-                        if (p2c_vec_len(fd->args)) p2c_str_append(cg->forward, ", ");
+                        if (p2c_vec_len(fd->args) || fwd_kind == CG_METHOD_STATIC) p2c_str_append(cg->forward, ", ");
                         p2c_str_append(cg->forward, "P2C_Object *"); p2c_str_append(cg->forward, fd->vararg);
                     }
                     if (fd->kwarg) {
-                        if (p2c_vec_len(fd->args) || fd->vararg) p2c_str_append(cg->forward, ", ");
+                        if (p2c_vec_len(fd->args) || fd->vararg || fwd_kind == CG_METHOD_STATIC) p2c_str_append(cg->forward, ", ");
                         p2c_str_append(cg->forward, "P2C_Object *"); p2c_str_append(cg->forward, fd->kwarg);
                     }
                     p2c_str_append(cg->forward, ");\n");
@@ -3809,6 +3908,9 @@ static void gen_stmt(P2C_CodeGen *cg, P2C_AstStmt *stmt) {
                 P2C_AstStmt *member = (P2C_AstStmt*)p2c_vec_get(n->u.classdef.body, i);
                 if (member->base.type != AST_FUNCTIONDEF) continue;
                 P2C_AstFunctionDef *fd = &member->base.u.functiondef;
+                int method_kind = class_method_kind(fd);
+                /* staticmethodはselfを受け取らないため、位置引数の対応が1つずれる。 */
+                size_t self_count = (method_kind == CG_METHOD_STATIC) ? 0 : 1;
                 bool method_is_suspension = class_method_requires_suspension(fd);
                 if (method_is_suspension) {
                     P2C_String *method_entry = p2c_str_new(cg->alloc);
@@ -3839,17 +3941,19 @@ static void gen_stmt(P2C_CodeGen *cg, P2C_AstStmt *stmt) {
                     p2c_str_free(method_entry);
                 } else {
                     indent(cg); write_str(cg, "static P2C_Object* "); write_str(cg, cname); write_str(cg, "__"); write_str(cg, fd->name); write_str(cg, "(");
+                if (method_kind == CG_METHOD_STATIC) write_str(cg, "P2C_Object *_p2c_static_self");
                 for (size_t j = 0; j < p2c_vec_len(fd->args); j++) {
-                    if (j) write_str(cg, ", ");
+                    if (j || method_kind == CG_METHOD_STATIC) write_str(cg, ", ");
                     write_str(cg, "P2C_Object *"); write_ident(cg, ((P2C_AstArg*)p2c_vec_get(fd->args, j))->name);
                 }
-                if (fd->vararg) { if (p2c_vec_len(fd->args)) write_str(cg, ", "); write_str(cg, "P2C_Object *"); write_ident(cg, fd->vararg); }
-                if (fd->kwarg) { if (p2c_vec_len(fd->args) || fd->vararg) write_str(cg, ", "); write_str(cg, "P2C_Object *"); write_ident(cg, fd->kwarg); }
+                if (fd->vararg) { if (p2c_vec_len(fd->args) || method_kind == CG_METHOD_STATIC) write_str(cg, ", "); write_str(cg, "P2C_Object *"); write_ident(cg, fd->vararg); }
+                if (fd->kwarg) { if (p2c_vec_len(fd->args) || fd->vararg || method_kind == CG_METHOD_STATIC) write_str(cg, ", "); write_str(cg, "P2C_Object *"); write_ident(cg, fd->kwarg); }
                 write_str(cg, ") {"); write_newline(cg); push_indent(cg);
                 /* selfを含め、本体で参照されないパラメータがあると
                  * -Wunused-parameter が -Werror 下でコンパイルエラーになる
                  * （例: def __iter__(self): return iter([1,2,3]) のようにselfを
                  * 使わないメソッド）。常に(void)キャストしておく。 */
+                if (method_kind == CG_METHOD_STATIC) write_line(cg, "(void)_p2c_static_self;");
                 for (size_t j = 0; j < p2c_vec_len(fd->args); j++) {
                     indent(cg); write_str(cg, "(void)"); write_ident(cg, ((P2C_AstArg*)p2c_vec_get(fd->args, j))->name); write_str(cg, ";"); write_newline(cg);
                 }
@@ -3880,10 +3984,12 @@ static void gen_stmt(P2C_CodeGen *cg, P2C_AstStmt *stmt) {
                  * 一切参照されず、-Wunused-parameter(-Werror下ではエラー)になる。
                  * 常に(void)キャストしておけば、実際に使われる場合でも無害。 */
                 write_line(cg, "(void)args; (void)nargs;");
+                /* staticmethodのアダプタは self を受け取るが使用しない。 */
+                if (self_count == 0) write_line(cg, "(void)self;");
                 size_t method_positional_total = (fd->kwonly_start > 0 ? (size_t)fd->kwonly_start : p2c_vec_len(fd->args));
-                method_positional_total = method_positional_total > 0 ? method_positional_total - 1 : 0;
+                method_positional_total = method_positional_total > self_count ? method_positional_total - self_count : 0;
                 size_t method_required = 0;
-                for (size_t j = 1; j < p2c_vec_len(fd->args); j++) {
+                for (size_t j = self_count; j < p2c_vec_len(fd->args); j++) {
                     P2C_AstArg *ma = (P2C_AstArg*)p2c_vec_get(fd->args, j);
                     if ((int)j < fd->kwonly_start && !ma->default_val) method_required++;
                 }
@@ -3892,9 +3998,9 @@ static void gen_stmt(P2C_CodeGen *cg, P2C_AstStmt *stmt) {
                 if (!fd->vararg) { write_str(cg, "nargs > "); emit_usize(cg, method_positional_total); }
                 else if (method_required == 0) write_str(cg, "false");
                 write_str(cg, ") p2c_raise(p2c_make_exception(\"TypeError\", \"wrong method arity\"));"); write_newline(cg);
-                for (size_t j = 1; j < p2c_vec_len(fd->args); j++) {
+                for (size_t j = self_count; j < p2c_vec_len(fd->args); j++) {
                     P2C_AstArg *ma = (P2C_AstArg*)p2c_vec_get(fd->args, j);
-                    indent(cg); write_str(cg, "P2C_Object *_p2c_method_arg_"); emit_usize(cg, j - 1); if ((int)j < fd->kwonly_start) { write_str(cg, " = (nargs > "); emit_usize(cg, j - 1); write_str(cg, ") ? args["); emit_usize(cg, j - 1); write_str(cg, "] : "); }
+                    indent(cg); write_str(cg, "P2C_Object *_p2c_method_arg_"); emit_usize(cg, j - self_count); if ((int)j < fd->kwonly_start) { write_str(cg, " = (nargs > "); emit_usize(cg, j - self_count); write_str(cg, ") ? args["); emit_usize(cg, j - self_count); write_str(cg, "] : "); }
                     else write_str(cg, " = ");
                     if (ma->default_val) gen_expr(cg, ma->default_val);
                     else write_str(cg, "&P2C_None");
@@ -3906,10 +4012,14 @@ static void gen_stmt(P2C_CodeGen *cg, P2C_AstStmt *stmt) {
                 }
                 if (fd->kwarg) { indent(cg); write_str(cg, "P2C_Object *"); write_ident(cg, fd->kwarg); write_str(cg, " = p2c_dict_new();"); write_newline(cg); }
                 indent(cg); write_str(cg, "return "); write_str(cg, cname); write_str(cg, "__"); write_str(cg, fd->name); write_str(cg, "(");
-                for (size_t j = 0; j < p2c_vec_len(fd->args); j++) {
-                    if (j) write_str(cg, ", ");
-                    if (j == 0) write_str(cg, "self");
-                    else { write_str(cg, "_p2c_method_arg_"); emit_usize(cg, j - 1); }
+                /* 生成Cの関数は常に先頭パラメータ（self スロット）を持つ。
+                 * staticmethodはその位置にNULLが渡されるだけで、以降の位置引数は
+                 * 先頭のPython引数から順に対応する。 */
+                /* 生成Cの関数は常に先頭の self スロットを受け取る（staticmethodでは
+                 * 未使用スロット。ランタイムがNULLを渡す）。以降が位置引数。 */
+                write_str(cg, "self");
+                for (size_t k = 0; k + self_count < p2c_vec_len(fd->args); k++) {
+                    write_str(cg, ", _p2c_method_arg_"); emit_usize(cg, k);
                 }
                 if (fd->vararg) { if (p2c_vec_len(fd->args)) write_str(cg, ", "); write_ident(cg, fd->vararg); }
                 if (fd->kwarg) { if (p2c_vec_len(fd->args) || fd->vararg) write_str(cg, ", "); write_ident(cg, fd->kwarg); }
@@ -3928,19 +4038,19 @@ static void gen_stmt(P2C_CodeGen *cg, P2C_AstStmt *stmt) {
                 if (!fd->vararg) { write_str(cg, "nargs > "); emit_usize(cg, method_positional_total); }
                 else if (method_required == 0) write_str(cg, "false");
                 write_str(cg, ") p2c_raise(p2c_make_exception(\"TypeError\", \"wrong method arity\"));"); write_newline(cg);
-                for (size_t j = 1; j < p2c_vec_len(fd->args); j++) {
+                for (size_t j = self_count; j < p2c_vec_len(fd->args); j++) {
                     P2C_AstArg *ma = (P2C_AstArg*)p2c_vec_get(fd->args, j);
-                    indent(cg); write_str(cg, "P2C_Object *_p2c_kw_arg_"); emit_usize(cg, j - 1);
-                    if ((int)j < fd->kwonly_start) { write_str(cg, " = (nargs > "); emit_usize(cg, j - 1); write_str(cg, ") ? args["); emit_usize(cg, j - 1); write_str(cg, "] : "); }
+                    indent(cg); write_str(cg, "P2C_Object *_p2c_kw_arg_"); emit_usize(cg, j - self_count);
+                    if ((int)j < fd->kwonly_start) { write_str(cg, " = (nargs > "); emit_usize(cg, j - self_count); write_str(cg, ") ? args["); emit_usize(cg, j - self_count); write_str(cg, "] : "); }
                     else write_str(cg, " = ");
                     if (ma->default_val) gen_expr(cg, ma->default_val); else write_str(cg, "&P2C_None");
                     write_str(cg, ";"); write_newline(cg);
-                    indent(cg); write_str(cg, "bool _p2c_kw_have_"); emit_usize(cg, j - 1);
-                    if ((int)j < fd->kwonly_start) { write_str(cg, " = nargs > "); emit_usize(cg, j - 1); }
+                    indent(cg); write_str(cg, "bool _p2c_kw_have_"); emit_usize(cg, j - self_count);
+                    if ((int)j < fd->kwonly_start) { write_str(cg, " = nargs > "); emit_usize(cg, j - self_count); }
                     else write_str(cg, " = false");
                     write_str(cg, ";"); write_newline(cg);
-                    indent(cg); write_str(cg, "for (size_t _p2c_kw_i = 0; _p2c_kw_i < nkw; _p2c_kw_i++) if (strcmp(kw_names[_p2c_kw_i], \""); write_str(cg, ma->name); write_str(cg, "\") == 0) { if (_p2c_kw_have_"); emit_usize(cg, j - 1); write_str(cg, ") p2c_raise(p2c_make_exception(\"TypeError\", \"multiple values for method argument\")); _p2c_kw_arg_"); emit_usize(cg, j - 1); write_str(cg, " = kw_values[_p2c_kw_i]; _p2c_kw_have_"); emit_usize(cg, j - 1); write_str(cg, " = true; }"); write_newline(cg);
-                    if (!ma->default_val) { indent(cg); write_str(cg, "if (!_p2c_kw_have_"); emit_usize(cg, j - 1); write_str(cg, ") p2c_raise(p2c_make_exception(\"TypeError\", \"missing required method argument\"));"); write_newline(cg); }
+                    indent(cg); write_str(cg, "for (size_t _p2c_kw_i = 0; _p2c_kw_i < nkw; _p2c_kw_i++) if (strcmp(kw_names[_p2c_kw_i], \""); write_str(cg, ma->name); write_str(cg, "\") == 0) { if (_p2c_kw_have_"); emit_usize(cg, j - self_count); write_str(cg, ") p2c_raise(p2c_make_exception(\"TypeError\", \"multiple values for method argument\")); _p2c_kw_arg_"); emit_usize(cg, j - self_count); write_str(cg, " = kw_values[_p2c_kw_i]; _p2c_kw_have_"); emit_usize(cg, j - self_count); write_str(cg, " = true; }"); write_newline(cg);
+                    if (!ma->default_val) { indent(cg); write_str(cg, "if (!_p2c_kw_have_"); emit_usize(cg, j - self_count); write_str(cg, ") p2c_raise(p2c_make_exception(\"TypeError\", \"missing required method argument\"));"); write_newline(cg); }
                 }
                 if (fd->vararg) {
                     indent(cg); write_str(cg, "P2C_Object *"); write_ident(cg, fd->vararg); write_str(cg, " = p2c_tuple_new(nargs > "); emit_usize(cg, method_positional_total); write_str(cg, " ? nargs - "); emit_usize(cg, method_positional_total); write_str(cg, " : 0);"); write_newline(cg);
@@ -3950,7 +4060,7 @@ static void gen_stmt(P2C_CodeGen *cg, P2C_AstStmt *stmt) {
                     indent(cg); write_str(cg, "P2C_Object *"); write_ident(cg, fd->kwarg); write_str(cg, " = p2c_dict_new();"); write_newline(cg);
                 }
                 indent(cg); write_str(cg, "for (size_t _p2c_kw_i = 0; _p2c_kw_i < nkw; _p2c_kw_i++) { bool _p2c_known = false;"); write_newline(cg); push_indent(cg);
-                for (size_t j = 1; j < p2c_vec_len(fd->args); j++) {
+                for (size_t j = self_count; j < p2c_vec_len(fd->args); j++) {
                     P2C_AstArg *ma = (P2C_AstArg*)p2c_vec_get(fd->args, j);
                     indent(cg); write_str(cg, "if (strcmp(kw_names[_p2c_kw_i], \""); write_str(cg, ma->name); write_str(cg, "\") == 0) _p2c_known = true;"); write_newline(cg);
                 }
@@ -3961,7 +4071,10 @@ static void gen_stmt(P2C_CodeGen *cg, P2C_AstStmt *stmt) {
                 }
                 pop_indent(cg); indent(cg); write_str(cg, "}"); write_newline(cg);
                 indent(cg); write_str(cg, "return "); write_str(cg, cname); write_str(cg, "__"); write_str(cg, fd->name); write_str(cg, "(self");
-                for (size_t j = 1; j < p2c_vec_len(fd->args); j++) { write_str(cg, ", _p2c_kw_arg_"); emit_usize(cg, j - 1); }
+                /* 呼び出しの先頭 "(self" は既に出力済み（staticでは未使用スロット）。 */
+                for (size_t k = 0; k + self_count < p2c_vec_len(fd->args); k++) {
+                    write_str(cg, ", _p2c_kw_arg_"); emit_usize(cg, k);
+                }
                 if (fd->vararg) { write_str(cg, ", "); write_ident(cg, fd->vararg); }
                 if (fd->kwarg) { write_str(cg, ", "); write_ident(cg, fd->kwarg); }
                 write_str(cg, ");"); write_newline(cg);
@@ -3971,10 +4084,10 @@ static void gen_stmt(P2C_CodeGen *cg, P2C_AstStmt *stmt) {
             for (size_t i = 0; i < p2c_vec_len(n->u.classdef.body); i++) {
                 P2C_AstStmt *member = (P2C_AstStmt*)p2c_vec_get(n->u.classdef.body, i);
                 if (member->base.type == AST_FUNCTIONDEF) {
-                    indent(cg); write_str(cg, "{\""); write_str(cg, member->base.u.functiondef.name); write_str(cg, "\", "); write_str(cg, cname); write_str(cg, "__"); write_str(cg, member->base.u.functiondef.name); write_str(cg, "__adapter, "); write_str(cg, cname); write_str(cg, "__"); write_str(cg, member->base.u.functiondef.name); write_str(cg, "__kwadapter},"); write_newline(cg);
+                    indent(cg); write_str(cg, "{\""); write_str(cg, member->base.u.functiondef.name); write_str(cg, "\", "); write_str(cg, cname); write_str(cg, "__"); write_str(cg, member->base.u.functiondef.name); write_str(cg, "__adapter, "); write_str(cg, cname); write_str(cg, "__"); write_str(cg, member->base.u.functiondef.name); write_str(cg, "__kwadapter, "); write_str(cg, class_method_kind_constant(class_method_kind(&member->base.u.functiondef))); write_str(cg, "},"); write_newline(cg);
                 }
             }
-            write_line(cg, "{NULL, NULL, NULL}"); pop_indent(cg); write_line(cg, "};");
+            write_line(cg, "{NULL, NULL, NULL, P2C_METHOD_INSTANCE}"); pop_indent(cg); write_line(cg, "};");
             indent(cg); write_str(cg, "static P2C_Object* "); write_str(cg, cname); write_str(cg, "__classobj(void) {"); write_newline(cg); push_indent(cg);
             indent(cg); write_str(cg, "if (!"); write_str(cg, cname); write_str(cg, ") "); write_str(cg, cname); write_str(cg, " = p2c_class_new(\""); write_str(cg, n->u.classdef.name); write_str(cg, "\", "); write_str(cg, cname); write_str(cg, "__ctor, "); write_str(cg, cname); write_str(cg, "__methods, ");
             if (p2c_vec_len(n->u.classdef.bases) > 0) {
@@ -4134,7 +4247,8 @@ static void gen_stmt(P2C_CodeGen *cg, P2C_AstStmt *stmt) {
             }
             break;
         default:
-            indent(cg); write_str(cg, "/* unimplemented stmt */"); write_newline(cg);
+            /* 未対応の文。--fallback ではランタイムスタブ、既定では変換エラー。 */
+            emit_unsupported_construct(cg, n, "statement", false);
             break;
     }
 }
