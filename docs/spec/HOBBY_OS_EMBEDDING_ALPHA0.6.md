@@ -120,7 +120,8 @@ int kernel_task(void *task_stack_lo, void *task_stack_hi) {
 
 | 項目 | 値 |
 | --- | --- |
-| 初期化直後の使用量（peak） | 約 17.7 KB |
+| 初期化直後の使用量（peak、math込み） | 約 17.7 KB（17,728 バイト） |
+| `-DPYTHON_CODE_TO_C_NO_MATH_MODULE` を定義した場合 | **704 バイト**（約25分の1。mathを使わないカーネル向け） |
 | 推奨ヒープ | 32 KB 以上（タスクの作業用に余裕を持たせる） |
 | テンプレート既定 | 64 KB（`templates/hobby_os`）、HobbyOS向けELFは128 KB |
 
@@ -174,6 +175,36 @@ int kernel_task(void *task_stack_lo, void *task_stack_hi) {
 | `cfg.raise_memory_error = true`（既定） | 例外フレームがあれば `MemoryError` を送出し、`except MemoryError` で受けられる。無ければシンクへ診断し panic フックへ |
 | `cfg.raise_memory_error = false` | 従来どおり確保失敗をNULLで返す（呼び出し側が処理する） |
 | `p2c_runtime_set_oom_handler(fn, user)` | 任意のハンドラを登録。`p2c_oom_raise_memory_error` が標準実装（事前確保済みの `MemoryError` を使うため、枯渇中でも再確保しない） |
+
+## 7-1. 実行予算（サンドボックス）— 信頼できないコードを走らせる
+
+カーネル内で「利用者が持ち込んだPython」を動かす場合、無限ループやメモリ爆発を
+**ハングやクラッシュではなく例外**として止められる必要があります。そのための予算APIを
+ランタイムに用意しました。
+
+```c
+P2C_SandboxLimits limits = { .max_ticks = 200000, .max_allocs = 8192 };
+p2c_sandbox_set(&limits);   /* 0 は無制限。タスク開始時に呼ぶ */
+p2c_embed_start(...);       /* 変換済みモジュールを実行 */
+p2c_sandbox_set(NULL);      /* 実行後に無制限へ戻す */
+
+uint64_t ticks  = p2c_sandbox_ticks();       /* 消費したループ後退エッジ数 */
+uint64_t allocs = p2c_sandbox_allocs();      /* 消費した確保数 */
+uint64_t viol   = p2c_sandbox_violations();  /* 予算超過で例外を出した回数 */
+p2c_sandbox_reset();                         /* 消費量だけをゼロに戻す */
+```
+
+- **ステップ予算** (`max_ticks`) はループの後退エッジで消費します。生成Cの `while` には
+  `p2c_sandbox_tick()` が自動で入るため、`while True: pass` のような確保を伴わない
+  無限ループも検出できます。`for` も反復ごとにランタイム側の反復経路を通ります。
+- **確保予算** (`max_allocs`) は `p2c_obj_new()` で検査し、超過時は確保を失敗させます。
+- 超過時は `SandboxError` を送出します。生成Cの `except` で捕捉できるので、
+  「予算内で終わらなかった」ことをOS側・Python側の両方で扱えます。
+- 予算超過後は内部で予算を無効化し、例外処理中の二次的な超過で例外が連鎖しないようにします。
+- 予算が未設定（0）のときの追加コストは分岐1回だけで、通常の実行性能に影響しません。
+- HobbyOS では `write` フック経由で `SandboxError` の内容をログに出し、タスクを終了させます。
+- 回帰: `make test-sandbox`（ステップ／確保の各予算が例外になること、無制限時に何も起きないこと、
+  生成ループに計装が入ること）。
 
 ## 8. OS内で変換する（オンデバイス変換）
 

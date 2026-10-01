@@ -159,7 +159,16 @@ struct P2C_Lexer {
     P2C_Token *current;
     P2C_Token *peek;
     bool has_peek;
-    P2C_Token *peek2;   /* 2つ先のトークン（キーワード引数 name=value の判定等に使用） */
+    P2C_Token *peek2;
+    /* 引退したトークン（解放せず保持し、lexer破棄時に一括解放する）。
+     * parser は CURRENT(p) を控えて NEXT(p) の直後に line/col/text を読む形を
+     * 多用するため、即時解放すると解放後参照になる（ASanが実例を検出した）。
+     * 解析中のメモリは増えるが、AST と同様に解析終了時にまとめて解放される。 */
+    P2C_Vector *retired_tokens;
+    /* 直前のトークン。parser が CURRENT(p) を控えて NEXT(p) の直後に
+     * line/col/text を読む形を多用するため、即時解放すると解放後参照に
+     * なる（ASan: heap-use-after-free）。1つだけ保持し、さらに次へ進んだ
+     * 時点で解放する（余分なメモリは1トークン分）。 */
     bool has_peek2;
     uint32_t grouping_depth; /* (), [], {} 内では改行・インデントを無視 */
 };

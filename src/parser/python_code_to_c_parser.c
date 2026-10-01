@@ -1493,10 +1493,16 @@ static P2C_AstStmt* parse_assignment_or_expr(P2C_Parser *p, P2C_Result *err) {
     P2C_AstExpr *first = NULL;
     if (CURRENT(p) && CURRENT(p)->type == TOK_STAR) {
         P2C_Token *star_tok = CURRENT(p);
+        /* NEXT(p) は peek 済みトークンを消費する際に直前のトークンを解放する
+         * （p2c_lexer_next）。そのため NEXT の後に star_tok を参照すると
+         * 解放後参照になる（ASanが heap-use-after-free として検出した）。
+         * 必要な値は進める前に控えておく。 */
+        uint32_t star_line = star_tok->line;
+        uint32_t star_col = star_tok->col;
         NEXT(p);
         P2C_AstExpr *value = parse_expr(p, err);
         if (!value) return NULL;
-        first = p2c_ast_expr_new(p->alloc, AST_STARRED, star_tok->line, star_tok->col);
+        first = p2c_ast_expr_new(p->alloc, AST_STARRED, star_line, star_col);
         if (!first) return NULL;
         first->base.u.starred.value = value;
     } else {

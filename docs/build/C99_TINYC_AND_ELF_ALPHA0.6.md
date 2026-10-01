@@ -52,7 +52,8 @@ tccが見つからない場合は `check-tcc` が理由を表示して停止し�
 
 ```sh
 make elf
-# build/elf/python-code-to-c            … 静的リンクされた自己完結ELF
+# build/elf/python-code-to-c.elf        … 静的リンクされた自己完結ELF（主成果物）
+# build/elf/python-code-to-c            … 同じ内容の互換用コピー（拡張子なし）
 # build/elf/python-code-to-c.elf.txt    … file/readelf のマニフェスト
 ```
 

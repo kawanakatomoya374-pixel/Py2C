@@ -345,6 +345,8 @@ CPython差分とは別に、組込み統合の契約を実行時検証する。
 | C526–C528 | super()のMRO解決：ダイヤモンド継承（class D(B, C)、B(A)、C(A)）でBのsuper()が実体の型のMROに従ってCを選ぶこと、単一継承でのsuper()、super().__init__()による基底初期化 | コード生成時に基底チェーンを静的に辿っていたことによる誤解決 |
 | C529–C538 | メソッドデコレータ：@staticmethod（クラス経由・インスタンス経由の呼び出し）、@classmethod（cls を受け取りクラス属性を更新／生成）、@property（読み出しでゲッター実行）、propertyのMRO継承とオーバーライド、propertyへの代入がAttributeErrorになること、束縛したpropertyの取り出し | メソッド種別のディスパッチ漏れ、propertyの優先順位（インスタンス属性より先）、setter未実装時の属性隠蔽 |
 | C539–C549 | math モジュール拡充：floor/ceil/trunc/fabs/fmod/hypot/copysign/ldexp/degrees/radians/log/log2/log10/log(2引数)/exp/expm1/log1p/tan/isnan/isinf/isfinite/fsum/prod/factorial/gcd/isqrt/comb/perm/cbrt/erf/gamma | freestandingでのlibm宣言漏れ、判定マクロ依存（isnan/isinf）、整数オーバーフロー検査 |
+| C550–C555 | @property の setter（`@x.setter`）：プロパティへの代入で setter が呼ばれること、setter 無しのプロパティへの代入が AttributeError になること、継承したプロパティの setter が動くこと、setter が副作用（trace リスト等）を残すこと | ゲッターと setter の C シンボル衝突、名前引きで setter がゲッターを隠すこと |
+| C556–C576 | 文字列の `%` 書式（剰余演算子）：`"%s(%.2f)" % (name, area)`、`%d`/`%i`/`%u`/`%x`/`%X`/`%o`、フラグ（`-` `+` 空白 `0`）と幅・精度、`*`（幅と精度を引数から取得）、`%r`/`%a`/`%c`、`%%`、タプル右辺の位置引数、`%(key)` 辞書マッピング、非タプルの単一値、`str % int` の TypeError（not all arguments converted）、引数不足の TypeError、辞書キー欠落の KeyError、`%(key)` に対する非マッピングの TypeError | 左辺が文字列でも数値の剰余として扱われていたこと（`ZeroDivisionError`）、`p2c_obj_as_str` が文字列専用で数値・コンテナを空文字にしていたこと |
 | H10 | make test-stack-usage | freestandingランタイムと共通層のすべてのフレームが STACK_USAGE_LIMIT（既定4096バイト）以下であること（-Wstack-usage と -Werror の併用） |
 | H11 | make test-analyzer | GCC -fanalyzer でコンパイラコアとランタイムの欠陥（解放後利用・NULL経路・確保失敗の取り違え）がないこと。実行時間が長いため任意実行 |
 

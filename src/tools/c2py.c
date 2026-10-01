@@ -17,6 +17,27 @@
 #include <ctype.h>
 #include <stdbool.h>
 
+/* ---------- 確保ラッパ ----------
+ * c2py は単体の小さな変換ツールなので、メモリ不足は「黙ってNULLを返して
+ * 後でクラッシュ」ではなく、その場で明示的に終了する。以前は malloc/realloc の
+ * 戻り値を確認せずに書き込んでおり、静的解析（-fanalyzer）が
+ * CWE-690（NULL参照）/CWE-476/CWE-401（realloc失敗時の旧領域リーク）を
+ * 7件報告していた。 */
+static void c2py_oom(void) {
+    fputs("c2py: out of memory\n", stderr);
+    exit(1);
+}
+static void *c2py_alloc(size_t size) {
+    void *p = malloc(size ? size : 1u);
+    if (!p) c2py_oom();
+    return p;
+}
+static void *c2py_realloc(void *ptr, size_t size) {
+    void *p = realloc(ptr, size ? size : 1u);
+    if (!p) c2py_oom();
+    return p;
+}
+
 /* ---------- 出力バッファ ---------- */
 typedef struct {
     char *data;
@@ -24,12 +45,12 @@ typedef struct {
     size_t cap;
 } OutBuf;
 
-static void ob_init(OutBuf *b) { b->data = (char*)malloc(1); b->data[0] = '\0'; b->len = 0; b->cap = 1; }
+static void ob_init(OutBuf *b) { b->data = (char*)c2py_alloc(1); b->data[0] = '\0'; b->len = 0; b->cap = 1; }
 static void ob_reserve(OutBuf *b, size_t extra) {
     if (b->len + extra + 1 <= b->cap) return;
     size_t new_cap = b->cap * 2;
     while (new_cap < b->len + extra + 1) new_cap *= 2;
-    b->data = (char*)realloc(b->data, new_cap);
+    b->data = (char*)c2py_realloc(b->data, new_cap);
     b->cap = new_cap;
 }
 static void ob_append(OutBuf *b, const char *s) {
@@ -59,9 +80,9 @@ static void tv_init(TokVec *v) { v->toks = NULL; v->n = 0; v->cap = 0; }
 static void tv_push(TokVec *v, TokType t, const char *start, size_t len) {
     if (v->n >= v->cap) {
         v->cap = v->cap ? v->cap * 2 : 64;
-        v->toks = (Token*)realloc(v->toks, v->cap * sizeof(Token));
+        v->toks = (Token*)c2py_realloc(v->toks, v->cap * sizeof(Token));
     }
-    char *s = (char*)malloc(len + 1);
+    char *s = (char*)c2py_alloc(len + 1);
     memcpy(s, start, len);
     s[len] = '\0';
     v->toks[v->n].type = t;
@@ -297,7 +318,7 @@ static void emit_printf(Parser *p, OutBuf *out, int indent) {
     }
     char *raw = cur(p)->text; /* ダブルクォート込み */
     size_t rl = strlen(raw);
-    char *fmt = (char*)malloc(rl);
+    char *fmt = (char*)c2py_alloc(rl);
     memcpy(fmt, raw + 1, rl - 2);
     fmt[rl - 2] = '\0';
     adv(p);

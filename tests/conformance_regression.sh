@@ -119,4 +119,6 @@ run_differential_case C516-C525 tests/tuple_ordering_alpha06.py 10
 run_differential_case C526-C528 tests/super_mro_alpha06.py 3
 run_differential_case C529-C538 tests/method_decorators_alpha06.py 10
 run_differential_case C539-C549 tests/math_module_alpha06.py 11
-printf '%s\n' 'conformance_regression_ok: 549 semantic assertions passed'
+run_differential_case C550-C555 tests/property_setter_alpha06.py 6
+run_differential_case C556-C576 tests/percent_format_alpha06.py 21
+printf '%s\n' 'conformance_regression_ok: 576 semantic assertions passed'

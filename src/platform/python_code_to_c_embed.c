@@ -378,6 +378,10 @@ void p2c_embed_console_reset(void) {
     if (g_console && g_console_capacity > 0) g_console[0] = '\0';
 }
 
+/* パニック時に復帰しなかった場合の待機フラグ（常に0。脱出条件として置く）。
+ * 静的解析へ「意図的な待機」であることを示すために volatile で参照する。 */
+static volatile int g_embed_halt_spin = 0;
+
 void p2c_embed_panic(const char *reason) {
     static const char prefix[] = "PANIC: ";
     const char *text = reason ? reason : "unknown";
@@ -387,9 +391,12 @@ void p2c_embed_panic(const char *reason) {
     embed_write(2, text, len, NULL);
     embed_write(2, "\n", 1, NULL);
     if (g_config && g_config->panic) g_config->panic(text, g_config->panic_user);
-    /* パニックハンドラが復帰した場合の最終手段。カーネルではここで止まる
-     * （ホスト側の検証では panic フックから longjmp して復帰させる）。 */
-    for (;;) { }
+    /* パニックハンドラが復帰した場合の最終手段。カーネルではここで待機する
+     * （ホスト側の検証では panic フックから longjmp して復帰させる）。
+     * volatile の脱出条件を介することで「意図的な待機」であることを示し、
+     * 静的解析の無限ループ検知（CWE-835 / -fanalyzer）を避ける。
+     * カーネルが WFI/HLT を差し込みたい場合はこのループを置き換える。 */
+    while (!g_embed_halt_spin) { /* spin (halt) */ }
 }
 
 /* ============================================================

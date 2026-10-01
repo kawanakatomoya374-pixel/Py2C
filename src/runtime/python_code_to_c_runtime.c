@@ -257,6 +257,46 @@ static bool         g_gc_adaptive    = true;   /* しきい値の自動調整（
 static size_t       g_gc_threshold_growths = 0; /* 適応GCがしきい値を伸ばした回数 */
 static size_t       g_gc_peak_objects = 0;      /* 追跡オブジェクト数の最大値 */
 static size_t       g_gc_oom_resets   = 0;      /* OOMでしきい値を基準値へ戻した回数 */
+
+/* ── サンドボックス予算 ──
+ * 0 は無制限。予算超過は SandboxError として送出し、ハングやクラッシュにしない。 */
+static uint64_t g_sandbox_max_ticks  = 0;
+static uint64_t g_sandbox_max_allocs = 0;
+static uint64_t g_sandbox_ticks      = 0;
+static uint64_t g_sandbox_allocs     = 0;
+static uint64_t g_sandbox_violations = 0;
+
+void p2c_sandbox_set(const P2C_SandboxLimits *limits) {
+    if (!limits) {
+        g_sandbox_max_ticks = 0;
+        g_sandbox_max_allocs = 0;
+    } else {
+        g_sandbox_max_ticks = limits->max_ticks;
+        g_sandbox_max_allocs = limits->max_allocs;
+    }
+    g_sandbox_ticks = 0;
+    g_sandbox_allocs = 0;
+}
+void p2c_sandbox_reset(void) {
+    g_sandbox_ticks = 0;
+    g_sandbox_allocs = 0;
+    g_sandbox_violations = 0;
+}
+uint64_t p2c_sandbox_ticks(void)      { return g_sandbox_ticks; }
+uint64_t p2c_sandbox_allocs(void)     { return g_sandbox_allocs; }
+uint64_t p2c_sandbox_violations(void) { return g_sandbox_violations; }
+
+/* ループ後退エッジ。毎回カウントするだけ（予算未設定なら分岐1回）。 */
+void p2c_sandbox_tick(void) {
+    if (g_sandbox_max_ticks == 0) return;
+    g_sandbox_ticks++;
+    if (g_sandbox_ticks > g_sandbox_max_ticks) {
+        g_sandbox_violations++;
+        g_sandbox_max_ticks = 0;   /* 連鎖的な例外を避ける */
+        p2c_raise(p2c_make_exception("SandboxError",
+                                     "sandbox: step budget exhausted (possible infinite loop)"));
+    }
+}
 /* 適応GCの上限。これ以上は伸ばさない（メモリを抱え込みすぎないため）。
  * 組込み（カーネル）では利用可能なヒープが小さいので、p2c_embed_start() が
  * p2c_gc_set_adaptive_limit() でヒープ容量に応じた上限へ下げる。 */
@@ -521,6 +561,16 @@ P2C_Object* p2c_obj_new(P2C_ClassDef *cls) {
         g_gc_bytes_alloc >= g_gc_threshold) {
         /* runtime.h が宣言している p2c_gc_collect を、この後方の定義より先に呼ぶ */
         p2c_gc_collect();
+    }
+    if (g_sandbox_max_allocs != 0) {
+        g_sandbox_allocs++;
+        if (g_sandbox_allocs > g_sandbox_max_allocs) {
+            g_sandbox_violations++;
+            g_sandbox_max_allocs = 0;   /* 連鎖的な例外を避ける */
+            p2c_raise(p2c_make_exception("SandboxError",
+                                         "sandbox: allocation budget exhausted"));
+            return NULL;
+        }
     }
     P2C_Object *obj = (P2C_Object*)p2c_malloc_checked(sizeof(P2C_Object), "object");
     if (!obj) return NULL;
@@ -875,8 +925,250 @@ P2C_Object* p2c_obj_floordiv(P2C_Object *a, P2C_Object *b) {
     if (r != 0 && ((r < 0) != (ib < 0))) q -= 1;
     return p2c_obj_from_int(q);
 }
+/* ── Python の str % 書式 ────────────────────────────────────────────────
+ * 例: "%s(%.2f)" % (name, area)
+ * 剰余演算子（p2c_obj_mod）の左辺が文字列のときに呼ばれる。
+ *   変換: %s %r %a %d %i %u %f %F %e %E %g %G %x %X %o %c %%
+ *   指定: フラグ '-' '+' ' ' '#' '0' / 幅 / '.'精度 / 幅と精度の '*'（引数から取得）
+ *   右辺: タプル=位置引数、%(key) を含む書式=辞書、それ以外=単一の値
+ * フラグ・幅・精度はそのまま snprintf の書式へ透過させるので、
+ * C の printf と同じ見た目になる（CPython と一致することを回帰で確認）。
+ * str.format() は p2c_str_format_py が担当する。 */
+
+/* 任意のオブジェクトを str()/repr() 表現へ変換する（本体は p2c_obj_repr の直前）。
+ * %s は repr=false、%r/%a は repr=true で使う。 */
+static void p2c_obj_to_buf_ex(P2C_Object *obj, P2C_String *out, bool repr);
+
+static bool p2c_pf_append(char **buf, size_t *len, size_t *cap,
+                          const char *s, size_t n) {
+    if (*len + n + 1 > *cap) {
+        size_t ncap = (*cap != 0) ? *cap : 64;
+        while (*len + n + 1 > ncap) ncap *= 2;
+        char *nb = (char*)p2c_realloc_checked(*buf, ncap, "percent format buffer");
+        if (!nb) return false;
+        *buf = nb; *cap = ncap;
+    }
+    if (n > 0) memcpy(*buf + *len, s, n);
+    *len += n;
+    (*buf)[*len] = '\0';
+    return true;
+}
+
+/* 変換1個分を整形して追記する。spec は '%' と変換子の間の指定。 */
+static bool p2c_pf_emit(char **buf, size_t *len, size_t *cap,
+                        const char *spec, char conv, P2C_Object *arg) {
+    char cfmt[64];
+    char tmp[512];
+    size_t width_hint = 0;
+    for (const char *q = spec; *q != '\0'; q++) {
+        if (*q >= '0' && *q <= '9') {
+            width_hint = width_hint * 10u + (size_t)(*q - '0');
+            if (width_hint > 1048576u) width_hint = 1048576u;
+        }
+    }
+    size_t need = width_hint + 256u;
+    char *work = tmp;
+    if (need > sizeof(tmp)) {
+        work = (char*)p2c_malloc_checked(need, "percent format field");
+        if (!work) return false;
+    }
+    int n = -1;
+    if (conv == 's' || conv == 'r' || conv == 'a') {
+        const char *txt = "";
+        P2C_String *sb = NULL;
+        if (conv == 's' && p2c_obj_is_str(arg)) {
+            txt = p2c_obj_as_str(arg);      /* 文字列はそのまま */
+        } else {
+            /* 数値・コンテナ・インスタンスは str()/repr() 表現に変換する
+             * （p2c_obj_as_str は文字列専用で、それ以外は空文字を返すため）。 */
+            sb = p2c_str_new(NULL);
+            if (sb) {
+                p2c_obj_to_buf_ex(arg, sb, conv != 's');
+                txt = p2c_str_cstr(sb);
+            }
+        }
+        snprintf(cfmt, sizeof(cfmt), "%%%ss", spec);
+        n = snprintf(work, need, cfmt, txt ? txt : "");
+        if (sb) p2c_str_free(sb);
+    } else if (conv == 'c') {
+        if (p2c_obj_is_str(arg) && p2c_obj_str_len(arg) >= 1) {
+            const char *txt = p2c_obj_as_str(arg);
+            snprintf(cfmt, sizeof(cfmt), "%%%ss", spec);
+            n = snprintf(work, need, cfmt, txt ? txt : "");
+        } else {
+            snprintf(cfmt, sizeof(cfmt), "%%%sc", spec);
+            n = snprintf(work, need, cfmt, (int)p2c_obj_as_int(arg));
+        }
+    } else if (conv == 'd' || conv == 'i' || conv == 'u' ||
+               conv == 'x' || conv == 'X' || conv == 'o') {
+        snprintf(cfmt, sizeof(cfmt), "%%%sll%c", spec, conv);
+        n = snprintf(work, need, cfmt, (long long)p2c_obj_as_int(arg));
+    } else if (conv == 'f' || conv == 'F' || conv == 'e' || conv == 'E' ||
+               conv == 'g' || conv == 'G') {
+        snprintf(cfmt, sizeof(cfmt), "%%%s%c", spec, conv);
+        n = snprintf(work, need, cfmt, p2c_obj_as_float(arg));
+    } else {
+        if (work != tmp) p2c_heap_free(work);
+        p2c_raise(p2c_make_exception("ValueError", "unsupported format character"));
+        return false;
+    }
+    bool ok = true;
+    if (n >= 0) {
+        size_t written = ((size_t)n < need) ? (size_t)n : need - 1u;
+        ok = p2c_pf_append(buf, len, cap, work, written);
+    }
+    if (work != tmp) p2c_heap_free(work);
+    return ok;
+}
+P2C_Object* p2c_percent_format(const char *fmt, P2C_Object *rhs) {
+    if (!fmt) return p2c_obj_from_str("");
+    /* %(key) 形式があるときだけ右辺の辞書をマッピングとして扱う（CPython と同じ）。 */
+    bool uses_mapping = false;
+    for (const char *q = fmt; *q != '\0'; q++) {
+        if (*q != '%') continue;
+        if (q[1] == '%') { q++; continue; }
+        if (q[1] == '(') { uses_mapping = true; break; }
+    }
+    bool tuple_args = (!uses_mapping && p2c_obj_is_tuple(rhs));
+    size_t count = tuple_args ? p2c_tuple_len(rhs) : 0u;
+    size_t pos = 0u;
+    bool single_used = false;
+    P2C_Object *single = (!uses_mapping && !tuple_args) ? rhs : NULL;
+
+    size_t cap = strlen(fmt) * 2u + 64u;
+    size_t len = 0u;
+    char *out = (char*)p2c_malloc_checked(cap, "percent format buffer");
+    if (!out) return p2c_obj_from_str("");
+
+    const char *p = fmt;
+    while (*p != '\0') {
+        if (*p != '%') {
+            if (!p2c_pf_append(&out, &len, &cap, p, 1u)) goto pf_fail;
+            p++;
+            continue;
+        }
+        p++;
+        if (*p == '\0') break;
+        if (*p == '%') {
+            if (!p2c_pf_append(&out, &len, &cap, "%", 1u)) goto pf_fail;
+            p++;
+            continue;
+        }
+        P2C_Object *arg = NULL;
+        if (*p == '(') {
+            const char *close = strchr(p, ')');
+            if (!close) { p2c_raise(p2c_make_exception("ValueError", "incomplete format key")); goto pf_fail; }
+            char keybuf[128];
+            size_t klen = (size_t)(close - (p + 1));
+            if (klen >= sizeof(keybuf)) klen = sizeof(keybuf) - 1u;
+            memcpy(keybuf, p + 1, klen);
+            keybuf[klen] = '\0';
+            if (!p2c_obj_is_dict(rhs)) {
+                p2c_raise(p2c_make_exception("TypeError", "format requires a mapping"));
+                goto pf_fail;
+            }
+            arg = p2c_dict_get(rhs, p2c_obj_from_str(keybuf));   /* 無ければ KeyError */
+            if (!arg) goto pf_fail;
+            p = close + 1;
+        }
+        char spec[48];
+        size_t sl = 0u;
+        while (*p == '-' || *p == '+' || *p == ' ' || *p == '#' || *p == '0') {
+            if (sl < sizeof(spec) - 1u) spec[sl++] = *p;
+            p++;
+        }
+        if (*p == '*') {
+            P2C_Object *warg = arg;
+            if (!warg) {
+                if (tuple_args) {
+                    if (pos >= count) { p2c_raise(p2c_make_exception("TypeError", "not enough arguments for format string")); goto pf_fail; }
+                    warg = p2c_tuple_get(rhs, pos++);
+                } else if (single != NULL && !single_used) {
+                    warg = single; single_used = true;
+                }
+            }
+            if (!warg) { p2c_raise(p2c_make_exception("TypeError", "not enough arguments for format string")); goto pf_fail; }
+            char wbuf[24];
+            snprintf(wbuf, sizeof(wbuf), "%lld", (long long)p2c_obj_as_int(warg));
+            for (const char *q = wbuf; *q != '\0' && sl < sizeof(spec) - 1u; q++) spec[sl++] = *q;
+            p++;
+        } else {
+            while (*p >= '0' && *p <= '9') {
+                if (sl < sizeof(spec) - 1u) spec[sl++] = *p;
+                p++;
+            }
+        }
+        if (*p == '.') {
+            if (sl < sizeof(spec) - 1u) spec[sl++] = *p;
+            p++;
+            if (*p == '*') {
+                P2C_Object *parg = arg;
+                if (!parg) {
+                    if (tuple_args) {
+                        if (pos >= count) { p2c_raise(p2c_make_exception("TypeError", "not enough arguments for format string")); goto pf_fail; }
+                        parg = p2c_tuple_get(rhs, pos++);
+                    } else if (single != NULL && !single_used) {
+                        parg = single; single_used = true;
+                    }
+                }
+                if (!parg) { p2c_raise(p2c_make_exception("TypeError", "not enough arguments for format string")); goto pf_fail; }
+                int64_t pv = p2c_obj_as_int(parg);
+                if (pv >= 0) {
+                    char pbuf[24];
+                    snprintf(pbuf, sizeof(pbuf), "%lld", (long long)pv);
+                    for (const char *q = pbuf; *q != '\0' && sl < sizeof(spec) - 1u; q++) spec[sl++] = *q;
+                } else if (sl > 0u) {
+                    sl--;   /* 負の精度は「精度指定なし」 */
+                }
+                p++;
+            } else {
+                while (*p >= '0' && *p <= '9') {
+                    if (sl < sizeof(spec) - 1u) spec[sl++] = *p;
+                    p++;
+                }
+            }
+        }
+        char conv = *p;
+        if (conv == '\0') break;
+        p++;
+        spec[sl] = '\0';
+        if (conv == '%') {
+            if (!p2c_pf_append(&out, &len, &cap, "%", 1u)) goto pf_fail;
+            continue;
+        }
+        if (!arg) {
+            if (tuple_args) {
+                if (pos >= count) { p2c_raise(p2c_make_exception("TypeError", "not enough arguments for format string")); goto pf_fail; }
+                arg = p2c_tuple_get(rhs, pos++);
+            } else if (single != NULL && !single_used) {
+                arg = single; single_used = true;
+            } else {
+                p2c_raise(p2c_make_exception("TypeError", "not enough arguments for format string"));
+                goto pf_fail;
+            }
+        }
+        if (!p2c_pf_emit(&out, &len, &cap, spec, conv, arg)) goto pf_fail;
+    }
+    /* 使われなかった引数が残っていたら CPython と同じく TypeError。 */
+    if (tuple_args ? (pos < count) : (single != NULL && !single_used)) {
+        p2c_raise(p2c_make_exception("TypeError", "not all arguments converted during string formatting"));
+        goto pf_fail;
+    }
+    {
+        P2C_Object *res = p2c_obj_from_str(out);
+        p2c_heap_free(out);
+        return res;
+    }
+pf_fail:
+    p2c_heap_free(out);
+    return &P2C_None;
+}
+
 P2C_Object* p2c_obj_mod(P2C_Object *a, P2C_Object *b) {
     { P2C_Object *r; if (try_binop_dunder(a, b, "__mod__", &r)) return r; }
+    /* 左辺が文字列なら % 書式（"%s(%.2f)" % (...)）。数値の剰余とは別物。
+     * CPython 同様、書式に %(key) があるときだけ右辺の辞書をマッピングに使う。 */
+    if (p2c_obj_is_str(a)) return p2c_percent_format(p2c_obj_as_str(a), b);
     if (p2c_obj_is_float(a) || p2c_obj_is_float(b)) {
         double da = p2c_obj_as_float(a), db = p2c_obj_as_float(b);
         if (p2c_float_eq(db, 0.0)) { p2c_raise(p2c_make_exception("ZeroDivisionError", "float modulo")); return &P2C_None; }
@@ -1925,6 +2217,33 @@ static P2C_MethodDef* p2c_find_own_method(P2C_Object *cls_obj, const char *name)
     if (!cls_obj || !name) return NULL;
     for (P2C_MethodDef *m = cls_obj->u.v_class.methods; m && m->name; m++) {
         if (strcmp(m->name, name) == 0) return m;
+    }
+    return NULL;
+}
+
+/* 種別を指定して自クラスのメソッドを探す（@x.setter は名前がゲッターと
+ * 同じため、種別なしの探索では見つけられない）。 */
+static P2C_MethodDef* p2c_find_own_method_kind(P2C_Object *cls_obj, const char *name, int kind) {
+    if (!cls_obj || !name) return NULL;
+    for (P2C_MethodDef *m = cls_obj->u.v_class.methods; m && m->name; m++) {
+        if (m->kind == kind && strcmp(m->name, name) == 0) return m;
+    }
+    return NULL;
+}
+
+/* MRO順に @x.setter を探す。 */
+static P2C_MethodDef* p2c_find_property_setter_in_chain(P2C_Object *cls_obj, const char *name) {
+    if (!cls_obj || !name) return NULL;
+    P2C_MethodDef *own = p2c_find_own_method_kind(cls_obj, name, P2C_METHOD_PROPERTY_SETTER);
+    if (own) return own;
+    const char *mro = p2c_class_mro(cls_obj);
+    size_t offset = 0;
+    P2C_NameSpan span;
+    while (p2c_mro_next(mro, &offset, &span)) {
+        P2C_Object *base_cls = p2c_find_class_by_span(&span);
+        if (!base_cls) continue;
+        P2C_MethodDef *found = p2c_find_own_method_kind(base_cls, name, P2C_METHOD_PROPERTY_SETTER);
+        if (found) return found;
     }
     return NULL;
 }
@@ -3274,15 +3593,20 @@ P2C_Object* p2c_call_attr_kw(P2C_Object *obj, const char *name, P2C_Object **arg
             return &P2C_None;
         }
         owns_flat = true;
-        for (size_t i = 0; i < nkw; i++) {
-            if (kw_names[i]) { flat_names[pos] = kw_names[i]; flat_values[pos++] = kw_values[i]; }
-            else for (P2C_DictEntry *e = kw_values[i]->u.v_dict.order_head; e; e = e->order_next) {
-                if (!e->key || !e->key->cls || e->key->cls->type_tag != OBJ_STR) {
-                    p2c_heap_free(flat_names); p2c_heap_free(flat_values);
-                    p2c_raise(p2c_make_exception("TypeError", "method ** keys must be strings"));
-                    return &P2C_None;
+        /* flat_n == 0 の場合（**空dictのみ等）は配列を確保しないため、
+         * 下のループは「書く先が無い」状態になる。clang静的解析が
+         * NULL配列へのアクセスとして指摘するため、明示的に分岐する。 */
+        if (flat_names && flat_values) {
+            for (size_t i = 0; i < nkw; i++) {
+                if (kw_names[i]) { flat_names[pos] = kw_names[i]; flat_values[pos++] = kw_values[i]; }
+                else for (P2C_DictEntry *e = kw_values[i]->u.v_dict.order_head; e; e = e->order_next) {
+                    if (!e->key || !e->key->cls || e->key->cls->type_tag != OBJ_STR) {
+                        p2c_heap_free(flat_names); p2c_heap_free(flat_values);
+                        p2c_raise(p2c_make_exception("TypeError", "method ** keys must be strings"));
+                        return &P2C_None;
+                    }
+                    flat_names[pos] = p2c_obj_as_str(e->key); flat_values[pos++] = e->val;
                 }
-                flat_names[pos] = p2c_obj_as_str(e->key); flat_values[pos++] = e->val;
             }
         }
         kw_names = flat_names; kw_values = flat_values; nkw = flat_n;
@@ -3911,6 +4235,10 @@ void p2c_runtime_init(void *heap_base, size_t heap_sz) {
     if (!g_oom_exception) {
         g_oom_exception = p2c_make_exception("MemoryError", "out of memory");
     }
+/* math モジュールは初期化時に約8KBのヒープを消費するため、組込み（HobbyOS等）で
+ * 使わない場合は PYTHON_CODE_TO_C_NO_MATH_MODULE を定義して登録自体を省ける
+ * （起動時のヒープ要件を下げる。`make test-embed-baseline` で実測できる）。 */
+#ifndef PYTHON_CODE_TO_C_NO_MATH_MODULE
     P2C_Object *math_mod = p2c_module_new("math");
     /* math モジュール: 組込みでよく使う関数と定数を登録する。各関数は
      * double を受けて double（またはint/bool）を返す薄いラッパで、
@@ -3963,6 +4291,7 @@ void p2c_runtime_init(void *heap_base, size_t heap_sz) {
         p2c_module_set_attr(math_mod, "gcd", p2c_function_new("gcd", math_gcd_fn));
         p2c_register_module(math_mod);
     }
+#endif /* !PYTHON_CODE_TO_C_NO_MATH_MODULE */
 #ifndef PYTHON_CODE_TO_C_NO_PYGAME
     p2c_register_pygame_module();
 #endif
@@ -5806,6 +6135,14 @@ void p2c_setattr(P2C_Object *obj, const char *name, P2C_Object *val) {
             /* @property への代入（setter）は未対応。Python同様AttributeErrorにして、
              * 属性を黙って上書き（propertyの隠蔽）しない。 */
             if (obj->u.v_instance.klass && p2c_find_property_in_chain(obj->u.v_instance.klass, name)) {
+                /* @x.setter があればそれを呼ぶ（引数は代入値1つ）。無ければ
+                 * Python同様 AttributeError。 */
+                P2C_MethodDef *setter = p2c_find_property_setter_in_chain(obj->u.v_instance.klass, name);
+                if (setter) {
+                    P2C_Object *arg = val;
+                    (void)p2c_invoke_found_method(setter, obj, obj->u.v_instance.klass, &arg, 1, false);
+                    break;
+                }
                 p2c_raise(p2c_make_exception("AttributeError", "property has no setter"));
                 break;
             }

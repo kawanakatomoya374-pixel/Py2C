@@ -39,3 +39,27 @@ ASan/UBSan付きでコンパイラ本体と複雑コーパスを実行しまし�
 LeakSanitizerで過去に確認された短命なCLIコンパイラ側の部分解析経路および中間構造の所有権課題は、生成プログラムのGCリークとは別に継続管理する。今回のAlpha0.6品質ゲートでは、common、platform中核、Hostedアダプタ、runtime、parser、AST、AST dump、lexer、codegen、semanticの10モジュールに対するClang静的解析を診断0件で通過させた。最新の304件コーパス、GCC/Clang双方のHosted・GUI・freestandingビルド、Python 3.13型構文・位置専用引数・`yield from`・`raise from`、UTF-8文字コード・基数変換・開始値付き集計の回帰、状態機械ジェネレータ・協調async回帰、静的ヒープのベアメタル実行、実変換ベアメタルCのC11オブジェクト化、高次dict/set拡張を含む単一ヘッダー自己完結ビルド、Clang単独の厳格C11単一ヘッダー経路、Hosted allocator・出力・時刻参照を除外するfreestanding単一ヘッダー経路、プラットフォーム出力アダプタ、`make run`および汎用C11テンプレートの起動契約、決定的コンテナファジング、およびネスト関数の移植性診断は、`docs/STRICT_REVIEW_ALPHA0.6.md`に記録した。
 
 > この結果は、残課題を隠した「完全無欠」の宣言ではありません。対応済み範囲を厳格に検証し、未達範囲は変換診断・文書・次期優先順位として明示する品質方針に基づく記録です。
+
+## make help の全ターゲット実行（Alpha0.6）
+
+`make help` に列挙される全ターゲットを順に実行するランナー `tests/run_all_make_targets.sh` を
+追加し、全件を実行・確認しました（結果は `/tmp/helprun/summary.txt` に記録）。
+
+| 区分 | 結果 |
+| --- | --- |
+| ビルド | all / gui / single-header / freestanding / c99 / tcc すべて成功 |
+| 差分・回帰 | test（661 s・0エラー）/ test-c99（576件一致）/ test-tcc（576件一致）/ test-fallback / test-sandbox ほか |
+| 組込み | test-embed-runtime / test-embed-compile / test-embed-generated / test-baremetal-* / test-gc-* / test-stack-usage |
+| 解析 | test-analyzer（263 s・欠陥0）/ test-analyzer-clang（106 s・欠陥0）/ test-sanitizers / test-sanitizers-core |
+| ELF | elf / hobbyos-elf / tcc elf c99 すべて成功 |
+
+### 実行で見つかった不具合と修正
+
+| 症状 | 原因 | 修正 |
+| --- | --- | --- |
+| `make hobbyos elf` が "No rule to make target 'hobbyos'" で失敗 | `help` が案内する `hobbyos` ゴールが未定義（`hobby` のみ定義されていた） | `hobbyos:` を別名ターゲットとして追加し `.PHONY` に登録（HobbyOS ELF の選択は従来どおり `elf` 側がゴールから判定） |
+| `make tcc elf hobby c99` が "ROOT: parameter not set" で失敗 | `tests/build_tcc_elf_alpha06.sh` が `$(MAKE) hobbyos-elf` を実行しており、Make変数が展開されず `MAKE` をコマンドとして起動していた | `${MAKE:-make}` と `$(dirname "$0")/..` で自己完結化し、TinyCC の `-nostdlib` リンク失敗時に GCC リンカスクリプト経路へ正しくフォールバック |
+
+修正後の実測: `make hobbyos elf` → `hobbyos_elf_ok: build/hobbyos/python-code-to-c-hobbyos.elf`、
+`make tcc elf hobby c99` → `hobbyos_elf_ok: build/hobbyos-tcc/python-code-to-c-hobbyos.elf`（どちらも rc=0）。
+`make run INPUT=...` と `make freestanding` も実引数で成功を確認しています。

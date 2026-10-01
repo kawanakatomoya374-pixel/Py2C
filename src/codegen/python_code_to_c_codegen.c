@@ -838,8 +838,10 @@ static void gen_expr(P2C_CodeGen *cg, P2C_AstExpr *expr) {
                 break;
             }
             /* Ellipsis はビルトインの単一値。Cの識別子ではないため、
-             * 名前置換が起きる前にシングルトンへ解決する。 */
-            if (strcmp(n->u.name.name, "Ellipsis") == 0) {
+             * 名前置換が起きる前にシングルトンへ解決する。
+             * 合成ノード（--fallback 等）では name が NULL になり得るので、
+             * 非NULLを確認してから比較する（clang静的解析の指摘）。 */
+            if (n->u.name.name && strcmp(n->u.name.name, "Ellipsis") == 0) {
                 write_str(cg, "&P2C_Ellipsis");
             } else if (map_has_name(cg->closure_env_names, n->u.name.name) && !map_has_name(cg->declared_vars, n->u.name.name) && cg->closure_env_var) {
                 write_str(cg, "p2c_cell_get(p2c_dict_get("); write_str(cg, cg->closure_env_var); write_str(cg, ", p2c_obj_from_str(\""); write_str(cg, n->u.name.name); write_str(cg, "\")))");
@@ -2468,7 +2470,11 @@ enum {
     CG_METHOD_INSTANCE = 0,
     CG_METHOD_STATIC = 1,
     CG_METHOD_CLASS = 2,
-    CG_METHOD_PROPERTY = 3
+    CG_METHOD_PROPERTY = 3,
+    /* @x.setter: プロパティ x へ代入されたときに呼ばれる setter。
+     * メソッド表には同じ名前で PROPERTY の行（ゲッター）と別に行を持ち、
+     * ランタイムは種別で区別する（名前引きはゲッターを優先）。 */
+    CG_METHOD_PROPERTY_SETTER = 4
 };
 
 /* クラス本体内のメソッド定義に付いたデコレータから、メソッド種別を求める。
@@ -2481,10 +2487,21 @@ static int class_method_kind(P2C_AstFunctionDef *fd) {
     if (!fd || !fd->decorator_list) return CG_METHOD_INSTANCE;
     for (size_t i = 0; i < p2c_vec_len(fd->decorator_list); i++) {
         P2C_AstExpr *dec = (P2C_AstExpr*)p2c_vec_get(fd->decorator_list, i);
-        if (!dec || dec->base.type != AST_NAME) continue;
-        if (strcmp(dec->base.u.name.name, "staticmethod") == 0) return CG_METHOD_STATIC;
-        if (strcmp(dec->base.u.name.name, "classmethod") == 0) return CG_METHOD_CLASS;
-        if (strcmp(dec->base.u.name.name, "property") == 0) return CG_METHOD_PROPERTY;
+        if (!dec) continue;
+        if (dec->base.type == AST_NAME) {
+            const char *dn = dec->base.u.name.name;
+            if (!dn) continue;
+            if (strcmp(dn, "staticmethod") == 0) return CG_METHOD_STATIC;
+            if (strcmp(dn, "classmethod") == 0) return CG_METHOD_CLASS;
+            if (strcmp(dn, "property") == 0) return CG_METHOD_PROPERTY;
+            continue;
+        }
+        /* @x.setter / @x.deleter の形（属性アクセスをデコレータに使う）。
+         * setter のみ対応し、deleter は意味解析側で診断する。 */
+        if (dec->base.type == AST_ATTRIBUTE && dec->base.u.attribute.attr &&
+            strcmp(dec->base.u.attribute.attr, "setter") == 0) {
+            return CG_METHOD_PROPERTY_SETTER;
+        }
     }
     return CG_METHOD_INSTANCE;
 }
@@ -2495,8 +2512,53 @@ static const char* class_method_kind_constant(int kind) {
         case CG_METHOD_STATIC: return "P2C_METHOD_STATIC";
         case CG_METHOD_CLASS: return "P2C_METHOD_CLASS";
         case CG_METHOD_PROPERTY: return "P2C_METHOD_PROPERTY";
+        case CG_METHOD_PROPERTY_SETTER: return "P2C_METHOD_PROPERTY_SETTER";
         default: return "P2C_METHOD_INSTANCE";
     }
+}
+
+/* @x.setter のメソッドはゲッターと同じ Python 名を持つため、そのままでは C の
+ * シンボル（関数・アダプタ）が衝突して生成Cがコンパイルできない。クラス本体の
+ * 生成前に "<name>__setter" へ改名し、メソッド表の「名前」列だけ元の Python 名
+ * （＝プロパティ名）へ戻す。 */
+#define P2C_SETTER_C_SUFFIX "__setter"
+
+static void rename_class_setters(P2C_CodeGen *cg, P2C_AstClassDef *cd) {
+    for (size_t i = 0; i < p2c_vec_len(cd->body); i++) {
+        P2C_AstStmt *m = (P2C_AstStmt*)p2c_vec_get(cd->body, i);
+        if (!m || m->base.type != AST_FUNCTIONDEF) continue;
+        if (class_method_kind(&m->base.u.functiondef) != CG_METHOD_PROPERTY_SETTER) continue;
+        {
+            /* snprintf だと -Wformat-truncation が「切れる可能性」を指摘するため、
+             * 長さを確定させて memcpy で組み立てる（他の箇所と同じ方針）。 */
+            const char *base = m->base.u.functiondef.name;
+            size_t base_len = strlen(base);
+            size_t suffix_len = sizeof(P2C_SETTER_C_SUFFIX) - 1u;
+            char *renamed = (char*)p2c_alloc(cg->alloc, base_len + suffix_len + 1u);
+            if (!renamed) continue;
+            memcpy(renamed, base, base_len);
+            memcpy(renamed + base_len, P2C_SETTER_C_SUFFIX, suffix_len + 1u);
+            m->base.u.functiondef.name = renamed;
+        }
+    }
+}
+
+/* メソッド表の「名前」列を出力する。setter は C 名の接尾辞を落として
+ * プロパティ名（＝ゲッターと同じ名前）に戻す。 */
+static void emit_method_row_name(P2C_CodeGen *cg, const char *c_name, int kind) {
+    if (kind == CG_METHOD_PROPERTY_SETTER && c_name) {
+        size_t len = strlen(c_name);
+        size_t suffix = sizeof(P2C_SETTER_C_SUFFIX) - 1u;
+        char buf[256];
+        size_t copy;
+        if (len > suffix) len -= suffix;
+        copy = len < sizeof(buf) - 1u ? len : sizeof(buf) - 1u;
+        memcpy(buf, c_name, copy);
+        buf[copy] = '\0';
+        write_str(cg, buf);
+        return;
+    }
+    if (c_name) write_str(cg, c_name);
 }
 
 static bool class_method_requires_suspension(P2C_AstFunctionDef *fd) {
@@ -3575,6 +3637,9 @@ static void gen_stmt(P2C_CodeGen *cg, P2C_AstStmt *stmt) {
             cg->active_loop_id = loop_id;
             indent(cg); write_str(cg, "{"); write_newline(cg); push_indent(cg);
             if (has_loop_else) { indent(cg); write_str(cg, "int _p2c_loop_broken_"); emit_usize(cg, (size_t)loop_id); write_str(cg, " = 0;"); write_newline(cg); }
+            /* ループ後退エッジ。サンドボックスのステップ予算を消費する
+             * （未設定なら runtime 側で即 return）。 */
+            indent(cg); write_str(cg, "p2c_sandbox_tick();"); write_newline(cg);
             indent(cg); write_str(cg, "while (p2c_obj_is_truthy("); gen_expr(cg, n->u.while_stmt.test); write_str(cg, ")) {"); write_newline(cg); push_indent(cg);
             cg->loop_depth++;
             gen_stmt_list(cg, n->u.while_stmt.body);
@@ -3828,6 +3893,8 @@ static void gen_stmt(P2C_CodeGen *cg, P2C_AstStmt *stmt) {
              * current_class/current_class_baseを設定する。 */
             const char *saved_current_class = cg->current_class;
             cg->current_class = cname;
+            /* setter の C シンボル衝突を避けるため、生成前に改名する。 */
+            rename_class_setters(cg, &n->u.classdef);
             p2c_str_append_fmt(cg->forward, "static P2C_Object *%s = NULL;\n", cname);
             p2c_str_append_fmt(cg->forward, "static P2C_Object* %s__ctor(P2C_Object **args, size_t nargs);\n", cname);
             p2c_str_append_fmt(cg->forward, "static P2C_Object* %s__classobj(void);\n", cname);
@@ -4084,7 +4151,7 @@ static void gen_stmt(P2C_CodeGen *cg, P2C_AstStmt *stmt) {
             for (size_t i = 0; i < p2c_vec_len(n->u.classdef.body); i++) {
                 P2C_AstStmt *member = (P2C_AstStmt*)p2c_vec_get(n->u.classdef.body, i);
                 if (member->base.type == AST_FUNCTIONDEF) {
-                    indent(cg); write_str(cg, "{\""); write_str(cg, member->base.u.functiondef.name); write_str(cg, "\", "); write_str(cg, cname); write_str(cg, "__"); write_str(cg, member->base.u.functiondef.name); write_str(cg, "__adapter, "); write_str(cg, cname); write_str(cg, "__"); write_str(cg, member->base.u.functiondef.name); write_str(cg, "__kwadapter, "); write_str(cg, class_method_kind_constant(class_method_kind(&member->base.u.functiondef))); write_str(cg, "},"); write_newline(cg);
+                    indent(cg); write_str(cg, "{\""); emit_method_row_name(cg, member->base.u.functiondef.name, class_method_kind(&member->base.u.functiondef)); write_str(cg, "\", "); write_str(cg, cname); write_str(cg, "__"); write_str(cg, member->base.u.functiondef.name); write_str(cg, "__adapter, "); write_str(cg, cname); write_str(cg, "__"); write_str(cg, member->base.u.functiondef.name); write_str(cg, "__kwadapter, "); write_str(cg, class_method_kind_constant(class_method_kind(&member->base.u.functiondef))); write_str(cg, "},"); write_newline(cg);
                 }
             }
             write_line(cg, "{NULL, NULL, NULL, P2C_METHOD_INSTANCE}"); pop_indent(cg); write_line(cg, "};");

@@ -74,6 +74,9 @@ P2C_Lexer* p2c_lexer_new(P2C_Allocator *a, const char *source, size_t len) {
     if (!lex) return NULL;
 
     lex->alloc = a;
+    /* 引退トークンのリスト（要素の解放は p2c_lexer_free が alloc 付きで行う）。 */
+    lex->retired_tokens = p2c_vec_new(a, NULL);
+    if (!lex->retired_tokens) { p2c_free(a, lex); return NULL; }
     /* 改行コードの正規化（universal newlines）。
      * Pythonのソースは CRLF / CR / LF のいずれでも同じ意味を持つと規定されて
      * いる。以前は '\r' を改行として扱っていなかったため、Windowsで保存した
@@ -126,6 +129,17 @@ P2C_Lexer* p2c_lexer_new(P2C_Allocator *a, const char *source, size_t len) {
     return lex;
 }
 
+/* トークンを解放せず引退リストへ移す（lexer破棄時に一括解放）。
+ * 引退リストが無い場合（確保失敗）は従来どおり即時解放する。 */
+static void lexer_retire(P2C_Lexer *lex, P2C_Token *tok) {
+    if (!tok) return;
+    if (lex->retired_tokens) {
+        p2c_vec_push(lex->retired_tokens, tok);
+        return;
+    }
+    p2c_token_free(tok, lex->alloc);
+}
+
 void p2c_lexer_free(P2C_Lexer *lex) {
     if (!lex) return;
     /* インデントスタックの数値を解放 */
@@ -136,6 +150,14 @@ void p2c_lexer_free(P2C_Lexer *lex) {
     if (lex->current) p2c_token_free(lex->current, lex->alloc);
     if (lex->peek) p2c_token_free(lex->peek, lex->alloc);
     if (lex->peek2) p2c_token_free(lex->peek2, lex->alloc);
+    if (lex->retired_tokens) {
+        /* トークンの解放には alloc が要るため、要素解放関数ではなく明示ループで行う。 */
+        for (size_t i = 0; i < p2c_vec_len(lex->retired_tokens); i++) {
+            p2c_token_free((P2C_Token*)p2c_vec_get(lex->retired_tokens, i), lex->alloc);
+        }
+        p2c_vec_free(lex->retired_tokens);
+        lex->retired_tokens = NULL;
+    }
     /* 改行正規化のために内部で複製したソースだけを解放する。 */
     if (lex->owned_source) p2c_free(lex->alloc, lex->owned_source);
     p2c_free(lex->alloc, lex);
@@ -835,7 +857,7 @@ P2C_Token* p2c_lexer_next(P2C_Lexer *lex) {
     
     /* 先行トークンがあればそれを返す */
     if (lex->has_peek) {
-        if (lex->current) p2c_token_free(lex->current, lex->alloc);
+        lexer_retire(lex, lex->current);
         lex->has_peek = false;
         P2C_Token *tok = lex->peek;
         lex->peek = NULL;
@@ -850,9 +872,7 @@ P2C_Token* p2c_lexer_next(P2C_Lexer *lex) {
         return tok;
     }
     
-    if (lex->current) {
-        p2c_token_free(lex->current, lex->alloc);
-    }
+    lexer_retire(lex, lex->current);
     lex->current = lexer_next_impl(lex);
     return lex->current;
 }

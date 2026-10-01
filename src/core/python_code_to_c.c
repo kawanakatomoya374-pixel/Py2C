@@ -203,6 +203,8 @@ const char* p2c_supported_range_string(void) {
             "    多重継承 (class D(B, C)): Pythonと同じC3線形化でMROを求め、ダイヤモンド継承でも基底メソッドの選択がCPythonと一致する。\n"
             "      基底クラスのクラス属性はサブクラスのインスタンスからも見える（MRO順に探索）。\n"
             "    束縛メソッド: m = obj.method でメソッドを取り出し、コールバック（sorted(key=...)、map()等）へ渡せる。\n"
+            "    @property の setter: @x.setter でプロパティへ代入されたときの処理を定義できる。\n"
+            "      setterが無いプロパティへの代入はAttributeError（Python同様）。\n"
             "    メソッドデコレータ: @staticmethod（selfを渡さない）、@classmethod（先頭にクラスオブジェクト）、\n"
             "      @property（属性読み出しでゲッター実行・インスタンス属性より優先・setter無しの代入はAttributeError）。\n"
             "      プロパティはMRO順に継承・オーバーライドされ、hasattr()も真になる。\n"

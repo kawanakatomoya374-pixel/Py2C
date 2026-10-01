@@ -578,10 +578,20 @@ static P2C_Result visit_stmt(P2C_Semantic *sem, P2C_AstStmt *stmt) {
                     for (size_t di = 0; di < p2c_vec_len(n->u.functiondef.decorator_list); di++) {
                         P2C_AstExpr *dec = (P2C_AstExpr*)p2c_vec_get(n->u.functiondef.decorator_list, di);
                         const char *dn = (dec && dec->base.type == AST_NAME) ? dec->base.u.name.name : NULL;
+                        if (dec && dec->base.type == AST_ATTRIBUTE && dec->base.u.attribute.attr &&
+                            strcmp(dec->base.u.attribute.attr, "setter") == 0) {
+                            /* @x.setter（プロパティ x の setter）は対応済み。 */
+                            continue;
+                        }
+                        if (dec && dec->base.type == AST_ATTRIBUTE && dec->base.u.attribute.attr &&
+                            strcmp(dec->base.u.attribute.attr, "deleter") == 0) {
+                            set_sem_error(sem, "@x.deleter is not supported yet (only @property and @x.setter)", n->line, n->col);
+                            return P2C_ERR_SEMANTIC;
+                        }
                         if (!dn || (strcmp(dn, "staticmethod") != 0 &&
                                     strcmp(dn, "classmethod") != 0 &&
                                     strcmp(dn, "property") != 0)) {
-                            set_sem_error(sem, "only @staticmethod, @classmethod, and @property are supported as method decorators", n->line, n->col);
+                            set_sem_error(sem, "only @staticmethod, @classmethod, @property, and @x.setter are supported as method decorators", n->line, n->col);
                             return P2C_ERR_SEMANTIC;
                         }
                     }

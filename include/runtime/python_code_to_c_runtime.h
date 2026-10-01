@@ -77,7 +77,10 @@ enum {
     P2C_METHOD_INSTANCE = 0,
     P2C_METHOD_STATIC = 1,
     P2C_METHOD_CLASS = 2,
-    P2C_METHOD_PROPERTY = 3
+    P2C_METHOD_PROPERTY = 3,
+    /* @x.setter（プロパティ x の setter）。名前はゲッターと同じで、
+     * 種別で区別する（名前引きはゲッターを優先する）。 */
+    P2C_METHOD_PROPERTY_SETTER = 4
 };
 
 typedef struct P2C_MethodDef {
@@ -209,6 +212,8 @@ P2C_Object* p2c_obj_mul(P2C_Object *a, P2C_Object *b);
 P2C_Object* p2c_obj_div(P2C_Object *a, P2C_Object *b);
 P2C_Object* p2c_obj_floordiv(P2C_Object *a, P2C_Object *b);
 P2C_Object* p2c_obj_mod(P2C_Object *a, P2C_Object *b);
+/* Python の str % 書式（"%s(%.2f)" % (name, x)）。p2c_obj_mod から呼ばれる。 */
+P2C_Object* p2c_percent_format(const char *fmt, P2C_Object *rhs);
 P2C_Object* p2c_obj_pow(P2C_Object *a, P2C_Object *b);
 P2C_Object* p2c_obj_lshift(P2C_Object *a, P2C_Object *b);
 P2C_Object* p2c_obj_rshift(P2C_Object *a, P2C_Object *b);
@@ -434,6 +439,26 @@ size_t p2c_gc_root_count(void);
  * 実際に実行されたときだけ NotImplementedError になり、到達しなければ
  * プログラムはそのまま動く（＝未対応構文を含んでいてもビルドは通る）。
  * where は "line 12" のような位置、what は "expression" 等の種別。 */
+/* ── サンドボックス（安全な実行上限） ─────────────────────────────
+ * 組込み（HobbyOS等）で「信頼できないPython」を走らせるときに、暴走を
+ * 例外として止めるための予算。0 は「無制限」。
+ *   max_ticks : ループ後退エッジの実行回数（while/for の各反復）
+ *   max_allocs: ランタイムが確保したオブジェクト数の上限
+ * 予算超過時は SandboxError を送出する（クラッシュやハングにしない）。
+ * 期限（ミリ秒）で止めたいカーネルは p2c_sandbox_ticks() を見て
+ * 自分のタイマと組み合わせることもできる。 */
+typedef struct {
+    uint64_t max_ticks;
+    uint64_t max_allocs;
+} P2C_SandboxLimits;
+
+void p2c_sandbox_set(const P2C_SandboxLimits *limits);
+void p2c_sandbox_reset(void);
+void p2c_sandbox_tick(void);           /* ループ後退エッジで呼ばれる */
+uint64_t p2c_sandbox_ticks(void);      /* 消費したステップ数 */
+uint64_t p2c_sandbox_allocs(void);     /* 消費した確保数 */
+uint64_t p2c_sandbox_violations(void); /* 予算超過で例外を出した回数 */
+
 P2C_Object* p2c_fallback_expr(const char *where, const char *what);
 void p2c_fallback_stmt(const char *where, const char *what);
 size_t p2c_gc_root_capacity(void);
