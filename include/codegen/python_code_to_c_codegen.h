@@ -39,6 +39,9 @@ struct P2C_CodeGen {
     P2C_SymbolTable *symtab;
     P2C_String *header;
     P2C_String *forward;
+    /* forward 書き込み中（関数本体や外側ラムダの生成中）に現れたラムダ等の定義を
+     * 退避しておく待ち行列。最終組み立てで forward の末尾へ連結する。 */
+    P2C_Vector *deferred_defs;
     P2C_String *body;
     P2C_String *toplevel;
     P2C_String *current;

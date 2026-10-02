@@ -48,7 +48,7 @@ LeakSanitizerで過去に確認された短命なCLIコンパイラ側の部分�
 | 区分 | 結果 |
 | --- | --- |
 | ビルド | all / gui / single-header / freestanding / c99 / tcc すべて成功 |
-| 差分・回帰 | test（661 s・0エラー）/ test-c99（576件一致）/ test-tcc（576件一致）/ test-fallback / test-sandbox ほか |
+| 差分・回帰 | test（661 s・0エラー）/ test-c99（749件一致）/ test-tcc（749件一致）/ test-fallback / test-sandbox ほか |
 | 組込み | test-embed-runtime / test-embed-compile / test-embed-generated / test-baremetal-* / test-gc-* / test-stack-usage |
 | 解析 | test-analyzer（263 s・欠陥0）/ test-analyzer-clang（106 s・欠陥0）/ test-sanitizers / test-sanitizers-core |
 | ELF | elf / hobbyos-elf / tcc elf c99 すべて成功 |
@@ -63,3 +63,21 @@ LeakSanitizerで過去に確認された短命なCLIコンパイラ側の部分�
 修正後の実測: `make hobbyos elf` → `hobbyos_elf_ok: build/hobbyos/python-code-to-c-hobbyos.elf`、
 `make tcc elf hobby c99` → `hobbyos_elf_ok: build/hobbyos-tcc/python-code-to-c-hobbyos.elf`（どちらも rc=0）。
 `make run INPUT=...` と `make freestanding` も実引数で成功を確認しています。
+
+### 追加修正（クラス名の隠蔽順序）
+
+フィクスチャを変換・ビルドして CPython と差分比較する補助 `tests/quick_diff_alpha06.sh` を追加し、
+実践的な複合プログラム（`tests/complex_program_alpha06.py`）を回帰へ加えたところ、
+**3段継承で `super().__init__(a, b)` が基底の `__init__` を呼ばず、祖先のメソッドが
+`AttributeError` になる**不具合を検出しました。
+
+- 原因: クラス名レジストリの名前引き（`p2c_find_class_by_name` / `p2c_find_class_by_span`）が
+  **先に登録された**クラスを返していました。起動時にモジュール側のクラス
+  （pygame の `Rect`/`Surface`/`Sprite`/`Group`/`Clock`）が登録されるため、ユーザーの
+  `class Rect(Shape)` ではなく pygame の `Rect`（基底なし・無言の `__init__`）が継承元として
+  解決され、`p2c_class_mro(Square)` が `[Rect]` で打ち切られ、`Shape` 由来の `describe` が
+  未解決になっていました（`super()` の探索も同名の別クラスへ向かっていました）。
+- 修正: 名前引きを**後から登録された定義優先**（逆順探索）に変更。ユーザー定義クラスが
+  ランタイム／モジュール側の同名クラスを隠します（Python の「後から定義した名前が勝つ」と同義）。
+- 回帰: `C577–C588`（複合プログラム）と `C589–C593`（隠蔽規則と3段継承の `super()`）を追加し、
+  合計 **749** アサーションになりました。

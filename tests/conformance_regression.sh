@@ -121,4 +121,19 @@ run_differential_case C529-C538 tests/method_decorators_alpha06.py 10
 run_differential_case C539-C549 tests/math_module_alpha06.py 11
 run_differential_case C550-C555 tests/property_setter_alpha06.py 6
 run_differential_case C556-C576 tests/percent_format_alpha06.py 21
-printf '%s\n' 'conformance_regression_ok: 576 semantic assertions passed'
+run_differential_case C577-C588 tests/complex_program_alpha06.py 12
+run_differential_case C589-C593 tests/repro_super3_alpha06.py 5
+run_differential_case C594-C615 tests/strict_convert_alpha06.py 22
+run_differential_case C616-C647 tests/unicode_codepoint_alpha06.py 32
+run_differential_case C648-C657 tests/dict_set_resize_alpha06.py 10
+run_differential_case C658-C667 tests/range_lazy_alpha06.py 23
+run_differential_case C668-C681 tests/range_slice_hash_alpha06.py 14
+run_differential_case C682-C691 tests/slice_assign_alpha06.py 10
+run_differential_case C692-C702 tests/unicode_width_alpha06.py 11
+run_differential_case C703-C712 tests/number_literals_alpha06.py 10
+run_differential_case C713-C722 tests/format_spec_alpha06.py 10
+run_differential_case C723-C732 tests/semicolon_block_alpha06.py 13
+run_differential_case C733-C740 tests/rsplit_alpha06.py 8
+run_differential_case C741-C746 tests/format_kw_alpha06.py 6
+run_differential_case C747-C749 tests/key_builtin_alpha06.py 3
+printf '%s\n' 'conformance_regression_ok: 749 semantic assertions passed'

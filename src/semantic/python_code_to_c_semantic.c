@@ -272,6 +272,12 @@ static P2C_Result visit_expr(P2C_Semantic *sem, P2C_AstExpr *expr, P2C_Type **ou
                         strlen(P2C_UNSUPPORTED_NAME_PREFIX)) == 0) {
                 break;
             }
+            /* パーサが a[b:c] を展開する際に作る p2c_obj_slice() も変数では
+             * ないため名前解決の対象外にする（以前は代入の右辺にスライスを
+             * 書くと 'undefined name' で失敗していた）。 */
+            if (n->u.name.name && strcmp(n->u.name.name, "p2c_obj_slice") == 0) {
+                break;
+            }
             P2C_Symbol *sym = p2c_symtab_lookup(sem->symtab, n->u.name.name);
             if (!sym) {
                 char buf[256];

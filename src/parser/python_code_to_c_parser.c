@@ -422,6 +422,57 @@ static P2C_AstExpr* parse_adjacent_string_literals(P2C_Parser *p, P2C_AstExpr *f
     return result;
 }
 
+/* 数値リテラルの表記を「C として妥当な形」へ正規化する。
+ * codegen は p2c_obj_from_int(<text>) / p2c_obj_from_float(<text>) を出力する
+ * ため、text はそのまま C の数値でなければならない。
+ *   - '_' 区切りは除去する（1_000 -> 1000。C11 の数値に '_' は書けない）
+ *   - 0x/0o/0b は 10 進へ（0x1f -> 31）
+ *   - int64 に収まらない基数つきリテラルはエラー（CPython は多倍長だが
+ *     この処理系は int64 のみ。黙って別の値になるより明示的に失敗させる）
+ * 成功時は p2c_alloc 済みの文字列を返す。失敗時は *ok=false を設定する。 */
+static char* normalize_number_text(P2C_Parser *p, const char *text, size_t len, bool *ok) {
+    char tmp[160];
+    size_t n = 0;
+    *ok = true;
+    for (size_t i = 0; i < len && n + 1u < sizeof(tmp); i++) {
+        if (text[i] != '_') tmp[n++] = text[i];
+    }
+    tmp[n] = '\0';
+    char *out = p2c_alloc(p->alloc, n + 32u > 32u ? n + 32u : 32u);
+    if (!out) { *ok = false; return NULL; }
+    int base = 10;
+    const char *digits = tmp;
+    if (n > 2u && tmp[0] == '0' && (tmp[1] == 'x' || tmp[1] == 'X')) { base = 16; digits = tmp + 2; }
+    else if (n > 2u && tmp[0] == '0' && (tmp[1] == 'o' || tmp[1] == 'O')) { base = 8; digits = tmp + 2; }
+    else if (n > 2u && tmp[0] == '0' && (tmp[1] == 'b' || tmp[1] == 'B')) { base = 2; digits = tmp + 2; }
+    if (base == 10) {
+        memcpy(out, tmp, n + 1u);
+        return out;
+    }
+    uint64_t value = 0;
+    for (const char *q = digits; *q; q++) {
+        int d;
+        if (*q >= '0' && *q <= '9') d = *q - '0';
+        else if (*q >= 'a' && *q <= 'f') d = *q - 'a' + 10;
+        else if (*q >= 'A' && *q <= 'F') d = *q - 'A' + 10;
+        else { set_error(p, "invalid digit in integer literal"); *ok = false; return NULL; }
+        if (d >= base) { set_error(p, "invalid digit in integer literal"); *ok = false; return NULL; }
+        if (value > (UINT64_MAX - (uint64_t)d) / (uint64_t)base) {
+            set_error(p, "integer literal too large for this runtime (int64)");
+            *ok = false;
+            return NULL;
+        }
+        value = value * (uint64_t)base + (uint64_t)d;
+    }
+    if (value > (uint64_t)INT64_MAX) {
+        set_error(p, "integer literal too large for this runtime (int64)");
+        *ok = false;
+        return NULL;
+    }
+    snprintf(out, n + 32u, "%llu", (unsigned long long)value);
+    return out;
+}
+
 static P2C_AstExpr* parse_atom(P2C_Parser *p, P2C_Result *err) {
     P2C_Token *tok = CURRENT(p);
     if (!tok || !tok->text) { if (err) *err = P2C_ERR_SYNTAX; return NULL; }
@@ -435,13 +486,17 @@ static P2C_AstExpr* parse_atom(P2C_Parser *p, P2C_Result *err) {
             NEXT(p);
             return p2c_ast_name(p->alloc, name, line, col);
         }
+
         case TOK_INT_LITERAL:
         case TOK_FLOAT_LITERAL: {
+            /* '_' 除去と 0x/0o/0b の 10 進化（C として妥当な表記にする）。 */
+            bool num_ok = true;
+            char *norm = normalize_number_text(p, tok->text, tok->len, &num_ok);
+            if (!num_ok) return NULL;
             P2C_AstExpr *e = p2c_ast_expr_new(p->alloc, AST_CONST, line, col);
             if (e) {
                 e->base.u.constant.token_type = tok->type;
-                e->base.u.constant.value = p2c_alloc(p->alloc, tok->len + 1);
-                if (e->base.u.constant.value) memcpy(e->base.u.constant.value, tok->text, tok->len + 1);
+                e->base.u.constant.value = norm;
             }
             NEXT(p);
             return e;

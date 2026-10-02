@@ -147,6 +147,7 @@ P2C_CodeGen* p2c_codegen_new(P2C_Allocator *a, P2C_CodeGenOptions *opts, P2C_Sym
     cg->symtab = symtab;
     cg->header = p2c_str_new(a);
     cg->forward = p2c_str_new(a);
+    cg->deferred_defs = NULL;
     cg->body = p2c_str_new(a);
     cg->toplevel = p2c_str_new(a);
     cg->current = cg->body;
@@ -229,6 +230,14 @@ void p2c_codegen_free(P2C_CodeGen *cg) {
     if (!cg) return;
     p2c_str_free(cg->header);
     p2c_str_free(cg->forward);
+    if (cg->deferred_defs) {
+        for (size_t _i = 0; _i < p2c_vec_len(cg->deferred_defs); _i++) {
+            P2C_String *_d = (P2C_String*)p2c_vec_get(cg->deferred_defs, _i);
+            if (_d) p2c_str_free(_d);
+        }
+        p2c_vec_free(cg->deferred_defs);
+        cg->deferred_defs = NULL;
+    }
     p2c_str_free(cg->body);
     p2c_str_free(cg->toplevel);
     free_name_map(cg->declared_vars);
@@ -849,6 +858,16 @@ static void gen_expr(P2C_CodeGen *cg, P2C_AstExpr *expr) {
                 write_str(cg, "p2c_cell_get(_p2c_cell_"); write_ident(cg, n->u.name.name); write_str(cg, ")");
             } else if (map_has_name(cg->decorated_names, n->u.name.name)) {
                 write_str(cg, "_p2c_decorated_"); write_ident(cg, n->u.name.name);
+            } else if (n->u.name.name && is_builtin_callable_name(n->u.name.name) &&
+                       !map_has_name(cg->closure_env_names, n->u.name.name) &&
+                       !map_has_name(cg->cell_names, n->u.name.name)) {
+                /* 組込み関数を「値」として使う場合（sorted(a, key=len) など）は、
+                 * 実行時に呼び出し可能オブジェクトへ解決する。以前は生の識別子
+                 * len を出力していたため生成 C がコンパイルできなかった。
+                 * 未対応の名前は NotImplementedError として明示的に失敗する。 */
+                write_str(cg, "p2c_builtin_ref_checked(\"");
+                write_str(cg, n->u.name.name);
+                write_str(cg, "\")");
             } else {
                 const char *nested_alias = nested_class_alias(cg, n->u.name.name);
                 if (nested_alias) {
@@ -1084,6 +1103,13 @@ static void gen_expr(P2C_CodeGen *cg, P2C_AstExpr *expr) {
                     write_str(cg, "p2c_obj_str(");
                     if (argc) gen_expr(cg, (P2C_AstExpr*)p2c_vec_get(n->u.call.args, 0)); else write_str(cg, "&P2C_None");
                     write_str(cg, ")");
+                } else if (strcmp(name, "int") == 0 && argc >= 2) {
+                    /* int(x, base): 基数付き変換（CPython 準拠）。 */
+                    write_str(cg, "p2c_builtin_int_from_base(");
+                    gen_expr(cg, (P2C_AstExpr*)p2c_vec_get(n->u.call.args, 0));
+                    write_str(cg, ", ");
+                    gen_expr(cg, (P2C_AstExpr*)p2c_vec_get(n->u.call.args, 1));
+                    write_str(cg, ")");
                 } else if (strcmp(name, "int") == 0) {
                     write_str(cg, "p2c_obj_from_int(p2c_obj_as_int(");
                     if (argc) gen_expr(cg, (P2C_AstExpr*)p2c_vec_get(n->u.call.args, 0)); else write_str(cg, "p2c_obj_from_int(0)");
@@ -1151,6 +1177,12 @@ static void gen_expr(P2C_CodeGen *cg, P2C_AstExpr *expr) {
                     gen_expr(cg, (P2C_AstExpr*)p2c_vec_get(n->u.call.args, 0)); write_str(cg, ", ");
                     gen_expr(cg, (P2C_AstExpr*)p2c_vec_get(n->u.call.args, 1)); write_str(cg, ", ");
                     gen_expr(cg, (P2C_AstExpr*)p2c_vec_get(n->u.call.args, 2)); write_str(cg, ")");
+                } else if (strcmp(name, "pow") == 0 && argc == 2 && nkw == 0) {
+                    /* 2引数のpow(a, b) は ** と同じ p2c_obj_pow へ落とす。
+                     * （未対応だと存在しない p2c_user_pow を呼んでコンパイルに失敗していた） */
+                    write_str(cg, "p2c_obj_pow(");
+                    gen_expr(cg, (P2C_AstExpr*)p2c_vec_get(n->u.call.args, 0)); write_str(cg, ", ");
+                    gen_expr(cg, (P2C_AstExpr*)p2c_vec_get(n->u.call.args, 1)); write_str(cg, ")");
                 } else if (strcmp(name, "format") == 0 && argc == 2 && nkw == 0) {
                     write_str(cg, "p2c_builtin_format(");
                     gen_expr(cg, (P2C_AstExpr*)p2c_vec_get(n->u.call.args, 0)); write_str(cg, ", ");
@@ -1722,8 +1754,20 @@ static void gen_expr(P2C_CodeGen *cg, P2C_AstExpr *expr) {
             int id = ++cg->lambda_counter;
             P2C_Vector *largs = n->u.lambda.args;
             snprintf(entry_name, sizeof(entry_name), "_p2c_lambda_entry_%d", id);
+            /* ネストしたラムダの定義は forward の末尾（待ち行列の連結時）に現れるため、
+             * 先に使っても解決できるよう前方宣言を header へ置く。 */
+            p2c_str_append(cg->header, "static P2C_Object *");
+            p2c_str_append(cg->header, entry_name);
+            p2c_str_append(cg->header, "(P2C_Object *env, P2C_Object **args, size_t nargs);\n");
             if (captures) for (size_t i = 0; i < captures->bucket_count; i++) for (P2C_MapEntry *entry = captures->buckets[i]; entry; entry = entry->next) capture_count++;
-            cg->current = cg->forward;
+            /* forward へ書き込み中に現れたラムダ定義を forward へ直接書くと、
+             * 生成中の外側の定義に割り込んで壊れたCになる。
+             * その場合は別バッファへ書き、最終組み立てで forward の末尾へ連結する。 */
+            const bool nested_def = (cg->current != cg->toplevel && cg->current != cg->body &&
+                                     cg->current != cg->header);
+            P2C_String *def_buf = nested_def ? p2c_str_new(cg->alloc) : cg->forward;
+            if (!def_buf) def_buf = cg->forward;
+            cg->current = def_buf;
             cg->indent_level = 0;
             write_str(cg, "static P2C_Object *"); write_str(cg, entry_name); write_str(cg, "(P2C_Object *env, P2C_Object **args, size_t nargs) {"); write_newline(cg); push_indent(cg);
             indent(cg); write_str(cg, "(void)env; (void)args; (void)nargs;"); write_newline(cg);
@@ -1743,6 +1787,10 @@ static void gen_expr(P2C_CodeGen *cg, P2C_AstExpr *expr) {
             pop_indent(cg); write_line(cg, "}"); write_newline(cg);
             cg->current = saved_current;
             cg->indent_level = saved_indent;
+            if (nested_def) {
+                if (!cg->deferred_defs) cg->deferred_defs = p2c_vec_new(cg->alloc, NULL);
+                if (cg->deferred_defs) (void)p2c_vec_push(cg->deferred_defs, def_buf);
+            }
             write_str(cg, "p2c_closure_new(\"<lambda>\", "); write_str(cg, entry_name); write_str(cg, ", ");
             if (capture_count == 0) {
                 write_str(cg, "p2c_dict_from_pairs(NULL, NULL, 0)");
@@ -4497,6 +4545,14 @@ P2C_Result p2c_codegen_generate(P2C_CodeGen *cg, P2C_AstModule *mod, char **out_
     cg->indent_level = 0;
     p2c_str_append(cg->body, "}\n");
 
+    /* 退避していたネスト定義（ラムダ等）を forward の末尾へ流し込む。
+     * いずれもファイルスコープの定義なので、本体より前にあれば順序は問わない。 */
+    if (cg->deferred_defs) {
+        for (size_t _i = 0; _i < p2c_vec_len(cg->deferred_defs); _i++) {
+            P2C_String *_d = (P2C_String*)p2c_vec_get(cg->deferred_defs, _i);
+            if (_d) p2c_str_append(cg->forward, p2c_str_cstr(_d));
+        }
+    }
     size_t total_len = p2c_str_len(cg->header) + p2c_str_len(cg->forward) + p2c_str_len(cg->toplevel) + p2c_str_len(cg->body) + 1;
     char *result = p2c_alloc(cg->alloc, total_len);
     if (!result) return P2C_ERR_NOMEM;

@@ -29,7 +29,8 @@ typedef enum {
     OBJ_EXCEPTION,
     OBJ_ITERATOR,  /* iter()/next() が返す反復子オブジェクト */
     OBJ_CELL,      /* closureが共有する可変束縛セル */
-    OBJ_ELLIPSIS   /* Pythonの単一値 ... (Ellipsis)。リーフ型。 */
+    OBJ_ELLIPSIS,  /* Pythonの単一値 ... (Ellipsis)。リーフ型。 */
+    OBJ_RANGE      /* range(start, stop, step)。要素を作らない遅延オブジェクト。 */
 } P2C_ObjType;
 
 typedef struct P2C_Object P2C_Object;
@@ -107,6 +108,7 @@ struct P2C_Object {
         int64_t v_int;
         double v_float;
         struct { char *data; size_t len; } v_str;
+        struct { int64_t start; int64_t stop; int64_t step; } v_range;
         struct { P2C_Object **items; size_t len; size_t cap; } v_list;
         struct { P2C_DictEntry **buckets; P2C_DictEntry *order_head; P2C_DictEntry *order_tail; size_t bucket_count; size_t len; } v_dict;
         struct { P2C_Object **items; size_t len; } v_tuple;
@@ -304,6 +306,9 @@ P2C_Object* p2c_call_attr_kw(P2C_Object *obj, const char *name, P2C_Object **arg
 void p2c_runtime_init(void *heap_base, size_t heap_size);
 void p2c_runtime_shutdown(void);
 bool p2c_runtime_is_active(void);
+/* 現在のランタイムコンテキストに登録されているクラス数（観測用）。
+ * p2c_runtime_shutdown() で 0 に戻る（再初期化の検証に使う）。 */
+size_t p2c_runtime_class_count(void);
 void* p2c_runtime_alloc(size_t size);
 void* p2c_runtime_realloc(void *ptr, size_t old_size, size_t new_size);
 void p2c_runtime_free(void *ptr);
@@ -609,6 +614,10 @@ P2C_Object* p2c_builtin_callable(P2C_Object *obj);
 P2C_Object* p2c_builtin_sum(P2C_Object **args, size_t nargs);
 P2C_Object* p2c_builtin_ord(P2C_Object *obj);
 P2C_Object* p2c_builtin_chr(P2C_Object *obj);
+P2C_Object* p2c_builtin_int_from_base(P2C_Object *obj, P2C_Object *base_obj);
+/* 組込み関数を値として取り出す（sorted(key=len) など）。 */
+P2C_Object* p2c_builtin_ref(const char *name);
+P2C_Object* p2c_builtin_ref_checked(const char *name);
 P2C_Object* p2c_builtin_int_base(P2C_Object *obj, unsigned base, const char *prefix);
 P2C_Object* p2c_builtin_sorted(P2C_Object *iterable);
 P2C_Object* p2c_builtin_sorted_key(P2C_Object *iterable, P2C_Object *key, P2C_Object *reverse);

@@ -101,7 +101,8 @@ p2c_sandbox_set(&limits);   /* 0 は無制限。タスクごとに呼ぶ */
 
 ## 文字列の `%` 書式
 
-`"%s(%.2f)" % (name, area)` のような剰余演算子による書式化に対応しました。`%s` `%r` `%a` `%d` `%i` `%u` `%f` `%F` `%e` `%E` `%g` `%G` `%x` `%X` `%o` `%c` `%%` と、フラグ（`- + 空白 # 0`）・幅・精度・`*`（引数から取得）を扱い、右辺はタプル＝位置引数、`%(key)` を含む書式＝辞書、それ以外＝単一の値として解釈します（CPythonと同じ規則）。以前は左辺が文字列でも数値の剰余として扱われ `ZeroDivisionError` で落ちていました（回帰: `make test-conformance` の C556-C576）。
+`"%s(%.2f)" % (name, area)` のような剰余演算子による書式化に対応しました。`%s` `%r` `%a` `%d` `%i` `%u` `%f` `%F` `%e` `%E` `%g` `%G` `%x` `%X` `%o` `%c` `%%` と、フラグ（`- + 空白 # 0`）・幅・精度・`*`（引数から取得）を扱い、右辺はタプル＝位置引数、`%(key)` を含む書式＝辞書、それ以外＝単一の値として解釈します（CPythonと同じ規則）。以前は左辺が文字列でも数値の剰余として扱われ `ZeroDivisionError` で落ちていました（回帰: `make test-conformance` の C556-C576、C577-C588）。
+``make test-limits`` 固定上限の診断と -D 上書きの検証
 
 ## C99（TinyCC）ビルドとELF生成
 
@@ -109,7 +110,7 @@ p2c_sandbox_set(&limits);   /* 0 は無制限。タスクごとに呼ぶ */
 
 ```sh
 make c99             # コンパイラ本体を -std=c99 -pedantic -Wall -Wextra -Werror でビルド
-make test-c99        # C99で変換器と生成Cをビルドし、CPython差分コーパス（576件）を実行
+make test-c99        # C99で変換器と生成Cをビルドし、CPython差分コーパス（749件）を実行
 make tcc             # CC=tcc でフル機能ビルド（TCC=/path/to/tcc で指定可）
 make test-tcc        # tccで変換器・生成C・単一ヘッダーをビルドして差分コーパスを実行
 

@@ -61,7 +61,7 @@ Alpha0.6の自己テストは、単一ヘッダーだけをincludeする翻訳�
 
 | 品質ゲート | 結果 |
 |---|---|
-| CPython差分コンフォーマンス | **C01–C576、576件一致** |
+| CPython差分コンフォーマンス | **C01–C749、749件一致** |
 | GCC一括構築 | `make CC=gcc full-build` 合格 |
 | GCC全回帰 | `make CC=gcc test` 合格 |
 | Clang一括構築 | `make CC=clang full-build` 合格 |

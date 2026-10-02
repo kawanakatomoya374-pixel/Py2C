@@ -358,13 +358,12 @@ static void free_stmt(P2C_AstStmt *stmt, P2C_Allocator *a) {
             free_expr_list(n->u.delete.targets, a);
             break;
         case AST_BLOCK:
-            if (n->u.block.stmts) {
-                for (size_t i = 0; i < p2c_vec_len(n->u.block.stmts); i++) {
-                    P2C_AstStmt *s = (P2C_AstStmt*)p2c_vec_get(n->u.block.stmts, i);
-                    if (s) p2c_ast_stmt_free(s, a);
-                }
-                p2c_vec_free(n->u.block.stmts);
-            }
+            /* free_stmt_list と同じ手順で解放する。以前は要素を個別に解放した後、
+             * len を 0 にせず p2c_vec_free を呼んでいたため、ベクタ側の free_fn が
+             * 解放済みの文をもう一度解放していた（heap-use-after-free）。
+             * 1 行にセミコロンで複数文を書いた入力で再現していた。 */
+            free_stmt_list(n->u.block.stmts, a);
+            n->u.block.stmts = NULL;
             break;
         default:
             break;

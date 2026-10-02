@@ -1510,6 +1510,9 @@ struct P2C_CodeGen {
     P2C_SymbolTable *symtab;
     P2C_String *header;
     P2C_String *forward;
+    /* forward 書き込み中（関数本体や外側ラムダの生成中）に現れたラムダ等の定義を
+     * 退避しておく待ち行列。最終組み立てで forward の末尾へ連結する。 */
+    P2C_Vector *deferred_defs;
     P2C_String *body;
     P2C_String *toplevel;
     P2C_String *current;
@@ -1606,7 +1609,8 @@ typedef enum {
     OBJ_EXCEPTION,
     OBJ_ITERATOR,  /* iter()/next() が返す反復子オブジェクト */
     OBJ_CELL,      /* closureが共有する可変束縛セル */
-    OBJ_ELLIPSIS   /* Pythonの単一値 ... (Ellipsis)。リーフ型。 */
+    OBJ_ELLIPSIS,  /* Pythonの単一値 ... (Ellipsis)。リーフ型。 */
+    OBJ_RANGE      /* range(start, stop, step)。要素を作らない遅延オブジェクト。 */
 } P2C_ObjType;
 
 typedef struct P2C_Object P2C_Object;
@@ -1684,6 +1688,7 @@ struct P2C_Object {
         int64_t v_int;
         double v_float;
         struct { char *data; size_t len; } v_str;
+        struct { int64_t start; int64_t stop; int64_t step; } v_range;
         struct { P2C_Object **items; size_t len; size_t cap; } v_list;
         struct { P2C_DictEntry **buckets; P2C_DictEntry *order_head; P2C_DictEntry *order_tail; size_t bucket_count; size_t len; } v_dict;
         struct { P2C_Object **items; size_t len; } v_tuple;
@@ -1881,6 +1886,9 @@ P2C_Object* p2c_call_attr_kw(P2C_Object *obj, const char *name, P2C_Object **arg
 void p2c_runtime_init(void *heap_base, size_t heap_size);
 void p2c_runtime_shutdown(void);
 bool p2c_runtime_is_active(void);
+/* 現在のランタイムコンテキストに登録されているクラス数（観測用）。
+ * p2c_runtime_shutdown() で 0 に戻る（再初期化の検証に使う）。 */
+size_t p2c_runtime_class_count(void);
 void* p2c_runtime_alloc(size_t size);
 void* p2c_runtime_realloc(void *ptr, size_t old_size, size_t new_size);
 void p2c_runtime_free(void *ptr);
@@ -2186,6 +2194,10 @@ P2C_Object* p2c_builtin_callable(P2C_Object *obj);
 P2C_Object* p2c_builtin_sum(P2C_Object **args, size_t nargs);
 P2C_Object* p2c_builtin_ord(P2C_Object *obj);
 P2C_Object* p2c_builtin_chr(P2C_Object *obj);
+P2C_Object* p2c_builtin_int_from_base(P2C_Object *obj, P2C_Object *base_obj);
+/* 組込み関数を値として取り出す（sorted(key=len) など）。 */
+P2C_Object* p2c_builtin_ref(const char *name);
+P2C_Object* p2c_builtin_ref_checked(const char *name);
 P2C_Object* p2c_builtin_int_base(P2C_Object *obj, unsigned base, const char *prefix);
 P2C_Object* p2c_builtin_sorted(P2C_Object *iterable);
 P2C_Object* p2c_builtin_sorted_key(P2C_Object *iterable, P2C_Object *key, P2C_Object *reverse);
@@ -4848,22 +4860,50 @@ static P2C_Token* read_fstring(P2C_Lexer *lex, char quote) {
 static P2C_Token* read_number(P2C_Lexer *lex) {
     size_t start = lex->pos;
     uint32_t start_col = lex->col;
-    
-    while (is_digit(peek_char(lex, 0))) advance(lex);
-    
+
+    /* 基数つき整数（0x/0o/0b）。Python と同じく '_' 区切りを許す。
+     * 表記の正規化（10 進化と '_' の除去）はパーサ側で行う。 */
+    if (peek_char(lex, 0) == '0') {
+        char p1 = peek_char(lex, 1);
+        char low = (p1 >= 'A' && p1 <= 'Z') ? (char)(p1 - 'A' + 'a') : p1;
+        if (low == 'x' || low == 'o' || low == 'b') {
+            advance(lex);          /* '0' */
+            advance(lex);          /* 'x' など */
+            bool any = false;
+            while (true) {
+                char c = peek_char(lex, 0);
+                bool ok = false;
+                if (low == 'x') ok = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+                else if (low == 'o') ok = (c >= '0' && c <= '7');
+                else ok = (c == '0' || c == '1');
+                if (ok) { any = true; advance(lex); continue; }
+                /* '_' は数字の間にだけ置ける（末尾の '_' は識別子側に残す）。 */
+                if (c == '_' && any && is_digit(peek_char(lex, 1))) { advance(lex); continue; }
+                break;
+            }
+            if (!any) return make_marker_token_at(lex, TOK_UNKNOWN, "invalidliteral", lex->line, start_col);
+            size_t rlen = lex->pos - start;
+            P2C_Token *rtok = make_token(lex, TOK_INT_LITERAL, lex->source + start, rlen);
+            if (rtok) rtok->col = start_col;
+            return rtok;
+        }
+    }
+
+    while (is_digit(peek_char(lex, 0)) || (peek_char(lex, 0) == '_' && is_digit(peek_char(lex, 1)))) advance(lex);
+
     bool is_float = false;
     if (peek_char(lex, 0) == '.' && is_digit(peek_char(lex, 1))) {
         is_float = true;
         advance(lex); /* '.' */
-        while (is_digit(peek_char(lex, 0))) advance(lex);
+        while (is_digit(peek_char(lex, 0)) || (peek_char(lex, 0) == '_' && is_digit(peek_char(lex, 1)))) advance(lex);
     }
-    
+
     /* 指数部 */
     if (peek_char(lex, 0) == 'e' || peek_char(lex, 0) == 'E') {
         is_float = true;
         advance(lex);
         if (peek_char(lex, 0) == '+' || peek_char(lex, 0) == '-') advance(lex);
-        while (is_digit(peek_char(lex, 0))) advance(lex);
+        while (is_digit(peek_char(lex, 0)) || (peek_char(lex, 0) == '_' && is_digit(peek_char(lex, 1)))) advance(lex);
     }
     
     /* 複素数リテラル (2j, 3.5J) は python_code_to_c 非対応。
@@ -5719,13 +5759,12 @@ static void free_stmt(P2C_AstStmt *stmt, P2C_Allocator *a) {
             free_expr_list(n->u.delete.targets, a);
             break;
         case AST_BLOCK:
-            if (n->u.block.stmts) {
-                for (size_t i = 0; i < p2c_vec_len(n->u.block.stmts); i++) {
-                    P2C_AstStmt *s = (P2C_AstStmt*)p2c_vec_get(n->u.block.stmts, i);
-                    if (s) p2c_ast_stmt_free(s, a);
-                }
-                p2c_vec_free(n->u.block.stmts);
-            }
+            /* free_stmt_list と同じ手順で解放する。以前は要素を個別に解放した後、
+             * len を 0 にせず p2c_vec_free を呼んでいたため、ベクタ側の free_fn が
+             * 解放済みの文をもう一度解放していた（heap-use-after-free）。
+             * 1 行にセミコロンで複数文を書いた入力で再現していた。 */
+            free_stmt_list(n->u.block.stmts, a);
+            n->u.block.stmts = NULL;
             break;
         default:
             break;
@@ -6597,6 +6636,57 @@ static P2C_AstExpr* parse_adjacent_string_literals(P2C_Parser *p, P2C_AstExpr *f
     return result;
 }
 
+/* 数値リテラルの表記を「C として妥当な形」へ正規化する。
+ * codegen は p2c_obj_from_int(<text>) / p2c_obj_from_float(<text>) を出力する
+ * ため、text はそのまま C の数値でなければならない。
+ *   - '_' 区切りは除去する（1_000 -> 1000。C11 の数値に '_' は書けない）
+ *   - 0x/0o/0b は 10 進へ（0x1f -> 31）
+ *   - int64 に収まらない基数つきリテラルはエラー（CPython は多倍長だが
+ *     この処理系は int64 のみ。黙って別の値になるより明示的に失敗させる）
+ * 成功時は p2c_alloc 済みの文字列を返す。失敗時は *ok=false を設定する。 */
+static char* normalize_number_text(P2C_Parser *p, const char *text, size_t len, bool *ok) {
+    char tmp[160];
+    size_t n = 0;
+    *ok = true;
+    for (size_t i = 0; i < len && n + 1u < sizeof(tmp); i++) {
+        if (text[i] != '_') tmp[n++] = text[i];
+    }
+    tmp[n] = '\0';
+    char *out = p2c_alloc(p->alloc, n + 32u > 32u ? n + 32u : 32u);
+    if (!out) { *ok = false; return NULL; }
+    int base = 10;
+    const char *digits = tmp;
+    if (n > 2u && tmp[0] == '0' && (tmp[1] == 'x' || tmp[1] == 'X')) { base = 16; digits = tmp + 2; }
+    else if (n > 2u && tmp[0] == '0' && (tmp[1] == 'o' || tmp[1] == 'O')) { base = 8; digits = tmp + 2; }
+    else if (n > 2u && tmp[0] == '0' && (tmp[1] == 'b' || tmp[1] == 'B')) { base = 2; digits = tmp + 2; }
+    if (base == 10) {
+        memcpy(out, tmp, n + 1u);
+        return out;
+    }
+    uint64_t value = 0;
+    for (const char *q = digits; *q; q++) {
+        int d;
+        if (*q >= '0' && *q <= '9') d = *q - '0';
+        else if (*q >= 'a' && *q <= 'f') d = *q - 'a' + 10;
+        else if (*q >= 'A' && *q <= 'F') d = *q - 'A' + 10;
+        else { set_error(p, "invalid digit in integer literal"); *ok = false; return NULL; }
+        if (d >= base) { set_error(p, "invalid digit in integer literal"); *ok = false; return NULL; }
+        if (value > (UINT64_MAX - (uint64_t)d) / (uint64_t)base) {
+            set_error(p, "integer literal too large for this runtime (int64)");
+            *ok = false;
+            return NULL;
+        }
+        value = value * (uint64_t)base + (uint64_t)d;
+    }
+    if (value > (uint64_t)INT64_MAX) {
+        set_error(p, "integer literal too large for this runtime (int64)");
+        *ok = false;
+        return NULL;
+    }
+    snprintf(out, n + 32u, "%llu", (unsigned long long)value);
+    return out;
+}
+
 static P2C_AstExpr* parse_atom(P2C_Parser *p, P2C_Result *err) {
     P2C_Token *tok = CURRENT(p);
     if (!tok || !tok->text) { if (err) *err = P2C_ERR_SYNTAX; return NULL; }
@@ -6610,13 +6700,17 @@ static P2C_AstExpr* parse_atom(P2C_Parser *p, P2C_Result *err) {
             NEXT(p);
             return p2c_ast_name(p->alloc, name, line, col);
         }
+
         case TOK_INT_LITERAL:
         case TOK_FLOAT_LITERAL: {
+            /* '_' 除去と 0x/0o/0b の 10 進化（C として妥当な表記にする）。 */
+            bool num_ok = true;
+            char *norm = normalize_number_text(p, tok->text, tok->len, &num_ok);
+            if (!num_ok) return NULL;
             P2C_AstExpr *e = p2c_ast_expr_new(p->alloc, AST_CONST, line, col);
             if (e) {
                 e->base.u.constant.token_type = tok->type;
-                e->base.u.constant.value = p2c_alloc(p->alloc, tok->len + 1);
-                if (e->base.u.constant.value) memcpy(e->base.u.constant.value, tok->text, tok->len + 1);
+                e->base.u.constant.value = norm;
             }
             NEXT(p);
             return e;
@@ -9150,6 +9244,12 @@ static P2C_Result visit_expr(P2C_Semantic *sem, P2C_AstExpr *expr, P2C_Type **ou
                         strlen(P2C_UNSUPPORTED_NAME_PREFIX)) == 0) {
                 break;
             }
+            /* パーサが a[b:c] を展開する際に作る p2c_obj_slice() も変数では
+             * ないため名前解決の対象外にする（以前は代入の右辺にスライスを
+             * 書くと 'undefined name' で失敗していた）。 */
+            if (n->u.name.name && strcmp(n->u.name.name, "p2c_obj_slice") == 0) {
+                break;
+            }
             P2C_Symbol *sym = p2c_symtab_lookup(sem->symtab, n->u.name.name);
             if (!sym) {
                 char buf[256];
@@ -9804,6 +9904,7 @@ P2C_CodeGen* p2c_codegen_new(P2C_Allocator *a, P2C_CodeGenOptions *opts, P2C_Sym
     cg->symtab = symtab;
     cg->header = p2c_str_new(a);
     cg->forward = p2c_str_new(a);
+    cg->deferred_defs = NULL;
     cg->body = p2c_str_new(a);
     cg->toplevel = p2c_str_new(a);
     cg->current = cg->body;
@@ -9886,6 +9987,14 @@ void p2c_codegen_free(P2C_CodeGen *cg) {
     if (!cg) return;
     p2c_str_free(cg->header);
     p2c_str_free(cg->forward);
+    if (cg->deferred_defs) {
+        for (size_t _i = 0; _i < p2c_vec_len(cg->deferred_defs); _i++) {
+            P2C_String *_d = (P2C_String*)p2c_vec_get(cg->deferred_defs, _i);
+            if (_d) p2c_str_free(_d);
+        }
+        p2c_vec_free(cg->deferred_defs);
+        cg->deferred_defs = NULL;
+    }
     p2c_str_free(cg->body);
     p2c_str_free(cg->toplevel);
     free_name_map(cg->declared_vars);
@@ -10506,6 +10615,16 @@ static void gen_expr(P2C_CodeGen *cg, P2C_AstExpr *expr) {
                 write_str(cg, "p2c_cell_get(_p2c_cell_"); write_ident(cg, n->u.name.name); write_str(cg, ")");
             } else if (map_has_name(cg->decorated_names, n->u.name.name)) {
                 write_str(cg, "_p2c_decorated_"); write_ident(cg, n->u.name.name);
+            } else if (n->u.name.name && is_builtin_callable_name(n->u.name.name) &&
+                       !map_has_name(cg->closure_env_names, n->u.name.name) &&
+                       !map_has_name(cg->cell_names, n->u.name.name)) {
+                /* 組込み関数を「値」として使う場合（sorted(a, key=len) など）は、
+                 * 実行時に呼び出し可能オブジェクトへ解決する。以前は生の識別子
+                 * len を出力していたため生成 C がコンパイルできなかった。
+                 * 未対応の名前は NotImplementedError として明示的に失敗する。 */
+                write_str(cg, "p2c_builtin_ref_checked(\"");
+                write_str(cg, n->u.name.name);
+                write_str(cg, "\")");
             } else {
                 const char *nested_alias = nested_class_alias(cg, n->u.name.name);
                 if (nested_alias) {
@@ -10741,6 +10860,13 @@ static void gen_expr(P2C_CodeGen *cg, P2C_AstExpr *expr) {
                     write_str(cg, "p2c_obj_str(");
                     if (argc) gen_expr(cg, (P2C_AstExpr*)p2c_vec_get(n->u.call.args, 0)); else write_str(cg, "&P2C_None");
                     write_str(cg, ")");
+                } else if (strcmp(name, "int") == 0 && argc >= 2) {
+                    /* int(x, base): 基数付き変換（CPython 準拠）。 */
+                    write_str(cg, "p2c_builtin_int_from_base(");
+                    gen_expr(cg, (P2C_AstExpr*)p2c_vec_get(n->u.call.args, 0));
+                    write_str(cg, ", ");
+                    gen_expr(cg, (P2C_AstExpr*)p2c_vec_get(n->u.call.args, 1));
+                    write_str(cg, ")");
                 } else if (strcmp(name, "int") == 0) {
                     write_str(cg, "p2c_obj_from_int(p2c_obj_as_int(");
                     if (argc) gen_expr(cg, (P2C_AstExpr*)p2c_vec_get(n->u.call.args, 0)); else write_str(cg, "p2c_obj_from_int(0)");
@@ -10808,6 +10934,12 @@ static void gen_expr(P2C_CodeGen *cg, P2C_AstExpr *expr) {
                     gen_expr(cg, (P2C_AstExpr*)p2c_vec_get(n->u.call.args, 0)); write_str(cg, ", ");
                     gen_expr(cg, (P2C_AstExpr*)p2c_vec_get(n->u.call.args, 1)); write_str(cg, ", ");
                     gen_expr(cg, (P2C_AstExpr*)p2c_vec_get(n->u.call.args, 2)); write_str(cg, ")");
+                } else if (strcmp(name, "pow") == 0 && argc == 2 && nkw == 0) {
+                    /* 2引数のpow(a, b) は ** と同じ p2c_obj_pow へ落とす。
+                     * （未対応だと存在しない p2c_user_pow を呼んでコンパイルに失敗していた） */
+                    write_str(cg, "p2c_obj_pow(");
+                    gen_expr(cg, (P2C_AstExpr*)p2c_vec_get(n->u.call.args, 0)); write_str(cg, ", ");
+                    gen_expr(cg, (P2C_AstExpr*)p2c_vec_get(n->u.call.args, 1)); write_str(cg, ")");
                 } else if (strcmp(name, "format") == 0 && argc == 2 && nkw == 0) {
                     write_str(cg, "p2c_builtin_format(");
                     gen_expr(cg, (P2C_AstExpr*)p2c_vec_get(n->u.call.args, 0)); write_str(cg, ", ");
@@ -11379,8 +11511,20 @@ static void gen_expr(P2C_CodeGen *cg, P2C_AstExpr *expr) {
             int id = ++cg->lambda_counter;
             P2C_Vector *largs = n->u.lambda.args;
             snprintf(entry_name, sizeof(entry_name), "_p2c_lambda_entry_%d", id);
+            /* ネストしたラムダの定義は forward の末尾（待ち行列の連結時）に現れるため、
+             * 先に使っても解決できるよう前方宣言を header へ置く。 */
+            p2c_str_append(cg->header, "static P2C_Object *");
+            p2c_str_append(cg->header, entry_name);
+            p2c_str_append(cg->header, "(P2C_Object *env, P2C_Object **args, size_t nargs);\n");
             if (captures) for (size_t i = 0; i < captures->bucket_count; i++) for (P2C_MapEntry *entry = captures->buckets[i]; entry; entry = entry->next) capture_count++;
-            cg->current = cg->forward;
+            /* forward へ書き込み中に現れたラムダ定義を forward へ直接書くと、
+             * 生成中の外側の定義に割り込んで壊れたCになる。
+             * その場合は別バッファへ書き、最終組み立てで forward の末尾へ連結する。 */
+            const bool nested_def = (cg->current != cg->toplevel && cg->current != cg->body &&
+                                     cg->current != cg->header);
+            P2C_String *def_buf = nested_def ? p2c_str_new(cg->alloc) : cg->forward;
+            if (!def_buf) def_buf = cg->forward;
+            cg->current = def_buf;
             cg->indent_level = 0;
             write_str(cg, "static P2C_Object *"); write_str(cg, entry_name); write_str(cg, "(P2C_Object *env, P2C_Object **args, size_t nargs) {"); write_newline(cg); push_indent(cg);
             indent(cg); write_str(cg, "(void)env; (void)args; (void)nargs;"); write_newline(cg);
@@ -11400,6 +11544,10 @@ static void gen_expr(P2C_CodeGen *cg, P2C_AstExpr *expr) {
             pop_indent(cg); write_line(cg, "}"); write_newline(cg);
             cg->current = saved_current;
             cg->indent_level = saved_indent;
+            if (nested_def) {
+                if (!cg->deferred_defs) cg->deferred_defs = p2c_vec_new(cg->alloc, NULL);
+                if (cg->deferred_defs) (void)p2c_vec_push(cg->deferred_defs, def_buf);
+            }
             write_str(cg, "p2c_closure_new(\"<lambda>\", "); write_str(cg, entry_name); write_str(cg, ", ");
             if (capture_count == 0) {
                 write_str(cg, "p2c_dict_from_pairs(NULL, NULL, 0)");
@@ -14154,6 +14302,14 @@ P2C_Result p2c_codegen_generate(P2C_CodeGen *cg, P2C_AstModule *mod, char **out_
     cg->indent_level = 0;
     p2c_str_append(cg->body, "}\n");
 
+    /* 退避していたネスト定義（ラムダ等）を forward の末尾へ流し込む。
+     * いずれもファイルスコープの定義なので、本体より前にあれば順序は問わない。 */
+    if (cg->deferred_defs) {
+        for (size_t _i = 0; _i < p2c_vec_len(cg->deferred_defs); _i++) {
+            P2C_String *_d = (P2C_String*)p2c_vec_get(cg->deferred_defs, _i);
+            if (_d) p2c_str_append(cg->forward, p2c_str_cstr(_d));
+        }
+    }
     size_t total_len = p2c_str_len(cg->header) + p2c_str_len(cg->forward) + p2c_str_len(cg->toplevel) + p2c_str_len(cg->body) + 1;
     char *result = p2c_alloc(cg->alloc, total_len);
     if (!result) return P2C_ERR_NOMEM;
@@ -14380,6 +14536,7 @@ P2C_ClassDef P2C_Class_Bool       = {"bool",     OBJ_BOOL,     free_none, str_no
 P2C_ClassDef P2C_Class_Int        = {"int",      OBJ_INT,      free_none, str_none, no_methods, NULL, NULL};
 P2C_ClassDef P2C_Class_Float      = {"float",    OBJ_FLOAT,    free_none, str_none, no_methods, NULL, NULL};
 P2C_ClassDef P2C_Class_Str        = {"str",      OBJ_STR,      free_none, str_none, no_methods, NULL, NULL};
+P2C_ClassDef P2C_Class_Range      = {"range",    OBJ_RANGE,    free_none, str_none, no_methods, NULL, NULL};
 P2C_ClassDef P2C_Class_List       = {"list",     OBJ_LIST,     free_none, str_none, no_methods, NULL, gc_traverse_list};
 P2C_ClassDef P2C_Class_Dict       = {"dict",     OBJ_DICT,     free_none, str_none, no_methods, NULL, gc_traverse_dict};
 P2C_ClassDef P2C_Class_Set        = {"set",      OBJ_SET,      free_none, str_none, no_methods, NULL, gc_traverse_set};
@@ -14415,7 +14572,6 @@ static void p2c_small_ints_init(void) {
     }
     g_small_ints_ready = true;
 }
-static P2C_Map *g_module_registry = NULL;
 
 /* ============================================================
  * GC (ガベージコレクタ) グローバル状態
@@ -14430,54 +14586,125 @@ static P2C_Map *g_module_registry = NULL;
 #include <setjmp.h>
 #endif
 
-static P2C_Object  *g_gc_all         = NULL;
-static P2C_Object **g_gc_roots[P2C_GC_ROOT_CAPACITY];
-static size_t       g_gc_root_count  = 0;
-static bool         g_gc_collecting  = false; /* GC再入防止 */
-static void        *g_gc_stack_bottom = NULL; /* スタックスキャンの基点 (main の SF 内) */
-static bool         g_gc_enabled     = true;
-static size_t       g_gc_threshold   = 256 * 1024; /* 自動収集しきい値 (bytes) */
-static size_t       g_gc_threshold_base = 256 * 1024; /* 基準しきい値（適応GCの下限） */
-static bool         g_gc_adaptive    = true;   /* しきい値の自動調整（既定で有効） */
-static size_t       g_gc_threshold_growths = 0; /* 適応GCがしきい値を伸ばした回数 */
-static size_t       g_gc_peak_objects = 0;      /* 追跡オブジェクト数の最大値 */
-static size_t       g_gc_oom_resets   = 0;      /* OOMでしきい値を基準値へ戻した回数 */
+/* ── ランタイムコンテキスト ──────────────────────────────────────
+ * 以前は可変な状態がファイルスコープのグローバル（クラスレジストリ、
+ * async キュー、実行中フラグ、上限の通知履歴…）に散らばっていた。ここへ
+ * 集約し、可変グローバルは「コンテキスト構造体 + そのポインタ 1 本」だけに
+ * する。将来 TLS 化して 1 プロセスで複数インタプリタ（スレッド）を動かす
+ * ときは、このポインタを差し替えるだけで済む。 */
+#ifndef P2C_MAX_CLASS_REGISTRY
+#define P2C_MAX_CLASS_REGISTRY 256
+#endif
+#ifndef P2C_ASYNC_QUEUE_CAPACITY
+#define P2C_ASYNC_QUEUE_CAPACITY 256
+#endif
+#define P2C_GC_THRESHOLD_MAX (4u * 1024u * 1024u)
+#ifndef P2C_LIMIT_REPORT_SLOTS
+#define P2C_LIMIT_REPORT_SLOTS 8
+#endif
+
+typedef struct P2C_RuntimeContext {
+    /* クラスレジストリ（名前引きと super()/MRO の解決に使う） */
+    const char *class_names[P2C_MAX_CLASS_REGISTRY];
+    P2C_Object *class_objs[P2C_MAX_CLASS_REGISTRY];
+    int         class_count;
+    /* 上限の通知履歴（同じ上限を何度も報告しない） */
+    const char *reported_limits[P2C_LIMIT_REPORT_SLOTS];
+    size_t      reported_limit_count;
+    /* async キュー（p2c_async_schedule 用のリングバッファ） */
+    P2C_Object *async_queue[P2C_ASYNC_QUEUE_CAPACITY];
+    size_t      async_head;
+    size_t      async_tail;
+    size_t      async_count;
+    /* --- GC（トレーシング・コレクタ）の状態 --- */
+    P2C_Object *gc_all;                 /* 追跡オブジェクトの連結リスト */
+    P2C_Object **gc_roots[P2C_GC_ROOT_CAPACITY];
+    size_t      gc_root_count;
+    bool        gc_collecting;          /* GC 再入防止 */
+    void       *gc_stack_bottom;        /* スタックスキャンの基点 */
+    bool        gc_enabled;
+    size_t      gc_threshold;           /* 自動収集しきい値 (bytes) */
+    size_t      gc_threshold_base;      /* 基準しきい値（適応GCの下限） */
+    bool        gc_adaptive;
+    size_t      gc_threshold_growths;   /* 適応GCがしきい値を伸ばした回数 */
+    size_t      gc_peak_objects;
+    size_t      gc_oom_resets;          /* OOM で基準値へ戻した回数 */
+    size_t      gc_threshold_max;
+    size_t      gc_bytes_alloc;         /* 前回収集後の累積確保 bytes */
+    size_t      gc_collections;
+    size_t      gc_last_freed;
+    size_t      gc_obj_count;
+    void       *gc_stack_lo;
+    void       *gc_stack_hi;
+    bool        gc_scan_warned;
+    uintptr_t   gc_addr_lo;
+    uintptr_t   gc_addr_hi;
+    size_t      gc_scan_words;
+    size_t      gc_temp_roots;
+    /* --- サンドボックス予算 --- */
+    uint64_t    sandbox_max_ticks;
+    uint64_t    sandbox_max_allocs;
+    uint64_t    sandbox_ticks;
+    uint64_t    sandbox_allocs;
+    uint64_t    sandbox_violations;
+    /* --- OOM ハンドラ --- */
+    P2C_OomHandler oom_handler;
+    void          *oom_user;
+    P2C_Object    *oom_exception;       /* 事前確保済み MemoryError */
+    bool           oom_in_handler;      /* ハンドラ再入防止 */
+    /* --- モジュールレジストリ（import 済みモジュール名 -> モジュール） --- */
+    P2C_Map        *module_registry;
+    /* --- 保守的スタックスキャンの一時索引 --- */
+    void          **scan_index;
+    size_t          scan_index_cap;     /* 常に 2 の冪（0 は未確保） */
+    size_t          scan_index_used;
+    /* 実行状態（初期化済みで、例外を投げて安全か） */
+    bool        active;
+} P2C_RuntimeContext;
+
+/* 既定インスタンス。非ゼロの初期値だけを明示する（残りは 0 = 従来と同じ）。 */
+static P2C_RuntimeContext g_runtime_context_default = {
+    .gc_enabled        = true,
+    .gc_threshold      = 256u * 1024u,
+    .gc_threshold_base = 256u * 1024u,
+    .gc_adaptive       = true,
+    .gc_threshold_max  = P2C_GC_THRESHOLD_MAX,
+    .gc_addr_lo        = (uintptr_t)-1,
+};
+static P2C_RuntimeContext *g_runtime_context = &g_runtime_context_default;
+#define P2C_CTX (g_runtime_context)
+
 
 /* ── サンドボックス予算 ──
  * 0 は無制限。予算超過は SandboxError として送出し、ハングやクラッシュにしない。 */
-static uint64_t g_sandbox_max_ticks  = 0;
-static uint64_t g_sandbox_max_allocs = 0;
-static uint64_t g_sandbox_ticks      = 0;
-static uint64_t g_sandbox_allocs     = 0;
-static uint64_t g_sandbox_violations = 0;
 
 void p2c_sandbox_set(const P2C_SandboxLimits *limits) {
     if (!limits) {
-        g_sandbox_max_ticks = 0;
-        g_sandbox_max_allocs = 0;
+        P2C_CTX->sandbox_max_ticks = 0;
+        P2C_CTX->sandbox_max_allocs = 0;
     } else {
-        g_sandbox_max_ticks = limits->max_ticks;
-        g_sandbox_max_allocs = limits->max_allocs;
+        P2C_CTX->sandbox_max_ticks = limits->max_ticks;
+        P2C_CTX->sandbox_max_allocs = limits->max_allocs;
     }
-    g_sandbox_ticks = 0;
-    g_sandbox_allocs = 0;
+    P2C_CTX->sandbox_ticks = 0;
+    P2C_CTX->sandbox_allocs = 0;
 }
 void p2c_sandbox_reset(void) {
-    g_sandbox_ticks = 0;
-    g_sandbox_allocs = 0;
-    g_sandbox_violations = 0;
+    P2C_CTX->sandbox_ticks = 0;
+    P2C_CTX->sandbox_allocs = 0;
+    P2C_CTX->sandbox_violations = 0;
 }
-uint64_t p2c_sandbox_ticks(void)      { return g_sandbox_ticks; }
-uint64_t p2c_sandbox_allocs(void)     { return g_sandbox_allocs; }
-uint64_t p2c_sandbox_violations(void) { return g_sandbox_violations; }
+uint64_t p2c_sandbox_ticks(void)      { return P2C_CTX->sandbox_ticks; }
+uint64_t p2c_sandbox_allocs(void)     { return P2C_CTX->sandbox_allocs; }
+uint64_t p2c_sandbox_violations(void) { return P2C_CTX->sandbox_violations; }
 
 /* ループ後退エッジ。毎回カウントするだけ（予算未設定なら分岐1回）。 */
 void p2c_sandbox_tick(void) {
-    if (g_sandbox_max_ticks == 0) return;
-    g_sandbox_ticks++;
-    if (g_sandbox_ticks > g_sandbox_max_ticks) {
-        g_sandbox_violations++;
-        g_sandbox_max_ticks = 0;   /* 連鎖的な例外を避ける */
+    if (P2C_CTX->sandbox_max_ticks == 0) return;
+    P2C_CTX->sandbox_ticks++;
+    if (P2C_CTX->sandbox_ticks > P2C_CTX->sandbox_max_ticks) {
+        P2C_CTX->sandbox_violations++;
+        P2C_CTX->sandbox_max_ticks = 0;   /* 連鎖的な例外を避ける */
         p2c_raise(p2c_make_exception("SandboxError",
                                      "sandbox: step budget exhausted (possible infinite loop)"));
     }
@@ -14485,28 +14712,14 @@ void p2c_sandbox_tick(void) {
 /* 適応GCの上限。これ以上は伸ばさない（メモリを抱え込みすぎないため）。
  * 組込み（カーネル）では利用可能なヒープが小さいので、p2c_embed_start() が
  * p2c_gc_set_adaptive_limit() でヒープ容量に応じた上限へ下げる。 */
-#define P2C_GC_THRESHOLD_MAX (4u * 1024u * 1024u)
-static size_t       g_gc_threshold_max = P2C_GC_THRESHOLD_MAX;
-static size_t       g_gc_bytes_alloc = 0;          /* 前回収集後の累積確保 bytes */
-static size_t       g_gc_collections = 0;
-static size_t       g_gc_last_freed  = 0;
-static size_t       g_gc_obj_count   = 0;
-static bool         g_runtime_active = false;
-static void        *g_gc_stack_lo    = NULL; /* OSが報告するスタック下限 (NULL可) */
-static void        *g_gc_stack_hi    = NULL; /* OS/カーネルが報告するスタック上端 */
-static bool         g_gc_scan_warned = false; /* スキャン不能の診断を一度だけ出す */
 /* GC管理下オブジェクトのアドレス範囲。スタックスキャン時に、候補語が
  * この範囲外なら索引を引かずに捨てる（保守的スキャンの定数コスト削減）。 */
-static uintptr_t    g_gc_addr_lo     = (uintptr_t)-1;
-static uintptr_t    g_gc_addr_hi     = 0;
 /* 直近の収集で走査したスタック語数（診断用。走査範囲がスタック全体に
  * 広がっていないことをテスト/カーネルが確認できる）。 */
-static size_t       g_gc_scan_words  = 0;
 /* 直近の収集でルート化した TLS 一時値の数（診断用）。
  * 式評価中の左オペランドと処理中の例外は、スタックではなく TLS に置かれる
  * ため保守的スタックスキャンでは見えない。収集時に明示的なルートとして
  * 扱っており、その個数をこのカウンタで観測できる。 */
-static size_t       g_gc_temp_roots  = 0;
 
 /* TLS の一時値（式評価中のオペランド、処理中の例外）をルート化する。
  * 定義は binop / f-string セクション（ファイル後方）にある。 */
@@ -14515,16 +14728,11 @@ static size_t gc_mark_tls_temporaries(void);
 /* メモリ確保失敗（OOM）フック。既定は未設定で、従来どおり呼び出し元へNULLが
  * 返る。カーネル/埋め込みホストは p2c_runtime_set_oom_handler() で
  * 「ログして停止」または MemoryError 送出を選べる。 */
-static P2C_OomHandler g_oom_handler = NULL;
-static void          *g_oom_user    = NULL;
 
 /* スタックスキャン用のアドレス索引（オープンアドレッシング）。
- * 収集のたびに g_gc_all から再構築し、スタック上の語がGCオブジェクトかどうかを
+ * 収集のたびに P2C_CTX->gc_all から再構築し、スタック上の語がGCオブジェクトかどうかを
  * 参照1回（平均O(1)）で判定する。索引バッファは収集をまたいで再利用し、
  * 確保に失敗した場合は従来の線形探索へフォールバックする。 */
-static void        **g_scan_index   = NULL;
-static size_t        g_scan_index_cap = 0; /* 常に2の冪（0は未確保） */
-static size_t        g_scan_index_used = 0;
 
 P2C_THREAD_LOCAL P2C_ExceptFrame *p2c_exc_stack = NULL;
 P2C_THREAD_LOCAL P2C_Object *p2c_active_exception = NULL;
@@ -14556,6 +14764,159 @@ static void *p2c_calloc_checked(size_t nmemb, size_t size, const char *context) 
     return out;
 }
 
+/* ── UTF-8 コードポイント支援 ──────────────────────────────────────────
+ * Python の str はコードポイント単位で len / 添字 / スライス / 反復を行うが、
+ * 本ランタイムは文字列を UTF-8 バイト列で保持している。ここでは
+ * 「バイト列 ⇔ コードポイント位置」の変換だけを提供する。
+ * 不正なバイト列に出会った場合は 1 バイト = 1 文字として前進し、停止しない。 */
+static size_t p2c_utf8_char_len(unsigned char c) {
+    if (c < 0x80u) return 1u;
+    if ((c & 0xE0u) == 0xC0u) return 2u;
+    if ((c & 0xF0u) == 0xE0u) return 3u;
+    if ((c & 0xF8u) == 0xF0u) return 4u;
+    return 1u;
+}
+
+/* off 位置の文字が占めるバイト数（off が末尾なら 0）。継続バイトの整合も見る。 */
+static size_t p2c_utf8_step(const char *s, size_t bytes, size_t off) {
+    if (!s || off >= bytes) return 0u;
+    size_t n = p2c_utf8_char_len((unsigned char)s[off]);
+    if (off + n > bytes) return 1u;
+    for (size_t i = 1u; i < n; i++) {
+        if (((unsigned char)s[off + i] & 0xC0u) != 0x80u) return 1u;
+    }
+    return n;
+}
+
+/* コードポイント1個を UTF-8 へ符号化する（out は最低5バイト）。書き込んだバイト数を返す。 */
+static size_t p2c_utf8_encode(int64_t cp, char *out) {
+    if (!out) return 0u;
+    if (cp < 0 || cp > 0x10FFFF) cp = 0xFFFD;
+    if (cp < 0x80) { out[0] = (char)cp; out[1] = '\0'; return 1u; }
+    if (cp < 0x800) {
+        out[0] = (char)(0xC0 | (cp >> 6));
+        out[1] = (char)(0x80 | (cp & 0x3F));
+        out[2] = '\0';
+        return 2u;
+    }
+    if (cp < 0x10000) {
+        out[0] = (char)(0xE0 | (cp >> 12));
+        out[1] = (char)(0x80 | ((cp >> 6) & 0x3F));
+        out[2] = (char)(0x80 | (cp & 0x3F));
+        out[3] = '\0';
+        return 3u;
+    }
+    out[0] = (char)(0xF0 | (cp >> 18));
+    out[1] = (char)(0x80 | ((cp >> 12) & 0x3F));
+    out[2] = (char)(0x80 | ((cp >> 6) & 0x3F));
+    out[3] = (char)(0x80 | (cp & 0x3F));
+    out[4] = '\0';
+    return 4u;
+}
+
+/* off 位置のコードポイントを返す（不正なら -1）。 */
+static int64_t p2c_utf8_decode(const char *s, size_t bytes, size_t off) {
+    if (!s || off >= bytes) return -1;
+    unsigned char c0 = (unsigned char)s[off];
+    size_t n = p2c_utf8_step(s, bytes, off);
+    int64_t cp = 0;
+    if (n == 1u) return (int64_t)c0;
+    if (n == 2u) cp = (int64_t)(c0 & 0x1Fu);
+    else if (n == 3u) cp = (int64_t)(c0 & 0x0Fu);
+    else cp = (int64_t)(c0 & 0x07u);
+    for (size_t i = 1u; i < n; i++) cp = (cp << 6) | (int64_t)((unsigned char)s[off + i] & 0x3Fu);
+    return cp;
+}
+
+/* str.upper/lower 相当の大小変換。
+ * 全 Unicode 表は持たないが、Latin-1 / Latin Extended-A / Greek / Cyrillic /
+ * Fullwidth をアルゴリズムで変換する（大小の無い文字はそのまま返す）。 */
+static int64_t p2c_utf8_tolower_cp(int64_t cp) {
+    if (cp < 0x80) return (cp >= 'A' && cp <= 'Z') ? cp + 32 : cp;
+    if (cp >= 0x00C0 && cp <= 0x00DE && cp != 0x00D7) return cp + 32;
+    if (cp == 0x0178) return 0x00FF;                    /* Y-diaeresis */
+    if (cp >= 0x0100 && cp <= 0x0137) return ((cp % 2) == 0) ? cp + 1 : cp;
+    if (cp >= 0x0139 && cp <= 0x0148) return ((cp % 2) == 1) ? cp + 1 : cp;
+    if (cp >= 0x014A && cp <= 0x0177) return ((cp % 2) == 0) ? cp + 1 : cp;
+    if (cp >= 0x0391 && cp <= 0x03A1) return cp + 32;   /* Greek */
+    if (cp >= 0x03A3 && cp <= 0x03AB) return cp + 32;
+    if (cp >= 0x0410 && cp <= 0x042F) return cp + 32;   /* Cyrillic */
+    if (cp >= 0x0400 && cp <= 0x040F) return cp + 80;
+    if (cp >= 0xFF21 && cp <= 0xFF3A) return cp + 32;   /* Fullwidth */
+    return cp;
+}
+
+/* 1 コードポイントが複数文字へ展開される特殊ケース（CPython と同じ）。
+ *   ß -> SS (upper) / ss (casefold)、合字 ﬁ -> FI、ﬂ -> FL など。
+ * lower では展開しない（ß の lower は ß のまま）。
+ * 展開したときは out へ追記して true を返す。 */
+static bool p2c_utf8_special_case(int64_t cp, bool to_upper, bool casefold, P2C_String *out) {
+    const char *up = NULL, *fold = NULL;
+    switch (cp) {
+        case 0x00DF: up = "SS";  fold = "ss";  break;   /* ß */
+        case 0xFB00: up = "FF";  fold = "ff";  break;   /* ﬀ */
+        case 0xFB01: up = "FI";  fold = "fi";  break;   /* ﬁ */
+        case 0xFB02: up = "FL";  fold = "fl";  break;   /* ﬂ */
+        case 0xFB03: up = "FFI"; fold = "ffi"; break;   /* ﬃ */
+        case 0xFB04: up = "FFL"; fold = "ffl"; break;   /* ﬄ */
+        case 0xFB05: up = "ST";  fold = "st";  break;   /* ﬅ */
+        case 0xFB06: up = "ST";  fold = "st";  break;   /* ﬆ */
+        default: return false;
+    }
+    const char *text = casefold ? fold : (to_upper ? up : NULL);
+    if (!text || !out) return false;
+    p2c_str_append(out, text);
+    return true;
+}
+
+static int64_t p2c_utf8_toupper_cp(int64_t cp) {
+    if (cp < 0x80) return (cp >= 'a' && cp <= 'z') ? cp - 32 : cp;
+    if (cp >= 0x00E0 && cp <= 0x00FE && cp != 0x00F7) return cp - 32;
+    if (cp == 0x00FF) return 0x0178;
+    if (cp >= 0x0101 && cp <= 0x0138 && cp != 0x0131 && cp != 0x0138) return ((cp % 2) == 1) ? cp - 1 : cp;
+    if (cp >= 0x013A && cp <= 0x0149) return ((cp % 2) == 0) ? cp - 1 : cp;
+    if (cp >= 0x014B && cp <= 0x0178) return ((cp % 2) == 1) ? cp - 1 : cp;
+    if (cp >= 0x03B1 && cp <= 0x03C1) return cp - 32;
+    if (cp == 0x03C2) return 0x03A3;                    /* final sigma */
+    if (cp >= 0x03C3 && cp <= 0x03CB) return cp - 32;
+    if (cp >= 0x0430 && cp <= 0x044F) return cp - 32;
+    if (cp >= 0x0450 && cp <= 0x045F) return cp - 80;
+    if (cp >= 0xFF41 && cp <= 0xFF5A) return cp - 32;
+    return cp;
+}
+
+/* 文字列比較はコードポイント順（Python の str 比較）。バイト順ではない。 */
+static int p2c_utf8_cmp(const char *a, size_t alen, const char *b, size_t blen) {
+    size_t oa = 0u, ob = 0u;
+    if (!a) { a = ""; alen = 0u; }
+    if (!b) { b = ""; blen = 0u; }
+    for (;;) {
+        bool ae = (oa >= alen), be = (ob >= blen);
+        if (ae || be) return (ae == be) ? 0 : (ae ? -1 : 1);
+        int64_t ca = p2c_utf8_decode(a, alen, oa);
+        int64_t cb = p2c_utf8_decode(b, blen, ob);
+        if (ca != cb) return (ca < cb) ? -1 : 1;
+        oa += p2c_utf8_step(a, alen, oa);
+        ob += p2c_utf8_step(b, blen, ob);
+    }
+}
+
+/* コードポイント数（Python の len(str)）。 */
+static size_t p2c_utf8_count(const char *s, size_t bytes) {
+    if (!s) return 0u;
+    size_t n = 0u, off = 0u;
+    while (off < bytes) { off += p2c_utf8_step(s, bytes, off); n++; }
+    return n;
+}
+
+/* コードポイント位置 cp（0..count）に対応するバイトオフセット。 */
+static size_t p2c_utf8_offset(const char *s, size_t bytes, size_t cp) {
+    if (!s) return 0u;
+    size_t off = 0u;
+    while (cp > 0u && off < bytes) { off += p2c_utf8_step(s, bytes, off); cp--; }
+    return off;
+}
+
 static char* p2c_strdup_local(const char *s) {
     size_t len = s ? strlen(s) : 0;
     char *out = (char*)p2c_malloc_checked(len + 1, "p2c_strdup");
@@ -14584,12 +14945,10 @@ static char* p2c_strdup_n_local(const char *s, size_t len) {
  *
  * 標準ハンドラは、runtime_init時に事前確保した MemoryError シングルトンを使う
  * ため、OOM中の再確保（再帰OOM）を起こさない。 */
-static P2C_Object *g_oom_exception = NULL; /* 事前確保済みMemoryError（GCルート登録済み） */
-static bool       g_oom_in_handler = false; /* ハンドラ再入防止 */
 
 void p2c_runtime_set_oom_handler(P2C_OomHandler handler, void *user) {
-    g_oom_handler = handler;
-    g_oom_user = user;
+    P2C_CTX->oom_handler = handler;
+    P2C_CTX->oom_user = user;
 }
 
 void p2c_runtime_notify_oom(size_t requested, const char *context) {
@@ -14597,26 +14956,102 @@ void p2c_runtime_notify_oom(size_t requested, const char *context) {
      * 次の確保までに必ず収集が走るようにする（小さなヒープでの枯渇を防ぐ）。
      * これを入れないと、しきい値が伸びたまま収集が止まり、組込みヒープの
      * タスクが MemoryError で止まる。 */
-    if (g_gc_adaptive && g_gc_threshold > g_gc_threshold_base) {
-        g_gc_threshold = g_gc_threshold_base;
-        g_gc_threshold_growths = 0;
-        g_gc_oom_resets++;
+    if (P2C_CTX->gc_adaptive && P2C_CTX->gc_threshold > P2C_CTX->gc_threshold_base) {
+        P2C_CTX->gc_threshold = P2C_CTX->gc_threshold_base;
+        P2C_CTX->gc_threshold_growths = 0;
+        P2C_CTX->gc_oom_resets++;
     }
-    if (!g_oom_handler || g_oom_in_handler) return;
-    g_oom_in_handler = true;
-    g_oom_handler(requested, context ? context : "allocation", g_oom_user);
-    g_oom_in_handler = false;
+    if (!P2C_CTX->oom_handler || P2C_CTX->oom_in_handler) return;
+    P2C_CTX->oom_in_handler = true;
+    P2C_CTX->oom_handler(requested, context ? context : "allocation", P2C_CTX->oom_user);
+    P2C_CTX->oom_in_handler = false;
+}
+
+/* ── 固定上限の診断 ────────────────────────────────────────────────
+ * 組込み（カーネル）向けに一部の表は固定長配列で持っている。上限に達した
+ * とき以前は黙って処理を飛ばしていたため、後で「原因不明の誤動作」になって
+ * いた。ここでは同じ上限について一度だけ確実に知らせ、実行中なら
+ * RuntimeError も投げる（起動前やGC中など、投げると危険な場所では通知のみ）。
+ * 上限はすべて -DP2C_xxx=... で上書きできる。
+ *
+ * snprintf に依存しないのは、組込み側の最小 libc に存在しないことがあるため。 */
+static void p2c_append_text(char *buf, size_t cap, size_t *pos, const char *text) {
+    if (!buf || !pos || cap == 0) return;
+    if (!text) text = "";
+    while (*text && *pos + 1u < cap) buf[(*pos)++] = *text++;
+    buf[*pos < cap ? *pos : cap - 1u] = '\0';
+}
+static void p2c_append_size(char *buf, size_t cap, size_t *pos, size_t value) {
+    char digits[24];
+    size_t n = 0;
+    if (value == 0) digits[n++] = '0';
+    while (value > 0 && n < sizeof(digits)) {
+        digits[n++] = (char)('0' + (int)(value % 10u));
+        value /= 10u;
+    }
+    while (n > 0) {
+        char c = digits[--n];
+        if (*pos + 1u < cap) buf[(*pos)++] = c;
+    }
+    if (cap > 0) buf[*pos < cap ? *pos : cap - 1u] = '\0';
+}
+
+static void p2c_limit_exceeded(const char *what, size_t limit, const char *macro,
+                               const char *detail, bool can_raise) {
+    bool first = true;
+    for (size_t i = 0; i < P2C_CTX->reported_limit_count; i++) {
+        if (P2C_CTX->reported_limits[i] == what) { first = false; break; }
+    }
+    if (first && P2C_CTX->reported_limit_count < P2C_LIMIT_REPORT_SLOTS) {
+        P2C_CTX->reported_limits[P2C_CTX->reported_limit_count++] = what;
+    }
+    if (first) {
+        char num[24];
+        size_t np = 0;
+        p2c_append_size(num, sizeof(num), &np, limit);
+        p2c_platform_write("p2c: limit exceeded: ");
+        p2c_platform_write(what ? what : "unknown");
+        p2c_platform_write(" (limit=");
+        p2c_platform_write(num);
+        if (macro && macro[0]) {
+            p2c_platform_write(", override with -D");
+            p2c_platform_write(macro);
+        }
+        p2c_platform_write(")");
+        if (detail && detail[0]) {
+            p2c_platform_write(": ");
+            p2c_platform_write(detail);
+        }
+        p2c_platform_write("\n");
+    }
+    if (!can_raise || !P2C_CTX->active) return;
+    char msg[192];
+    size_t pos = 0;
+    p2c_append_text(msg, sizeof(msg), &pos, what ? what : "limit");
+    p2c_append_text(msg, sizeof(msg), &pos, " limit exhausted (");
+    p2c_append_size(msg, sizeof(msg), &pos, limit);
+    p2c_append_text(msg, sizeof(msg), &pos, ")");
+    if (detail && detail[0]) {
+        p2c_append_text(msg, sizeof(msg), &pos, ": ");
+        p2c_append_text(msg, sizeof(msg), &pos, detail);
+    }
+    if (macro && macro[0]) {
+        p2c_append_text(msg, sizeof(msg), &pos, "; rebuild with -D");
+        p2c_append_text(msg, sizeof(msg), &pos, macro);
+        p2c_append_text(msg, sizeof(msg), &pos, "=<larger>");
+    }
+    p2c_raise(p2c_make_exception("RuntimeError", msg));
 }
 
 void p2c_oom_raise_memory_error(size_t requested, const char *context, void *user) {
     (void)requested;
     (void)user;
     const char *where = context ? context : "allocation";
-    if (g_oom_exception && p2c_exc_stack) {
+    if (P2C_CTX->oom_exception && p2c_exc_stack) {
         /* p2c_raise() は longjmp で戻らないため、再入フラグは先に解除しておく
          * （except節の中での再確保失敗も通知できるようにする）。 */
-        g_oom_in_handler = false;
-        p2c_raise(g_oom_exception);
+        P2C_CTX->oom_in_handler = false;
+        p2c_raise(P2C_CTX->oom_exception);
         return;
     }
     p2c_platform_write("MemoryError: ");
@@ -14742,16 +15177,16 @@ static bool p2c_obj_is_exception_instance(P2C_Object *obj) {
 
 P2C_Object* p2c_obj_new(P2C_ClassDef *cls) {
     /* 閾値を超えていたら collect してから確保する */
-    if (g_gc_enabled && g_gc_stack_bottom &&
-        g_gc_bytes_alloc >= g_gc_threshold) {
+    if (P2C_CTX->gc_enabled && P2C_CTX->gc_stack_bottom &&
+        P2C_CTX->gc_bytes_alloc >= P2C_CTX->gc_threshold) {
         /* runtime.h が宣言している p2c_gc_collect を、この後方の定義より先に呼ぶ */
         p2c_gc_collect();
     }
-    if (g_sandbox_max_allocs != 0) {
-        g_sandbox_allocs++;
-        if (g_sandbox_allocs > g_sandbox_max_allocs) {
-            g_sandbox_violations++;
-            g_sandbox_max_allocs = 0;   /* 連鎖的な例外を避ける */
+    if (P2C_CTX->sandbox_max_allocs != 0) {
+        P2C_CTX->sandbox_allocs++;
+        if (P2C_CTX->sandbox_allocs > P2C_CTX->sandbox_max_allocs) {
+            P2C_CTX->sandbox_violations++;
+            P2C_CTX->sandbox_max_allocs = 0;   /* 連鎖的な例外を避ける */
             p2c_raise(p2c_make_exception("SandboxError",
                                          "sandbox: allocation budget exhausted"));
             return NULL;
@@ -14763,28 +15198,28 @@ P2C_Object* p2c_obj_new(P2C_ClassDef *cls) {
     obj->refcount  = 0;       /* GC管理下では refcount はピン留めカウンタ */
     memset(&obj->u, 0, sizeof(obj->u));
     /* GC 追跡リストの先頭に繋ぐ */
-    obj->gc_next   = g_gc_all;
+    obj->gc_next   = P2C_CTX->gc_all;
     obj->gc_marked = 0;
-    g_gc_all = obj;
-    g_gc_bytes_alloc += sizeof(P2C_Object);
-    g_gc_obj_count++;
-    if (g_gc_obj_count > g_gc_peak_objects) g_gc_peak_objects = g_gc_obj_count;
+    P2C_CTX->gc_all = obj;
+    P2C_CTX->gc_bytes_alloc += sizeof(P2C_Object);
+    P2C_CTX->gc_obj_count++;
+    if (P2C_CTX->gc_obj_count > P2C_CTX->gc_peak_objects) P2C_CTX->gc_peak_objects = P2C_CTX->gc_obj_count;
     /* スタックスキャン用のアドレス範囲を更新する。 */
     {
         uintptr_t addr = (uintptr_t)obj;
-        if (addr < g_gc_addr_lo) g_gc_addr_lo = addr;
-        if (addr > g_gc_addr_hi) g_gc_addr_hi = addr;
+        if (addr < P2C_CTX->gc_addr_lo) P2C_CTX->gc_addr_lo = addr;
+        if (addr > P2C_CTX->gc_addr_hi) P2C_CTX->gc_addr_hi = addr;
     }
     return obj;
 }
 
 static void p2c_gc_discard_new_object(P2C_Object *obj) {
     if (!obj) return;
-    P2C_Object **link = &g_gc_all;
+    P2C_Object **link = &P2C_CTX->gc_all;
     while (*link) {
         if (*link == obj) {
             *link = obj->gc_next;
-            if (g_gc_obj_count > 0) g_gc_obj_count--;
+            if (P2C_CTX->gc_obj_count > 0) P2C_CTX->gc_obj_count--;
             break;
         }
         link = &(*link)->gc_next;
@@ -14912,8 +15347,50 @@ bool p2c_obj_is_truthy(P2C_Object *obj) {
         case OBJ_DICT: return obj->u.v_dict.len > 0;
         case OBJ_SET: return obj->u.v_dict.len > 0;
         case OBJ_TUPLE: return obj->u.v_tuple.len > 0;
+        case OBJ_RANGE: {
+            /* 空の range は偽（要素数を知るだけでよいので算術で判定する）。 */
+            int64_t start = obj->u.v_range.start, stop = obj->u.v_range.stop;
+            return obj->u.v_range.step > 0 ? (start < stop) : (start > stop);
+        }
         default: return true;
     }
+}
+
+/* Python の int(str) 相当の厳密な 10 進変換。
+ *   - 前後の空白を許す（Python と同じ）
+ *   - 数字の間の '_' を許す（1_000 は可、_1 や 1__0 は不可）
+ *   - 文字列全体が整数でなければ false（呼び出し側が ValueError を送出）
+ *   - 64bit に収まらない場合は overflow=true（呼び出し側が OverflowError を送出）
+ * strtoll は末尾の未消費文字を見ず、範囲外も飽和値で返してしまうため置き換えた。 */
+static bool p2c_str_to_i64(const char *s, int64_t *out, bool *overflow) {
+    if (!s) return false;
+    const char *p = s;
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r' || *p == '\v' || *p == '\f') p++;
+    bool neg = false;
+    if (*p == '+' || *p == '-') { neg = (*p == '-'); p++; }
+    if (*p == '\0') return false;
+    const uint64_t limit = neg ? 9223372036854775808ull : 9223372036854775807ull;
+    uint64_t acc = 0;
+    bool any = false, ovf = false, prev_digit = false;
+    for (; *p != '\0'; p++) {
+        char c = *p;
+        if (c == '_') {
+            if (!prev_digit || p[1] < '0' || p[1] > '9') return false;
+            prev_digit = false;
+            continue;
+        }
+        if (c < '0' || c > '9') break;
+        any = true;
+        prev_digit = true;
+        uint64_t d = (uint64_t)(c - '0');
+        if (acc > (limit - d) / 10u) ovf = true;
+        else acc = acc * 10u + d;
+    }
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r' || *p == '\v' || *p == '\f') p++;
+    if (!any || *p != '\0') return false;
+    if (overflow) *overflow = ovf;
+    if (!ovf && out) *out = neg ? (int64_t)(0u - acc) : (int64_t)acc;
+    return true;
 }
 
 int64_t p2c_obj_as_int(P2C_Object *obj) {
@@ -14923,11 +15400,17 @@ int64_t p2c_obj_as_int(P2C_Object *obj) {
         case OBJ_FLOAT: return (int64_t)obj->u.v_float;
         case OBJ_BOOL: return obj->u.v_bool ? 1 : 0;
         case OBJ_STR: {
-            if (!obj->u.v_str.data) return 0;
-            char *end = NULL;
-            long long v = strtoll(obj->u.v_str.data, &end, 10);
-            if (end == obj->u.v_str.data) { p2c_raise(p2c_make_exception("ValueError", "invalid literal for int()")); return 0; }
-            return (int64_t)v;
+            int64_t v = 0;
+            bool ovf = false;
+            if (!p2c_str_to_i64(obj->u.v_str.data, &v, &ovf)) {
+                p2c_raise(p2c_make_exception("ValueError", "invalid literal for int() with base 10"));
+                return 0;
+            }
+            if (ovf) {
+                p2c_raise(p2c_make_exception("OverflowError", "Python int too large to convert to C long long"));
+                return 0;
+            }
+            return v;
         }
         default: return 0;
     }
@@ -14943,7 +15426,14 @@ double p2c_obj_as_float(P2C_Object *obj) {
             if (!obj->u.v_str.data) return 0.0;
             char *end = NULL;
             double v = strtod(obj->u.v_str.data, &end);
-            if (end == obj->u.v_str.data) { p2c_raise(p2c_make_exception("ValueError", "could not convert string to float")); return 0.0; }
+            /* Python と同じく、文字列全体が数値でなければ ValueError
+             * （strtod は "1.2x" でも 1.2 を返し、末尾を見ないと素通りしてしまう）。 */
+            const char *q = end;
+            while (*q == ' ' || *q == '\t' || *q == '\n' || *q == '\r' || *q == '\v' || *q == '\f') q++;
+            if (end == obj->u.v_str.data || *q != '\0') {
+                p2c_raise(p2c_make_exception("ValueError", "could not convert string to float"));
+                return 0.0;
+            }
             return v;
         }
         default: return 0.0;
@@ -15123,6 +15613,14 @@ P2C_Object* p2c_obj_floordiv(P2C_Object *a, P2C_Object *b) {
 /* 任意のオブジェクトを str()/repr() 表現へ変換する（本体は p2c_obj_repr の直前）。
  * %s は repr=false、%r/%a は repr=true で使う。 */
 static void p2c_obj_to_buf_ex(P2C_Object *obj, P2C_String *out, bool repr);
+/* range ヘルパ（定義は p2c_range の近く。等値比較など後方の関数からも使う） */
+static bool p2c_range_shape(const P2C_Object *o, uint64_t *span_out, uint64_t *mag_out, uint64_t *len_out);
+static int64_t p2c_range_pos(const P2C_Object *o, int64_t index);
+static int64_t p2c_range_value(const P2C_Object *o, int64_t pos);
+static bool p2c_range_contains(const P2C_Object *o, P2C_Object *item);
+static void p2c_range_to_buf(const P2C_Object *o, P2C_String *out);
+static P2C_Object** p2c_range_items(P2C_Object *range_obj, size_t *n_out, bool *owned_out);
+static P2C_Object* p2c_range_new(int64_t start, int64_t stop, int64_t step);
 
 static bool p2c_pf_append(char **buf, size_t *len, size_t *cap,
                           const char *s, size_t n) {
@@ -15137,6 +15635,51 @@ static bool p2c_pf_append(char **buf, size_t *len, size_t *cap,
     *len += n;
     (*buf)[*len] = '\0';
     return true;
+}
+
+/* %s 系フィールドを組み立てる。幅と精度は「コードポイント数」で数える
+ * （CPython と同じ。snprintf の %s はバイト数で数えるため "é" に %5s を
+ * 掛けると 1 文字分ずれる）。 */
+static P2C_Object* p2c_pf_str_field(const char *txt, const char *spec) {
+    bool left = false;
+    size_t width = 0;
+    bool has_prec = false;
+    size_t prec = 0;
+    for (const char *q = spec; q && *q; q++) {
+        if (*q == '-') {
+            left = true;
+        } else if (*q >= '1' && *q <= '9') {
+            width = 0;
+            while (*q >= '0' && *q <= '9') { width = width * 10u + (size_t)(*q - '0'); q++; }
+            q--;
+        } else if (*q == '.') {
+            has_prec = true;
+            prec = 0;
+            q++;
+            while (*q >= '0' && *q <= '9') { prec = prec * 10u + (size_t)(*q - '0'); q++; }
+            q--;
+        }
+        /* その他のフラグは文字列では効かない（Python も '0' は無効）。 */
+    }
+    size_t bytes = txt ? strlen(txt) : 0u;
+    if (has_prec) {
+        size_t cps = p2c_utf8_count(txt, bytes);
+        if (cps > prec) bytes = p2c_utf8_offset(txt, bytes, prec);
+    }
+    size_t cps = p2c_utf8_count(txt, bytes);
+    size_t pad = (width > cps) ? (width - cps) : 0u;
+    if (pad > ((size_t)1 << 20)) pad = (size_t)1 << 20;   /* 過大な確保を防ぐ */
+    char *out = (char*)p2c_malloc_checked(bytes + pad + 1u, "percent format field");
+    if (!out) return NULL;
+    size_t pos = 0;
+    if (!left) for (size_t i = 0; i < pad; i++) out[pos++] = ' ';
+    if (bytes > 0) memcpy(out + pos, txt, bytes);
+    pos += bytes;
+    if (left) for (size_t i = 0; i < pad; i++) out[pos++] = ' ';
+    out[pos] = '\0';
+    P2C_Object *r = p2c_obj_from_str(out);
+    p2c_heap_free(out);
+    return r;
 }
 
 /* 変換1個分を整形して追記する。spec は '%' と変換子の間の指定。 */
@@ -15158,10 +15701,41 @@ static bool p2c_pf_emit(char **buf, size_t *len, size_t *cap,
         if (!work) return false;
     }
     int n = -1;
-    if (conv == 's' || conv == 'r' || conv == 'a') {
+    /* 文字列系（%s/%r/%a/%c）はコードポイント単位で幅・精度を適用する。 */
+    if (conv == 's' || conv == 'r' || conv == 'a' || conv == 'c') {
         const char *txt = "";
         P2C_String *sb = NULL;
-        if (conv == 's' && p2c_obj_is_str(arg)) {
+        char cbuf[8];
+        if (conv == 'c') {
+            if (p2c_obj_is_str(arg) && p2c_obj_str_len(arg) >= 1) {
+                txt = p2c_obj_as_str(arg);
+            } else {
+                int64_t cp = p2c_obj_as_int(arg);
+                if (cp < 0 || cp > 0x10FFFF) {
+                    if (work != tmp) p2c_heap_free(work);
+                    p2c_raise(p2c_make_exception("OverflowError", "%c arg not in range(0x110000)"));
+                    return false;
+                }
+                /* CPython は %c でコードポイントの UTF-8 表現を出力する。 */
+                size_t n2 = 0;
+                if (cp < 0x80) { cbuf[n2++] = (char)cp; }
+                else if (cp < 0x800) {
+                    cbuf[n2++] = (char)(0xC0 | (cp >> 6));
+                    cbuf[n2++] = (char)(0x80 | (cp & 0x3F));
+                } else if (cp < 0x10000) {
+                    cbuf[n2++] = (char)(0xE0 | (cp >> 12));
+                    cbuf[n2++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+                    cbuf[n2++] = (char)(0x80 | (cp & 0x3F));
+                } else {
+                    cbuf[n2++] = (char)(0xF0 | (cp >> 18));
+                    cbuf[n2++] = (char)(0x80 | ((cp >> 12) & 0x3F));
+                    cbuf[n2++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+                    cbuf[n2++] = (char)(0x80 | (cp & 0x3F));
+                }
+                cbuf[n2] = '\0';
+                txt = cbuf;
+            }
+        } else if (conv == 's' && p2c_obj_is_str(arg)) {
             txt = p2c_obj_as_str(arg);      /* 文字列はそのまま */
         } else {
             /* 数値・コンテナ・インスタンスは str()/repr() 表現に変換する
@@ -15172,18 +15746,11 @@ static bool p2c_pf_emit(char **buf, size_t *len, size_t *cap,
                 txt = p2c_str_cstr(sb);
             }
         }
-        snprintf(cfmt, sizeof(cfmt), "%%%ss", spec);
-        n = snprintf(work, need, cfmt, txt ? txt : "");
+        P2C_Object *field = p2c_pf_str_field(txt ? txt : "", spec);
         if (sb) p2c_str_free(sb);
-    } else if (conv == 'c') {
-        if (p2c_obj_is_str(arg) && p2c_obj_str_len(arg) >= 1) {
-            const char *txt = p2c_obj_as_str(arg);
-            snprintf(cfmt, sizeof(cfmt), "%%%ss", spec);
-            n = snprintf(work, need, cfmt, txt ? txt : "");
-        } else {
-            snprintf(cfmt, sizeof(cfmt), "%%%sc", spec);
-            n = snprintf(work, need, cfmt, (int)p2c_obj_as_int(arg));
-        }
+        if (work != tmp) p2c_heap_free(work);
+        if (!field) return false;
+        return p2c_pf_append(buf, len, cap, p2c_obj_as_str(field), p2c_obj_str_len(field));
     } else if (conv == 'd' || conv == 'i' || conv == 'u' ||
                conv == 'x' || conv == 'X' || conv == 'o') {
         snprintf(cfmt, sizeof(cfmt), "%%%sll%c", spec, conv);
@@ -15459,6 +16026,16 @@ static uint32_t p2c_obj_hash(P2C_Object *obj) {
     if (!obj) return 0;
     switch (obj->cls ? obj->cls->type_tag : OBJ_NONE) {
         case OBJ_INT: return (uint32_t)(obj->u.v_int ^ (obj->u.v_int >> 32));
+        case OBJ_RANGE: {
+            /* 等値判定は (長さ, start, step) なので、ハッシュもそれだけから作る。
+             * 空の range は start/step に関わらず等しいため定数を返す。 */
+            uint64_t span = 0, mag = 1, len = 0;
+            if (!p2c_range_shape(obj, &span, &mag, &len) || len == 0) return 0u;
+            uint32_t h = (uint32_t)(len ^ (len >> 32));
+            h ^= (uint32_t)obj->u.v_range.start;
+            h ^= (uint32_t)obj->u.v_range.step * 2654435761u;
+            return h;
+        }
         case OBJ_BOOL: return obj->u.v_bool ? 1u : 0u;
         case OBJ_FLOAT: {
             double value = obj->u.v_float;
@@ -15494,6 +16071,18 @@ static bool p2c_obj_equal_raw(P2C_Object *a, P2C_Object *b) {
     }
     switch (a->cls->type_tag) {
         case OBJ_INT: return a->u.v_int == b->u.v_int;
+        case OBJ_RANGE: {
+            /* CPython の range 比較: 長さ→start→step の順に比較する
+             * （要素ごとではないので、range(0,3,2) == range(0,4,2) は True）。 */
+            uint64_t span_a = 0, mag_a = 1, len_a = 0, span_b = 0, mag_b = 1, len_b = 0;
+            if (!p2c_range_shape(a, &span_a, &mag_a, &len_a)) len_a = UINT64_MAX;
+            if (!p2c_range_shape(b, &span_b, &mag_b, &len_b)) len_b = UINT64_MAX;
+            if (len_a != len_b) return false;
+            /* 要素が無ければ start/step に関わらず等しい（range(0) == range(1, 1)）。 */
+            if (len_a == 0) return true;
+            return a->u.v_range.start == b->u.v_range.start &&
+                   a->u.v_range.step == b->u.v_range.step;
+        }
         case OBJ_FLOAT: return p2c_float_eq(a->u.v_float, b->u.v_float);
         case OBJ_BOOL: return a->u.v_bool == b->u.v_bool;
         case OBJ_STR: return strcmp(p2c_obj_as_str(a), p2c_obj_as_str(b)) == 0;
@@ -15534,10 +16123,32 @@ static bool p2c_obj_equal_raw(P2C_Object *a, P2C_Object *b) {
 
 P2C_Object* p2c_obj_eq(P2C_Object *a, P2C_Object *b) { return p2c_obj_from_bool(p2c_obj_equal_raw(a, b)); }
 P2C_Object* p2c_obj_ne(P2C_Object *a, P2C_Object *b) { return p2c_obj_from_bool(!p2c_obj_equal_raw(a, b)); }
-P2C_Object* p2c_obj_lt(P2C_Object *a, P2C_Object *b) { { P2C_Object *r; if (try_binop_dunder(a, b, "__lt__", &r)) return r; } return p2c_obj_from_bool((p2c_obj_is_float(a)||p2c_obj_is_float(b)) ? (p2c_obj_as_float(a) < p2c_obj_as_float(b)) : (p2c_obj_as_int(a) < p2c_obj_as_int(b))); }
-P2C_Object* p2c_obj_le(P2C_Object *a, P2C_Object *b) { { P2C_Object *r; if (try_binop_dunder(a, b, "__le__", &r)) return r; } return p2c_obj_from_bool((p2c_obj_is_float(a)||p2c_obj_is_float(b)) ? (p2c_obj_as_float(a) <= p2c_obj_as_float(b)) : (p2c_obj_as_int(a) <= p2c_obj_as_int(b))); }
-P2C_Object* p2c_obj_gt(P2C_Object *a, P2C_Object *b) { { P2C_Object *r; if (try_binop_dunder(a, b, "__gt__", &r)) return r; } return p2c_obj_from_bool((p2c_obj_is_float(a)||p2c_obj_is_float(b)) ? (p2c_obj_as_float(a) > p2c_obj_as_float(b)) : (p2c_obj_as_int(a) > p2c_obj_as_int(b))); }
-P2C_Object* p2c_obj_ge(P2C_Object *a, P2C_Object *b) { { P2C_Object *r; if (try_binop_dunder(a, b, "__ge__", &r)) return r; } return p2c_obj_from_bool((p2c_obj_is_float(a)||p2c_obj_is_float(b)) ? (p2c_obj_as_float(a) >= p2c_obj_as_float(b)) : (p2c_obj_as_int(a) >= p2c_obj_as_int(b))); }
+/* <,<=,>,>= 用の順序比較。
+ * 文字列同士はコードポイント順（Python の str 比較）、それ以外は数値として比較する。
+ * 以前は文字列も p2c_obj_as_int に落ちていたため、非ASCII文字列の比較が
+ * 数値変換エラーになっていた。 */
+static bool p2c_sequence_less(P2C_Object *a, P2C_Object *b);
+static int p2c_obj_order_cmp(P2C_Object *a, P2C_Object *b) {
+    if (a && b && p2c_obj_is_str(a) && p2c_obj_is_str(b)) {
+        return p2c_utf8_cmp(p2c_obj_as_str(a), p2c_obj_str_len(a),
+                            p2c_obj_as_str(b), p2c_obj_str_len(b));
+    }
+    if (a && b && (p2c_obj_is_tuple(a) || p2c_obj_is_list(a)) &&
+        (p2c_obj_is_tuple(b) || p2c_obj_is_list(b))) {
+        return p2c_sequence_less(a, b) ? -1 : (p2c_sequence_less(b, a) ? 1 : 0);
+    }
+    {
+        double da = p2c_obj_as_float(a), db = p2c_obj_as_float(b);
+        if (da < db) return -1;
+        if (da > db) return 1;
+        return 0;
+    }
+}
+
+P2C_Object* p2c_obj_lt(P2C_Object *a, P2C_Object *b) { { P2C_Object *r; if (try_binop_dunder(a, b, "__lt__", &r)) return r; } return p2c_obj_from_bool(p2c_obj_order_cmp(a, b) < 0); }
+P2C_Object* p2c_obj_le(P2C_Object *a, P2C_Object *b) { { P2C_Object *r; if (try_binop_dunder(a, b, "__le__", &r)) return r; } return p2c_obj_from_bool((p2c_obj_is_float(a)||p2c_obj_is_float(b)) ? (p2c_obj_as_float(a) <= p2c_obj_as_float(b)) : (p2c_obj_order_cmp(a, b) <= 0)); }
+P2C_Object* p2c_obj_gt(P2C_Object *a, P2C_Object *b) { { P2C_Object *r; if (try_binop_dunder(a, b, "__gt__", &r)) return r; } return p2c_obj_from_bool((p2c_obj_is_float(a)||p2c_obj_is_float(b)) ? (p2c_obj_as_float(a) > p2c_obj_as_float(b)) : (p2c_obj_order_cmp(a, b) > 0)); }
+P2C_Object* p2c_obj_ge(P2C_Object *a, P2C_Object *b) { { P2C_Object *r; if (try_binop_dunder(a, b, "__ge__", &r)) return r; } return p2c_obj_from_bool((p2c_obj_is_float(a)||p2c_obj_is_float(b)) ? (p2c_obj_as_float(a) >= p2c_obj_as_float(b)) : (p2c_obj_order_cmp(a, b) >= 0)); }
 P2C_Object* p2c_bool_and(P2C_Object *a, P2C_Object *b) { return p2c_obj_from_bool(p2c_obj_is_truthy(a) && p2c_obj_is_truthy(b)); }
 P2C_Object* p2c_bool_or(P2C_Object *a, P2C_Object *b) { return p2c_obj_from_bool(p2c_obj_is_truthy(a) || p2c_obj_is_truthy(b)); }
 P2C_Object* p2c_bool_not(P2C_Object *a) { return p2c_obj_from_bool(!p2c_obj_is_truthy(a)); }
@@ -15557,6 +16168,10 @@ P2C_Object* p2c_obj_contains(P2C_Object *container, P2C_Object *item) {
     if (container->cls && container->cls->type_tag == OBJ_INSTANCE && p2c_has_method(container, "__contains__")) {
         P2C_Object *args[1] = { item };
         return p2c_obj_from_bool(p2c_obj_is_truthy(p2c_call_attr(container, "__contains__", args, 1)));
+    }
+    /* range: 要素を作らずに算術で判定する（範囲外・非整数は False）。 */
+    if (container->cls && container->cls->type_tag == OBJ_RANGE) {
+        return p2c_obj_from_bool(p2c_range_contains(container, item));
     }
     /* リスト・タプル: 各要素と等値比較 */
     if (p2c_obj_is_list(container) || container->cls == &P2C_Class_Tuple) {
@@ -15581,9 +16196,12 @@ P2C_Object* p2c_obj_contains(P2C_Object *container, P2C_Object *item) {
     /* 辞書: キーの存在確認 */
     if (container->cls == &P2C_Class_Dict || container->cls == &P2C_Class_Set) {
         if (!p2c_require_hashable(item)) return &P2C_False;
-        if (!container->u.v_dict.buckets) return &P2C_False;
-        for (size_t i = 0; i < container->u.v_dict.bucket_count; i++) {
-            for (P2C_DictEntry *e = container->u.v_dict.buckets[i]; e; e = e->next) {
+        if (!container->u.v_dict.buckets || container->u.v_dict.bucket_count == 0) return &P2C_False;
+        /* 以前は全バケットを舐めており、辞書/集合の包含判定が実質 O(n) だった。
+         * 挿入側と同じハッシュで1バケットに絞る（平均 O(1)）。 */
+        {
+            size_t h = p2c_obj_hash(item) % container->u.v_dict.bucket_count;
+            for (P2C_DictEntry *e = container->u.v_dict.buckets[h]; e; e = e->next) {
                 if (p2c_obj_equal_raw(e->key, item)) return &P2C_True;
             }
         }
@@ -15669,6 +16287,34 @@ P2C_Object* p2c_set_new(void) {
     return o;
 }
 
+/* ── ハッシュ表の動的拡張（dict/set） ────────────────────────────────
+ * 以前はバケット数が 32 固定で、要素が増えると衝突連鎖だけが伸びていた
+ * （実質 O(n)）。負荷率が高くなったらバケットを増やして張り直す。
+ * 挿入順リスト（order_head/order_next）はそのまま辿るので順序は保たれる。 */
+static void p2c_hash_rehash(P2C_Object *table, size_t new_count) {
+    if (!table || new_count == 0u) return;
+    if (new_count > (size_t)1 << 22) return;  /* 過大な確保を避ける上限 */
+    P2C_DictEntry **nb = (P2C_DictEntry**)p2c_calloc_checked(new_count, sizeof(P2C_DictEntry*), "dict buckets");
+    if (!nb) return;                          /* 失敗時は現状維持（安全側） */
+    for (P2C_DictEntry *e = table->u.v_dict.order_head; e; e = e->order_next) {
+        size_t h = p2c_obj_hash(e->key) % new_count;
+        e->next = nb[h];
+        nb[h] = e;
+    }
+    P2C_DictEntry **old = table->u.v_dict.buckets;
+    table->u.v_dict.buckets = nb;
+    table->u.v_dict.bucket_count = new_count;
+    if (old) p2c_heap_free(old);
+}
+
+/* 負荷率 75% を超えたらバケット数を 4 倍にする。 */
+static void p2c_hash_maybe_grow(P2C_Object *table) {
+    if (!table) return;
+    size_t bc = table->u.v_dict.bucket_count;
+    if (bc == 0u) return;
+    if (table->u.v_dict.len > bc - (bc / 4u)) p2c_hash_rehash(table, bc * 4u);
+}
+
 void p2c_set_add(P2C_Object *set, P2C_Object *item) {
     if (!set || !p2c_obj_is_set(set) || !item) {
         p2c_raise(p2c_make_exception("TypeError", "set add requires a set and a value"));
@@ -15689,6 +16335,7 @@ void p2c_set_add(P2C_Object *set, P2C_Object *item) {
     else set->u.v_dict.order_head = entry;
     set->u.v_dict.order_tail = entry;
     set->u.v_dict.len++;
+    p2c_hash_maybe_grow(set);
 }
 
 static bool p2c_set_remove_item(P2C_Object *set, P2C_Object *item) {
@@ -15794,6 +16441,7 @@ void p2c_dict_set(P2C_Object *dict, P2C_Object *key, P2C_Object *val) {
     else dict->u.v_dict.order_head = e;
     dict->u.v_dict.order_tail = e;
     dict->u.v_dict.len++;
+    p2c_hash_maybe_grow(dict);
 }
 
 void p2c_dict_update(P2C_Object *dict, P2C_Object *mapping) {
@@ -15912,7 +16560,8 @@ size_t p2c_obj_str_len(P2C_Object *s) { return (s && p2c_obj_is_str(s)) ? s->u.v
 /* Python の str.format() 実装。
  * {} (自動インデックス), {0}/{1} (位置), {name:fmt} のフォーマット仕様に対応。
  * シンプルな動的バッファで実装し、内部のP2C_Stringビルダーには依存しない。 */
-P2C_Object* p2c_str_format_py(const char *fmt, P2C_Object **args, size_t nargs) {
+static P2C_Object* p2c_str_format_py_kw(const char *fmt, P2C_Object **args, size_t nargs,
+                                       const char **kw_names, P2C_Object **kw_values, size_t nkw) {
     if (!fmt) return p2c_obj_from_str("");
     /* 出力バッファ: 適宜倍増する */
     size_t cap = strlen(fmt) * 3 + 64;
@@ -15944,10 +16593,72 @@ P2C_Object* p2c_str_format_py(const char *fmt, P2C_Object **args, size_t nargs) 
             const char *fmt_spec = colon ? colon + 1 : "";
             if (colon) *colon = '\0';
             /* インデックス決定 */
-            size_t idx = auto_idx++;
+            size_t idx = 0;
+            const char *field_name = NULL;
             if (spec_buf[0] >= '0' && spec_buf[0] <= '9') idx = (size_t)atoi(spec_buf);
-            P2C_Object *arg = (idx < nargs) ? args[idx] : &P2C_None;
+            else if (spec_buf[0] != '\0') field_name = spec_buf;   /* "{name}" */
+            else idx = auto_idx++;                                  /* "{}" */
+            P2C_Object *arg = &P2C_None;
+            if (field_name) {
+                /* 名前フィールドはキーワード引数から引く（無ければ KeyError）。 */
+                for (size_t k = 0; k < nkw; k++) {
+                    if (kw_names && kw_names[k] && strcmp(kw_names[k], field_name) == 0) {
+                        arg = kw_values[k];
+                        break;
+                    }
+                }
+                if (arg == &P2C_None) {
+                    bool found = false;
+                    for (size_t k = 0; k < nkw; k++) {
+                        if (kw_names && kw_names[k] && strcmp(kw_names[k], field_name) == 0) { found = true; break; }
+                    }
+                    if (!found) {
+                        char kb[160];
+                        size_t kp = 0;
+                        p2c_append_text(kb, sizeof(kb), &kp, "'");
+                        p2c_append_text(kb, sizeof(kb), &kp, field_name);
+                        p2c_append_text(kb, sizeof(kb), &kp, "'");
+                        p2c_raise(p2c_make_exception("KeyError", kb));
+                        return &P2C_None;
+                    }
+                }
+            } else if (idx < nargs) {
+                arg = args[idx];
+            }
             char val_buf[256] = {0};
+            /* Python のアラインメント（[fill]< > ^）と幅を取り出す。幅寄せは
+             * コードポイント単位で自前に行う（"é" などでバイト数と文字数が
+             * ずれるため snprintf の %s では正しくならない）。
+             * 明示のアラインメントが無い数値は、従来どおり spec 全体を
+             * snprintf へ渡す（0 埋め "05d" などの挙動を変えないため）。 */
+            char align_ch = 0;
+            char fill_buf[8] = " ";
+            const char *fill_str = fill_buf;
+            size_t pad_width = 0;
+            const char *num_spec = fmt_spec;
+            bool manual_pad = false;
+            {
+                const char *q = fmt_spec;
+                if (q[0] && q[1] && (q[1] == '<' || q[1] == '>' || q[1] == '^')) {
+                    {
+                        /* fill は 1 コードポイントだけ取り出す（"*^9" のような
+                         * 残り全体を fill として追記してしまうバグを防ぐ）。 */
+                        size_t flen = p2c_utf8_step(q, strlen(q), 0);
+                        if (flen == 0u || flen >= sizeof(fill_buf)) flen = 1u;
+                        memcpy(fill_buf, q, flen);
+                        fill_buf[flen] = '\0';
+                    }
+                    align_ch = q[1];
+                    q += 2;
+                } else if (q[0] == '<' || q[0] == '>' || q[0] == '^') {
+                    align_ch = q[0];
+                    q += 1;
+                }
+                while (*q >= '0' && *q <= '9') { pad_width = pad_width * 10u + (size_t)(*q - '0'); q++; }
+                num_spec = q;
+                manual_pad = (align_ch != 0) || p2c_obj_is_str(arg);
+                if (!align_ch) align_ch = p2c_obj_is_str(arg) ? '<' : '>';
+            }
             if (fmt_spec[0]) {
                 /* C printf仕様に変換: %<spec_without_last><spec_char>
                  * fmt_spec は spec_buf（最大255文字）由来のため、"%" + fmt_spec +
@@ -15955,25 +16666,75 @@ P2C_Object* p2c_str_format_py(const char *fmt, P2C_Object **args, size_t nargs) 
                  * （固定64バイトだと極端に長い書式指定でGCCのformat-truncation
                  * 警告(-Werror)が出るのに加え、実際に切り詰められうる）。 */
                 char c_fmt[sizeof(spec_buf) + 16];
-                char spec_char = fmt_spec[strlen(fmt_spec)-1];
+                const char *use_spec = manual_pad ? num_spec : fmt_spec;
+                char spec_no_type[sizeof(spec_buf) + 16];
+                {
+                    size_t snl = use_spec[0] ? strlen(use_spec) - 1u : 0u;
+                    if (snl >= sizeof(spec_no_type)) snl = sizeof(spec_no_type) - 1u;
+                    memcpy(spec_no_type, use_spec, snl);
+                    spec_no_type[snl] = '\0';
+                }
+                char spec_char = use_spec[0] ? use_spec[strlen(use_spec)-1] : 0;
                 if (spec_char == 'd' || spec_char == 'i') {
-                    snprintf(c_fmt, sizeof(c_fmt), "%%%s", fmt_spec);
+                    snprintf(c_fmt, sizeof(c_fmt), "%%%s", use_spec);
                     snprintf(val_buf, sizeof(val_buf), c_fmt, (long long)p2c_obj_as_int(arg));
                 } else if (spec_char == 'f' || spec_char == 'e' || spec_char == 'g' ||
                            spec_char == 'E' || spec_char == 'G') {
-                    snprintf(c_fmt, sizeof(c_fmt), "%%%s", fmt_spec);
+                    snprintf(c_fmt, sizeof(c_fmt), "%%%s", use_spec);
                     snprintf(val_buf, sizeof(val_buf), c_fmt, p2c_obj_as_float(arg));
                 } else if (spec_char == 's') {
-                    snprintf(c_fmt, sizeof(c_fmt), "%%%ss", fmt_spec);
+                    /* "%" + spec + "s" を手で組む（snprintf だと GCC が
+                     * -Wformat-truncation を出すため）。 */
+                    size_t snl2 = strlen(spec_no_type);
+                    if (snl2 > sizeof(c_fmt) - 3u) snl2 = sizeof(c_fmt) - 3u;
+                    c_fmt[0] = '%';
+                    memcpy(c_fmt + 1, spec_no_type, snl2);
+                    c_fmt[1 + snl2] = 's';
+                    c_fmt[2 + snl2] = '\0';
                     const char *sv = p2c_obj_as_str(arg);
                     snprintf(val_buf, sizeof(val_buf), c_fmt, sv ? sv : "None");
+                } else if (spec_char == 'x' || spec_char == 'X' || spec_char == 'o') {
+                    /* "%" + spec + "ll" + 型文字 を手で組む（snprintf だと GCC が
+                     * -Wformat-truncation を出すため）。 */
+                    size_t snl3 = strlen(spec_no_type);
+                    if (snl3 > sizeof(c_fmt) - 5u) snl3 = sizeof(c_fmt) - 5u;
+                    c_fmt[0] = '%';
+                    memcpy(c_fmt + 1, spec_no_type, snl3);
+                    c_fmt[1 + snl3] = 'l';
+                    c_fmt[2 + snl3] = 'l';
+                    c_fmt[3 + snl3] = spec_char;
+                    c_fmt[4 + snl3] = '\0';
+                    snprintf(val_buf, sizeof(val_buf), c_fmt, (long long)p2c_obj_as_int(arg));
+                } else if (spec_char == 'b') {
+                    /* C に %b が無いので自前で 2 進化する。 */
+                    uint64_t bv = (uint64_t)p2c_obj_as_int(arg);
+                    char bin[72];
+                    size_t bn = 0;
+                    if (bv == 0) bin[bn++] = '0';
+                    while (bv > 0 && bn < sizeof(bin) - 1u) { bin[bn++] = (char)('0' + (int)(bv & 1u)); bv >>= 1; }
+                    for (size_t bi = 0; bi < bn; bi++) val_buf[bi] = bin[bn - 1u - bi];
+                    val_buf[bn] = '\0';
                 } else {
                     /* フォールバック */
                     if (p2c_obj_is_int(arg)) { snprintf(c_fmt, sizeof(c_fmt), "%%%sd", fmt_spec); snprintf(val_buf, sizeof(val_buf), c_fmt, (long long)p2c_obj_as_int(arg)); }
                     else if (p2c_obj_is_float(arg)) { snprintf(c_fmt, sizeof(c_fmt), "%%%sg", fmt_spec); snprintf(val_buf, sizeof(val_buf), c_fmt, p2c_obj_as_float(arg)); }
                     else { const char *sv = p2c_obj_as_str(arg); snprintf(val_buf, sizeof(val_buf), "%s", sv ? sv : "None"); }
                 }
-                FBUF_APPEND(val_buf);
+                if (manual_pad && pad_width > 0) {
+                    size_t cps = p2c_utf8_count(val_buf, strlen(val_buf));
+                    if (pad_width > cps) {
+                        size_t pad = pad_width - cps;
+                        size_t lpad = (align_ch == '<') ? 0u : ((align_ch == '>') ? pad : pad / 2u);
+                        size_t rpad = pad - lpad;
+                        for (size_t i = 0; i < lpad; i++) FBUF_APPEND(fill_str);
+                        FBUF_APPEND(val_buf);
+                        for (size_t i = 0; i < rpad; i++) FBUF_APPEND(fill_str);
+                    } else {
+                        FBUF_APPEND(val_buf);
+                    }
+                } else {
+                    FBUF_APPEND(val_buf);
+                }
             } else {
                 /* 書式なし: str() 相当 - p2c_obj_str() で int/float も正しく変換 */
                 P2C_Object *sval = p2c_obj_str(arg);
@@ -16095,13 +16856,13 @@ void p2c_module_set_attr(P2C_Object *module, const char *name, P2C_Object *val) 
 }
 void p2c_register_module(P2C_Object *module) {
     if (!module || !module->u.v_module.name) return;
-    if (!g_module_registry) g_module_registry = new_attr_map();
-    if (!g_module_registry) return;
-    attr_map_set(g_module_registry, module->u.v_module.name, module);
+    if (!P2C_CTX->module_registry) P2C_CTX->module_registry = new_attr_map();
+    if (!P2C_CTX->module_registry) return;
+    attr_map_set(P2C_CTX->module_registry, module->u.v_module.name, module);
 }
 P2C_Object* p2c_import_module(const char *name) {
-    if (!g_module_registry) g_module_registry = new_attr_map();
-    P2C_Object *module = attr_map_get(g_module_registry, name);
+    if (!P2C_CTX->module_registry) P2C_CTX->module_registry = new_attr_map();
+    P2C_Object *module = attr_map_get(P2C_CTX->module_registry, name);
     if (module) return module;
     p2c_raise(p2c_make_exception("ImportError", name ? name : "<module>"));
     return &P2C_None;
@@ -16128,28 +16889,35 @@ static P2C_Object** p2c_iter_items(P2C_Object *obj, size_t *out_n, bool *out_own
  * メソッド解決時に基底クラスのクラスオブジェクトを辿れるように登録しておく。
  * (以前はこの仕組みがなく、サブクラスが自分でオーバーライドしていない
  * メソッドを呼び出すと解決できずクラッシュしていた。) */
-#define P2C_MAX_CLASS_REGISTRY 256
-static const char *g_class_registry_names[P2C_MAX_CLASS_REGISTRY];
-static P2C_Object *g_class_registry_objs[P2C_MAX_CLASS_REGISTRY];
-static int g_class_registry_count = 0;
 
 static void p2c_register_class(const char *name, P2C_Object *cls_obj) {
-    if (!name || g_class_registry_count >= P2C_MAX_CLASS_REGISTRY) return;
-    g_class_registry_names[g_class_registry_count] = name;
-    g_class_registry_objs[g_class_registry_count] = cls_obj;
-    g_class_registry_count++;
+    if (!name) return;
+    if (P2C_CTX->class_count >= P2C_MAX_CLASS_REGISTRY) {
+        /* 登録できない = 名前引き・super() から見えなくなる。無言で続けると
+         * 後で「別のクラスのメソッドが呼ばれる」等の誤動作になるため通知する。 */
+        p2c_limit_exceeded("class registry", P2C_MAX_CLASS_REGISTRY,
+                           "P2C_MAX_CLASS_REGISTRY", name, true);
+        return;
+    }
+    P2C_CTX->class_names[P2C_CTX->class_count] = name;
+    P2C_CTX->class_objs[P2C_CTX->class_count] = cls_obj;
+    P2C_CTX->class_count++;
 }
 
 static void p2c_reset_class_registry(void) {
-    memset(g_class_registry_names, 0, sizeof(g_class_registry_names));
-    memset(g_class_registry_objs, 0, sizeof(g_class_registry_objs));
-    g_class_registry_count = 0;
+    memset(P2C_CTX->class_names, 0, sizeof(P2C_CTX->class_names));
+    memset(P2C_CTX->class_objs, 0, sizeof(P2C_CTX->class_objs));
+    P2C_CTX->class_count = 0;
 }
 
 static P2C_Object* p2c_find_class_by_name(const char *name) {
     if (!name || !name[0]) return NULL;
-    for (int i = 0; i < g_class_registry_count; i++) {
-        if (strcmp(g_class_registry_names[i], name) == 0) return g_class_registry_objs[i];
+    /* 後から登録された（= 後から定義された）クラスを優先する。
+     * ランタイムやモジュール側の既存クラス（例: pygame の Rect/Surface/Sprite）と
+     * ユーザー定義クラスが同名のとき、名前引きが先着側を返すと継承元を取り違え、
+     * 基底のMROが空になる（super() が無言の別クラスを呼ぶ）ため。 */
+    for (int i = P2C_CTX->class_count - 1; i >= 0; i--) {
+        if (P2C_CTX->class_names[i] && strcmp(P2C_CTX->class_names[i], name) == 0) return P2C_CTX->class_objs[i];
     }
     return NULL;
 }
@@ -16175,12 +16943,20 @@ static P2C_Object* p2c_find_class_by_name(const char *name) {
  * 同じ深さ優先の訪問順をキャッシュする。このときの解決結果は以前の実装と
  * 一致する（安全側へのフォールバック）。
  */
+#ifndef P2C_MRO_MAX_NAMES
 #define P2C_MRO_MAX_NAMES 32
+#endif
+#ifndef P2C_MRO_MAX_BASES
 #define P2C_MRO_MAX_BASES 8
+#endif
+#ifndef P2C_MRO_MAX_DEPTH
 #define P2C_MRO_MAX_DEPTH 12
+#endif
 /* アリーナはMRO計算中だけ使う一時領域。組込み（カーネルスタックが数KB）でも
  * 収まるよう、各再帰フレームの作業配列は小さく、アリーナも4KB未満に抑える。 */
+#ifndef P2C_MRO_ARENA_BYTES
 #define P2C_MRO_ARENA_BYTES 3072
+#endif
 
 typedef struct {
     const char *names[P2C_MRO_MAX_NAMES];
@@ -16360,6 +17136,10 @@ static const char* p2c_class_mro(P2C_Object *cls_obj) {
     arena.used = 0;
     order.count = 0;
     if (!p2c_c3_linearize(cls_obj, &order, &arena, 0)) {
+        /* C3 を計算できない（循環 or 上限超過）。以前どおり深さ優先順へ
+         * フォールバックするが、黙って違う MRO にしないよう必ず通知する。 */
+        p2c_limit_exceeded("C3 MRO", P2C_MRO_MAX_DEPTH, "P2C_MRO_MAX_DEPTH",
+                           cls_obj->u.v_class.name, false);
         order.count = 0;
         arena.used = 0;
         if (!p2c_mro_dfs_collect(cls_obj, &order, &arena, 0)) order.count = 0;
@@ -16391,9 +17171,10 @@ static bool p2c_name_span_equals(const P2C_NameSpan *span, const char *name) {
 
 static P2C_Object* p2c_find_class_by_span(const P2C_NameSpan *span) {
     if (!span || span->len == 0) return NULL;
-    for (int i = 0; i < g_class_registry_count; i++) {
-        const char *name = g_class_registry_names[i];
-        if (name && p2c_name_span_equals(span, name)) return g_class_registry_objs[i];
+    /* 名前引きと同じく、後から登録された定義を優先する。 */
+    for (int i = P2C_CTX->class_count - 1; i >= 0; i--) {
+        const char *name = P2C_CTX->class_names[i];
+        if (name && p2c_name_span_equals(span, name)) return P2C_CTX->class_objs[i];
     }
     return NULL;
 }
@@ -16683,6 +17464,7 @@ P2C_Object* p2c_builtin_iter(P2C_Object *obj) {
         return it;
     }
     switch (obj->cls->type_tag) {
+        case OBJ_RANGE: /* range もインデックスで辿れる系列 */
         case OBJ_LIST: case OBJ_TUPLE: case OBJ_STR: case OBJ_DICT: case OBJ_SET: case OBJ_INSTANCE: {
             P2C_Object *it = p2c_obj_new(&P2C_Class_Iterator);
             if (!it) return &P2C_None;
@@ -16799,20 +17581,12 @@ P2C_Object* p2c_builtin_next(P2C_Object *it) {
     return val;
 }
 
-#ifndef P2C_ASYNC_QUEUE_CAPACITY
-#define P2C_ASYNC_QUEUE_CAPACITY 256
-#endif
-
-static P2C_Object *g_async_queue[P2C_ASYNC_QUEUE_CAPACITY];
-static size_t g_async_queue_head = 0;
-static size_t g_async_queue_tail = 0;
-static size_t g_async_queue_count = 0;
 
 static void p2c_reset_async_queue(void) {
-    memset(g_async_queue, 0, sizeof(g_async_queue));
-    g_async_queue_head = 0;
-    g_async_queue_tail = 0;
-    g_async_queue_count = 0;
+    memset(P2C_CTX->async_queue, 0, sizeof(P2C_CTX->async_queue));
+    P2C_CTX->async_head = 0;
+    P2C_CTX->async_tail = 0;
+    P2C_CTX->async_count = 0;
 }
 
 static bool p2c_is_generator_object(P2C_Object *obj) {
@@ -16956,19 +17730,19 @@ void p2c_async_schedule(P2C_Object *coroutine) {
         return;
     }
     if (coroutine->u.v_iterator.done || coroutine->u.v_iterator.queued) return;
-    if (g_async_queue_count == P2C_ASYNC_QUEUE_CAPACITY) {
+    if (P2C_CTX->async_count == P2C_ASYNC_QUEUE_CAPACITY) {
         p2c_raise(p2c_make_exception("RuntimeError", "async queue capacity exceeded"));
         return;
     }
     p2c_obj_incref(coroutine);
     coroutine->u.v_iterator.queued = true;
-    g_async_queue[g_async_queue_tail] = coroutine;
-    g_async_queue_tail = (g_async_queue_tail + 1) % P2C_ASYNC_QUEUE_CAPACITY;
-    g_async_queue_count++;
+    P2C_CTX->async_queue[P2C_CTX->async_tail] = coroutine;
+    P2C_CTX->async_tail = (P2C_CTX->async_tail + 1) % P2C_ASYNC_QUEUE_CAPACITY;
+    P2C_CTX->async_count++;
 }
 
 size_t p2c_async_pending_count(void) {
-    return g_async_queue_count;
+    return P2C_CTX->async_count;
 }
 
 P2C_Object* p2c_async_run(P2C_Object *coroutine) {
@@ -16978,11 +17752,11 @@ P2C_Object* p2c_async_run(P2C_Object *coroutine) {
     }
     p2c_obj_incref(coroutine);
     p2c_async_schedule(coroutine);
-    while (!coroutine->u.v_iterator.done && g_async_queue_count > 0) {
-        P2C_Object *current = g_async_queue[g_async_queue_head];
-        g_async_queue[g_async_queue_head] = NULL;
-        g_async_queue_head = (g_async_queue_head + 1) % P2C_ASYNC_QUEUE_CAPACITY;
-        g_async_queue_count--;
+    while (!coroutine->u.v_iterator.done && P2C_CTX->async_count > 0) {
+        P2C_Object *current = P2C_CTX->async_queue[P2C_CTX->async_head];
+        P2C_CTX->async_queue[P2C_CTX->async_head] = NULL;
+        P2C_CTX->async_head = (P2C_CTX->async_head + 1) % P2C_ASYNC_QUEUE_CAPACITY;
+        P2C_CTX->async_count--;
         current->u.v_iterator.queued = false;
         if (!current->u.v_iterator.done) {
             P2C_Object *waiting = current->u.v_iterator.awaiting;
@@ -17378,29 +18152,53 @@ P2C_Object* p2c_call_attr(P2C_Object *obj, const char *name, P2C_Object **args, 
         } else if (obj->cls->type_tag == OBJ_STR) {
             const char *s = p2c_obj_as_str(obj);
             if (strcmp(name, "upper") == 0 || strcmp(name, "lower") == 0 || strcmp(name, "casefold") == 0) {
-                size_t len = strlen(s);
-                char *buf = (char*)p2c_malloc_checked(len + 1, "string copy");
-                if (!buf) return &P2C_None;
-                for (size_t i = 0; i < len; i++) buf[i] = (strcmp(name, "upper") == 0) ? (char)toupper((unsigned char)s[i]) : (char)tolower((unsigned char)s[i]);
-                buf[len] = '\0';
-                P2C_Object *out = p2c_obj_from_str(buf);
-                p2c_heap_free(buf);
+                /* コードポイント単位で大小変換する（非ASCIIも対象）。 */
+                bool to_upper = (strcmp(name, "upper") == 0);
+                bool is_casefold = (strcmp(name, "casefold") == 0);
+                size_t bytes = strlen(s);
+                P2C_String *cbuf = p2c_str_new(NULL);
+                if (!cbuf) return &P2C_None;
+                size_t off = 0u;
+                while (off < bytes) {
+                    int64_t cp = p2c_utf8_decode(s, bytes, off);
+                    size_t step = p2c_utf8_step(s, bytes, off);
+                    char enc[8];
+                    if (cp < 0) { memcpy(enc, s + off, step); enc[step] = '\0'; }
+                    else if (p2c_utf8_special_case(cp, to_upper, is_casefold, cbuf)) { enc[0] = '\0'; }
+                    else p2c_utf8_encode(to_upper ? p2c_utf8_toupper_cp(cp) : p2c_utf8_tolower_cp(cp), enc);
+                    p2c_str_append(cbuf, enc);
+                    off += step;
+                }
+                P2C_Object *out = p2c_obj_from_str(p2c_str_cstr(cbuf));
+                p2c_str_free(cbuf);
                 return out;
             }
             if (strcmp(name, "capitalize") == 0 || strcmp(name, "swapcase") == 0) {
-                size_t len = strlen(s);
-                char *buf = (char*)p2c_malloc_checked(len + 1, "string copy");
-                if (!buf) return &P2C_None;
-                for (size_t i = 0; i < len; i++) {
-                    unsigned char ch = (unsigned char)s[i];
-                    if (strcmp(name, "capitalize") == 0) buf[i] = (i == 0) ? (char)toupper(ch) : (char)tolower(ch);
-                    else if (ch >= (unsigned char)'a' && ch <= (unsigned char)'z') buf[i] = (char)toupper(ch);
-                    else if (ch >= (unsigned char)'A' && ch <= (unsigned char)'Z') buf[i] = (char)tolower(ch);
-                    else buf[i] = (char)ch;
+                bool is_cap = (strcmp(name, "capitalize") == 0);
+                size_t bytes = strlen(s);
+                P2C_String *cbuf = p2c_str_new(NULL);
+                if (!cbuf) return &P2C_None;
+                size_t off = 0u, cp_index = 0u;
+                while (off < bytes) {
+                    int64_t cp = p2c_utf8_decode(s, bytes, off);
+                    size_t step = p2c_utf8_step(s, bytes, off);
+                    char enc[8];
+                    int64_t mapped = cp;
+                    if (cp >= 0) {
+                        if (is_cap) mapped = (cp_index == 0u) ? p2c_utf8_toupper_cp(cp) : p2c_utf8_tolower_cp(cp);
+                        else {
+                            int64_t up = p2c_utf8_toupper_cp(cp);
+                            mapped = (up != cp) ? up : p2c_utf8_tolower_cp(cp);
+                        }
+                    }
+                    if (cp < 0) { memcpy(enc, s + off, step); enc[step] = '\0'; }
+                    else p2c_utf8_encode(mapped, enc);
+                    p2c_str_append(cbuf, enc);
+                    off += step;
+                    cp_index++;
                 }
-                buf[len] = '\0';
-                P2C_Object *out = p2c_obj_from_str(buf);
-                p2c_heap_free(buf);
+                P2C_Object *out = p2c_obj_from_str(p2c_str_cstr(cbuf));
+                p2c_str_free(cbuf);
                 return out;
             }
             if (strcmp(name, "strip") == 0 && nargs == 0) {
@@ -17415,6 +18213,88 @@ P2C_Object* p2c_call_attr(P2C_Object *obj, const char *name, P2C_Object **args, 
                 P2C_Object *out = p2c_obj_from_str(buf);
                 p2c_heap_free(buf);
                 return out;
+            }
+            /* str.rsplit(sep=None, maxsplit=-1): 右から分割する。
+             * 断片は元の文字列の部分文字列（区切りの並びは落ち、空白の並びは
+             * 断片の内側では保たれる）。 */
+            if (strcmp(name, "rsplit") == 0) {
+                const char *sep = (nargs >= 1 && args[0] != &P2C_None) ? p2c_obj_as_str(args[0]) : NULL;
+                int64_t maxsplit = nargs >= 2 ? p2c_obj_as_int(args[1]) : -1;
+                size_t len = strlen(s);
+                size_t seplen = sep ? strlen(sep) : 0u;
+                if (sep && seplen == 0) {
+                    p2c_raise(p2c_make_exception("ValueError", "empty separator"));
+                    return &P2C_None;
+                }
+                P2C_Object **pieces = NULL;
+                size_t npieces = 0, cap = 0;
+                size_t end = len;
+                int64_t splits = 0;
+                bool oom = false;
+                if (!sep) {
+                    while (end > 0 && isspace((unsigned char)s[end - 1])) end--;
+                }
+                while (end > 0) {
+                    if (maxsplit >= 0 && splits >= maxsplit) break;
+                    size_t cut = 0;
+                    bool found = false;
+                    if (sep) {
+                        if (end >= seplen) {
+                            size_t q = end - seplen;
+                            for (;;) {
+                                if (memcmp(s + q, sep, seplen) == 0) { cut = q; found = true; break; }
+                                if (q == 0) break;
+                                q--;
+                            }
+                        }
+                    } else {
+                        size_t q = end;
+                        while (q > 0 && !isspace((unsigned char)s[q - 1])) q--;
+                        if (q > 0) {
+                            size_t r = q;
+                            while (r > 0 && isspace((unsigned char)s[r - 1])) r--;
+                            if (r > 0) { cut = r; found = true; }
+                        }
+                    }
+                    if (!found) break;
+                    if (npieces == cap) {
+                        size_t ncap = cap ? cap * 2u : 8u;
+                        P2C_Object **np = (P2C_Object**)p2c_realloc_checked(
+                            pieces, ncap * sizeof(P2C_Object*), "rsplit pieces");
+                        if (!np) { oom = true; break; }
+                        pieces = np;
+                        cap = ncap;
+                    }
+                    size_t pstart = sep ? (cut + seplen) : cut;
+                    if (!sep) {
+                        while (pstart < end && isspace((unsigned char)s[pstart])) pstart++;
+                    }
+                    pieces[npieces++] = p2c_obj_from_str_n(s + pstart, end - pstart);
+                    splits++;
+                    end = cut;
+                }
+                if (oom) {
+                    for (size_t i = 0; i < npieces; i++) p2c_heap_free(pieces[i]);
+                    if (pieces) p2c_heap_free(pieces);
+                    return &P2C_None;
+                }
+                P2C_Object *rsout = p2c_list_new();
+                if (!rsout) {
+                    for (size_t i = 0; i < npieces; i++) p2c_heap_free(pieces[i]);
+                    if (pieces) p2c_heap_free(pieces);
+                    return &P2C_None;
+                }
+                /* 空白モードで分割数無制限のときは、先頭の空白も落とす
+                 * （CPython: "  a  b".rsplit() は ['a', 'b']、maxsplit 付きなら
+                 * 先頭の空白は残る）。 */
+                size_t head_start = 0;
+                if (!sep && maxsplit < 0) {
+                    while (head_start < end && isspace((unsigned char)s[head_start])) head_start++;
+                }
+                p2c_list_append(rsout, p2c_obj_from_str_n(s + head_start, end - head_start));
+                for (size_t i = npieces; i > 0; i--) p2c_list_append(rsout, pieces[i - 1]);
+                if (pieces) p2c_heap_free(pieces);
+                return rsout;
             }
             if (strcmp(name, "split") == 0) {
                 const char *sep = (nargs >= 1 && args[0] != &P2C_None) ? p2c_obj_as_str(args[0]) : NULL;
@@ -17533,8 +18413,16 @@ P2C_Object* p2c_call_attr(P2C_Object *obj, const char *name, P2C_Object **args, 
                 bool raises_if_missing = strcmp(name, "index") == 0 || strcmp(name, "rindex") == 0;
                 P2C_Object *start_obj = nargs >= 2 ? args[1] : NULL;
                 P2C_Object *stop_obj = nargs >= 3 ? args[2] : NULL;
-                if (!p2c_normalize_search_bounds(strlen(s), start_obj, stop_obj, &start, &stop)) return &P2C_None;
+                if (!p2c_normalize_search_bounds(p2c_utf8_count(s, strlen(s)), start_obj, stop_obj, &start, &stop)) return &P2C_None;
+                /* start/stop と戻り値はコードポイント単位（Python 互換）。
+                 * 検索そのものはバイト列に対して行い、境界と結果だけ変換する。 */
+                {
+                    size_t _sb_len = strlen(s);
+                    start = (int64_t)p2c_utf8_offset(s, _sb_len, (size_t)start);
+                    stop = (int64_t)p2c_utf8_offset(s, _sb_len, (size_t)stop);
+                }
                 int64_t found = p2c_str_find_range(s, start, stop, needle, reverse);
+                if (found >= 0) found = (int64_t)p2c_utf8_count(s, (size_t)found);
                 if (found < 0 && raises_if_missing) {
                     p2c_raise(p2c_make_exception("ValueError", "substring not found"));
                     return &P2C_None;
@@ -17545,7 +18433,12 @@ P2C_Object* p2c_call_attr(P2C_Object *obj, const char *name, P2C_Object **args, 
                 int64_t start, stop;
                 P2C_Object *start_obj = nargs >= 2 ? args[1] : NULL;
                 P2C_Object *stop_obj = nargs >= 3 ? args[2] : NULL;
-                if (!p2c_normalize_search_bounds(strlen(s), start_obj, stop_obj, &start, &stop)) return &P2C_None;
+                if (!p2c_normalize_search_bounds(p2c_utf8_count(s, strlen(s)), start_obj, stop_obj, &start, &stop)) return &P2C_None;
+                {
+                    size_t _sb_len = strlen(s);
+                    start = (int64_t)p2c_utf8_offset(s, _sb_len, (size_t)start);
+                    stop = (int64_t)p2c_utf8_offset(s, _sb_len, (size_t)stop);
+                }
                 return p2c_obj_from_bool(p2c_str_edge_matches(s, start, stop, args[0], strcmp(name, "endswith") == 0));
             }
             if (strcmp(name, "removeprefix") == 0 && nargs == 1) {
@@ -17564,31 +18457,43 @@ P2C_Object* p2c_call_attr(P2C_Object *obj, const char *name, P2C_Object **args, 
             }
             /* str.title() */
             if (strcmp(name, "title") == 0) {
-                size_t slen = strlen(s);
-                char *buf = (char*)p2c_malloc_checked(slen + 1, "string replace"); if (!buf) return obj;
+                size_t bytes = strlen(s);
+                P2C_String *tbuf = p2c_str_new(NULL);
+                if (!tbuf) return obj;
                 bool cap_next = true;
-                for (size_t i = 0; i < slen; i++) {
-                    unsigned char c = (unsigned char)s[i];
-                    if (c == ' ' || c == '\t' || c == '\n') { buf[i] = (char)c; cap_next = true; }
-                    else if (cap_next) { buf[i] = (char)toupper(c); cap_next = false; }
-                    else { buf[i] = (char)tolower(c); }
+                size_t off = 0u;
+                while (off < bytes) {
+                    int64_t cp = p2c_utf8_decode(s, bytes, off);
+                    size_t step = p2c_utf8_step(s, bytes, off);
+                    char enc[8];
+                    bool is_sep = (cp == ' ' || cp == '\t' || cp == '\n' || cp == '\r' || cp == '\f' || cp == '\v');
+                    int64_t mapped = cp;
+                    if (cp >= 0) {
+                        if (is_sep) cap_next = true;
+                        else if (cap_next) { mapped = p2c_utf8_toupper_cp(cp); cap_next = false; }
+                        else mapped = p2c_utf8_tolower_cp(cp);
+                    }
+                    if (cp < 0) { memcpy(enc, s + off, step); enc[step] = '\0'; }
+                    else p2c_utf8_encode(mapped, enc);
+                    p2c_str_append(tbuf, enc);
+                    off += step;
                 }
-                buf[slen] = '\0';
-                P2C_Object *r = p2c_obj_from_str(buf); p2c_heap_free(buf); return r;
+                P2C_Object *r = p2c_obj_from_str(p2c_str_cstr(tbuf)); p2c_str_free(tbuf); return r;
             }
             /* str.center(width[, fill]) */
             if (strcmp(name, "center") == 0 && nargs >= 1) {
                 int64_t w = p2c_obj_as_int(args[0]);
                 char fill = (nargs >= 2) ? p2c_obj_as_str(args[1])[0] : ' ';
-                size_t slen = strlen(s);
-                if ((size_t)w <= slen) return obj;
-                size_t pad = (size_t)w - slen;
+                size_t slen = strlen(s);                       /* バイト数（コピー用） */
+                size_t cps = p2c_utf8_count(s, slen);           /* 幅はコードポイント数で数える */
+                if ((size_t)w <= cps) return obj;
+                size_t pad = (size_t)w - cps;
                 size_t lpad = pad / 2, rpad = pad - lpad;
-                char *buf = (char*)p2c_malloc_checked((size_t)w + 1, "string pad"); if (!buf) return obj;
+                char *buf = (char*)p2c_malloc_checked(slen + pad + 1, "string pad"); if (!buf) return obj;
                 for (size_t i = 0; i < lpad; i++) buf[i] = fill;
                 memcpy(buf + lpad, s, slen);
                 for (size_t i = 0; i < rpad; i++) buf[lpad + slen + i] = fill;
-                buf[w] = '\0';
+                buf[slen + pad] = '\0';
                 P2C_Object *r = p2c_obj_from_str(buf); p2c_heap_free(buf); return r;
             }
             /* str.ljust(width[, fill]) */
@@ -17596,11 +18501,13 @@ P2C_Object* p2c_call_attr(P2C_Object *obj, const char *name, P2C_Object **args, 
                 int64_t w = p2c_obj_as_int(args[0]);
                 char fill = (nargs >= 2) ? p2c_obj_as_str(args[1])[0] : ' ';
                 size_t slen = strlen(s);
-                if ((size_t)w <= slen) return obj;
-                char *buf = (char*)p2c_malloc_checked((size_t)w + 1, "string pad"); if (!buf) return obj;
+                size_t cps = p2c_utf8_count(s, slen);
+                if ((size_t)w <= cps) return obj;
+                size_t pad = (size_t)w - cps;
+                char *buf = (char*)p2c_malloc_checked(slen + pad + 1, "string pad"); if (!buf) return obj;
                 memcpy(buf, s, slen);
-                for (size_t i = slen; i < (size_t)w; i++) buf[i] = fill;
-                buf[w] = '\0';
+                for (size_t i = slen; i < slen + pad; i++) buf[i] = fill;
+                buf[slen + pad] = '\0';
                 P2C_Object *r = p2c_obj_from_str(buf); p2c_heap_free(buf); return r;
             }
             /* str.rjust(width[, fill]) */
@@ -17608,25 +18515,33 @@ P2C_Object* p2c_call_attr(P2C_Object *obj, const char *name, P2C_Object **args, 
                 int64_t w = p2c_obj_as_int(args[0]);
                 char fill = (nargs >= 2) ? p2c_obj_as_str(args[1])[0] : ' ';
                 size_t slen = strlen(s);
-                if ((size_t)w <= slen) return obj;
-                size_t pad = (size_t)w - slen;
-                char *buf = (char*)p2c_malloc_checked((size_t)w + 1, "string pad"); if (!buf) return obj;
+                size_t cps = p2c_utf8_count(s, slen);   /* 幅はコードポイント数 */
+                if ((size_t)w <= cps) return obj;
+                size_t pad = (size_t)w - cps;
+                char *buf = (char*)p2c_malloc_checked(slen + pad + 1, "string pad"); if (!buf) return obj;
                 for (size_t i = 0; i < pad; i++) buf[i] = fill;
-                memcpy(buf + pad, s, slen); buf[w] = '\0';
+                memcpy(buf + pad, s, slen); buf[slen + pad] = '\0';
                 P2C_Object *r = p2c_obj_from_str(buf); p2c_heap_free(buf); return r;
             }
-            /* str.zfill(width) */
+                        /* str.zfill(width) */
             if (strcmp(name, "zfill") == 0 && nargs >= 1) {
                 int64_t w = p2c_obj_as_int(args[0]);
                 size_t slen = strlen(s);
-                if ((size_t)w <= slen) return obj;
-                size_t pad = (size_t)w - slen;
-                char *buf = (char*)p2c_malloc_checked((size_t)w + 1, "string pad"); if (!buf) return obj;
-                size_t off = 0;
-                if (slen > 0 && (s[0] == '+' || s[0] == '-')) { buf[off++] = s[0]; }
-                for (size_t i = 0; i < pad; i++) buf[off + i] = '0';
-                memcpy(buf + off + pad, s + off, slen - off); buf[w] = '\0';
+                size_t cps = p2c_utf8_count(s, slen);
+                if ((size_t)w <= cps) return obj;
+                /* 符号は先頭のまま（"-5".zfill(4) は "-005"）。幅はコードポイント数。 */
+                size_t lead = (slen > 0 && (s[0] == '-' || s[0] == '+')) ? 1u : 0u;
+                size_t pad = (size_t)w - cps;
+                char *buf = (char*)p2c_malloc_checked(slen + pad + 1, "string pad");
+                if (!buf) return obj;
+                size_t pos = 0;
+                if (lead) buf[pos++] = s[0];
+                for (size_t i = 0; i < pad; i++) buf[pos++] = '0';
+                if (slen > lead) memcpy(buf + pos, s + lead, slen - lead);
+                pos += slen - lead;
+                buf[pos] = '\0';
                 P2C_Object *r = p2c_obj_from_str(buf); p2c_heap_free(buf); return r;
+
             }
             if (strcmp(name, "count") == 0 && nargs >= 1) {
                 const char *sub = p2c_obj_as_str(args[0]);
@@ -17634,7 +18549,12 @@ P2C_Object* p2c_call_attr(P2C_Object *obj, const char *name, P2C_Object **args, 
                 int64_t start, stop, count = 0;
                 P2C_Object *start_obj = nargs >= 2 ? args[1] : NULL;
                 P2C_Object *stop_obj = nargs >= 3 ? args[2] : NULL;
-                if (!p2c_normalize_search_bounds(strlen(s), start_obj, stop_obj, &start, &stop)) return &P2C_None;
+                if (!p2c_normalize_search_bounds(p2c_utf8_count(s, strlen(s)), start_obj, stop_obj, &start, &stop)) return &P2C_None;
+                {
+                    size_t _sb_len = strlen(s);
+                    start = (int64_t)p2c_utf8_offset(s, _sb_len, (size_t)start);
+                    stop = (int64_t)p2c_utf8_offset(s, _sb_len, (size_t)stop);
+                }
                 if (sublen == 0) return p2c_obj_from_int(stop >= start ? stop - start + 1 : 0);
                 for (int64_t pos = start; pos + (int64_t)sublen <= stop; ) {
                     if (strncmp(s + pos, sub, sublen) == 0) {
@@ -17817,6 +18737,33 @@ P2C_Object* p2c_call_attr_kw(P2C_Object *obj, const char *name, P2C_Object **arg
         }
     }
     if (owns_flat) { p2c_heap_free(flat_names); p2c_heap_free(flat_values); }
+    /* str.format はキーワード引数でフィールド名を埋める。 */
+    if (obj && p2c_obj_is_str(obj) && name && strcmp(name, "format") == 0) {
+        return p2c_str_format_py_kw(p2c_obj_as_str(obj), args, nargs, kw_names, kw_values, nkw);
+    }
+    /* list.sort(key=..., reverse=...) はキーワードを受け付ける。 */
+    if (obj && obj->cls && obj->cls->type_tag == OBJ_LIST && name && strcmp(name, "sort") == 0) {
+        P2C_Object *keyfn = NULL;
+        P2C_Object *rev = &P2C_False;
+        for (size_t i = 0; i < nkw; i++) {
+            if (!kw_names || !kw_names[i]) continue;
+            if (strcmp(kw_names[i], "key") == 0 && kw_values[i] != &P2C_None) keyfn = kw_values[i];
+            else if (strcmp(kw_names[i], "reverse") == 0) rev = kw_values[i];
+        }
+        P2C_Object *sorted_copy = p2c_builtin_sorted_key(obj, keyfn, rev);
+        if (sorted_copy && p2c_obj_is_list(sorted_copy)) {
+            size_t n = obj->u.v_list.len < sorted_copy->u.v_list.len
+                           ? obj->u.v_list.len : sorted_copy->u.v_list.len;
+            for (size_t i = 0; i < n; i++) {
+                P2C_Object *old_item = obj->u.v_list.items[i];
+                P2C_Object *new_item = sorted_copy->u.v_list.items[i];
+                p2c_obj_incref(new_item);
+                obj->u.v_list.items[i] = new_item;
+                p2c_obj_decref(old_item);
+            }
+        }
+        return &P2C_None;
+    }
     p2c_raise(p2c_make_exception("TypeError", "keyword arguments are not supported for this method"));
     return &P2C_None;
 }
@@ -18033,52 +18980,52 @@ static void gc_mark(P2C_Object *obj, void *ctx) {
  * 収集開始時点の全オブジェクトをオープンアドレッシング表へ入れる。
  * 表が確保できない場合は false を返し、呼び出し側は線形探索へ落ちる。 */
 static bool gc_scan_index_build(void) {
-    size_t count = g_gc_obj_count;
+    size_t count = P2C_CTX->gc_obj_count;
     /* 負荷率50%を保つため2倍を確保し、2の冪へ切り上げる。 */
     size_t want = count < 8 ? 16 : count * 2;
     if (want < count) return false; /* 桁あふれ */
-    if (want > g_scan_index_cap) {
-        size_t new_cap = g_scan_index_cap ? g_scan_index_cap : 16;
+    if (want > P2C_CTX->scan_index_cap) {
+        size_t new_cap = P2C_CTX->scan_index_cap ? P2C_CTX->scan_index_cap : 16;
         while (new_cap < want) {
             if (new_cap > ((size_t)-1) / 2) return false;
             new_cap *= 2;
         }
-        void **grown = (void**)p2c_heap_realloc(g_scan_index, new_cap * sizeof(void*));
+        void **grown = (void**)p2c_heap_realloc(P2C_CTX->scan_index, new_cap * sizeof(void*));
         if (!grown) return false;
-        g_scan_index = grown;
-        g_scan_index_cap = new_cap;
+        P2C_CTX->scan_index = grown;
+        P2C_CTX->scan_index_cap = new_cap;
     }
-    if (!g_scan_index) return false;
-    memset(g_scan_index, 0, g_scan_index_cap * sizeof(void*));
-    g_scan_index_used = 0;
-    size_t mask = g_scan_index_cap - 1;
-    for (P2C_Object *o = g_gc_all; o; o = o->gc_next) {
+    if (!P2C_CTX->scan_index) return false;
+    memset(P2C_CTX->scan_index, 0, P2C_CTX->scan_index_cap * sizeof(void*));
+    P2C_CTX->scan_index_used = 0;
+    size_t mask = P2C_CTX->scan_index_cap - 1;
+    for (P2C_Object *o = P2C_CTX->gc_all; o; o = o->gc_next) {
         if (o == &P2C_None || o == &P2C_True || o == &P2C_False) continue;
         size_t slot = ((size_t)(uintptr_t)o >> 4) & mask;
-        while (g_scan_index[slot] != NULL) slot = (slot + 1) & mask;
-        g_scan_index[slot] = (void*)o;
-        g_scan_index_used++;
+        while (P2C_CTX->scan_index[slot] != NULL) slot = (slot + 1) & mask;
+        P2C_CTX->scan_index[slot] = (void*)o;
+        P2C_CTX->scan_index_used++;
     }
     return true;
 }
 
 static void gc_scan_index_clear(void) {
-    if (g_scan_index && g_scan_index_cap) memset(g_scan_index, 0, g_scan_index_cap * sizeof(void*));
-    g_scan_index_used = 0;
+    if (P2C_CTX->scan_index && P2C_CTX->scan_index_cap) memset(P2C_CTX->scan_index, 0, P2C_CTX->scan_index_cap * sizeof(void*));
+    P2C_CTX->scan_index_used = 0;
 }
 
 /* candidate がGC管理下のオブジェクトならそれへのポインタを返す。 */
 static P2C_Object* gc_candidate_object(void *candidate) {
-    if (g_scan_index && g_scan_index_used) {
-        size_t mask = g_scan_index_cap - 1;
+    if (P2C_CTX->scan_index && P2C_CTX->scan_index_used) {
+        size_t mask = P2C_CTX->scan_index_cap - 1;
         size_t slot = ((size_t)(uintptr_t)candidate >> 4) & mask;
-        while (g_scan_index[slot] != NULL) {
-            if (g_scan_index[slot] == candidate) return (P2C_Object*)candidate;
+        while (P2C_CTX->scan_index[slot] != NULL) {
+            if (P2C_CTX->scan_index[slot] == candidate) return (P2C_Object*)candidate;
             slot = (slot + 1) & mask;
         }
         return NULL;
     }
-    for (P2C_Object *o = g_gc_all; o; o = o->gc_next) {
+    for (P2C_Object *o = P2C_CTX->gc_all; o; o = o->gc_next) {
         if ((void*)o == candidate) return o;
     }
     return NULL;
@@ -18098,11 +19045,11 @@ static void gc_stack_scan(void *stack_lo, void *stack_hi) {
     uintptr_t hi = (uintptr_t)stack_hi & ~(sizeof(void*) - 1);
     /* GCオブジェクトが存在しない、あるいはアドレス範囲外の語は索引を
      * 引かずに捨てる（スタック長ぶんの定数コストを大幅に下げる）。 */
-    if (g_gc_obj_count == 0 || g_gc_addr_lo > g_gc_addr_hi) return;
-    const uintptr_t obj_lo = g_gc_addr_lo;
-    const uintptr_t obj_hi = g_gc_addr_hi;
+    if (P2C_CTX->gc_obj_count == 0 || P2C_CTX->gc_addr_lo > P2C_CTX->gc_addr_hi) return;
+    const uintptr_t obj_lo = P2C_CTX->gc_addr_lo;
+    const uintptr_t obj_hi = P2C_CTX->gc_addr_hi;
     for (uintptr_t addr = lo; addr + sizeof(void*) <= hi; addr += sizeof(void*)) {
-        g_gc_scan_words++;
+        P2C_CTX->gc_scan_words++;
         void *candidate;
         memcpy(&candidate, (void*)addr, sizeof(void*));
         uintptr_t cand = (uintptr_t)candidate;
@@ -18119,19 +19066,19 @@ static void gc_stack_scan(void *stack_lo, void *stack_hi) {
  * ============================================================ */
 void p2c_gc_set_stack_bounds(void *stack_lo, void *stack_hi) {
     if (!stack_lo || !stack_hi || stack_lo == stack_hi) return;
-    g_gc_stack_lo = stack_lo;
-    g_gc_stack_hi = stack_hi;
-    g_gc_scan_warned = false;
+    P2C_CTX->gc_stack_lo = stack_lo;
+    P2C_CTX->gc_stack_hi = stack_hi;
+    P2C_CTX->gc_scan_warned = false;
 }
 
 bool p2c_gc_stack_scan_available(void) {
     /* 走査は「現在のフレームから宣言された上端まで」なので、上端だけで足りる
      * （p2c_gc_init() にスタック上のアドレスを渡した場合も有効）。 */
-    return g_gc_stack_hi != NULL;
+    return P2C_CTX->gc_stack_hi != NULL;
 }
 
 void p2c_gc_init(void *stack_hint) {
-    g_gc_stack_bottom = stack_hint; /* 後方互換: hint は未使用になるが API は維持 */
+    P2C_CTX->gc_stack_bottom = stack_hint; /* 後方互換: hint は未使用になるが API は維持 */
     /* OS から実際のスタック境界を取得 (Linux/POSIX with pthreads).
      * ASan は fakestack / shadow memory のせいで local 変数のアドレスや
      * __builtin_frame_address(0) が実スタックアドレスと異なる値を返すため、
@@ -18146,8 +19093,8 @@ void p2c_gc_init(void *stack_hint) {
             pthread_attr_getstack(&attr, &stack_addr, &stack_size);
             pthread_attr_destroy(&attr);
             if (stack_addr && stack_size) {
-                g_gc_stack_lo = stack_addr;
-                g_gc_stack_hi = (char*)stack_addr + stack_size;
+                P2C_CTX->gc_stack_lo = stack_addr;
+                P2C_CTX->gc_stack_hi = (char*)stack_addr + stack_size;
             }
         }
     }
@@ -18158,8 +19105,8 @@ void p2c_gc_init(void *stack_hint) {
      * 値を大きくし過ぎると無関係なメモリを走査するため、タスクのスタック
      * サイズに合わせて指定する。範囲外のタスクスタックを使う場合は
      * p2c_gc_set_stack_bounds() を直接呼ぶこと。 */
-    g_gc_stack_lo = (char*)stack_hint - (size_t)(P2C_GC_STACK_HINT_RANGE);
-    g_gc_stack_hi = stack_hint;
+    P2C_CTX->gc_stack_lo = (char*)stack_hint - (size_t)(P2C_GC_STACK_HINT_RANGE);
+    P2C_CTX->gc_stack_hi = stack_hint;
 #else
     /* スタック境界を問い合わせるAPIがない環境（自作OS/ベアメタル）。
      * stack_hint は「呼び出し側フレーム内のローカル変数のアドレス」なので、
@@ -18168,52 +19115,54 @@ void p2c_gc_init(void *stack_hint) {
      * 領域全体を事前に知る必要はない（p2c_gc_collect() の説明を参照）。
      * hint が NULL の場合だけ境界不明とし、カーネルが
      * p2c_gc_set_stack_bounds() を呼ぶまで収集を安全側に停止する。 */
-    g_gc_stack_lo = NULL;
-    g_gc_stack_hi = stack_hint;
+    P2C_CTX->gc_stack_lo = NULL;
+    P2C_CTX->gc_stack_hi = stack_hint;
 #endif
 }
 
 void p2c_gc_register_root(P2C_Object **slot) {
     if (!slot) return;
-    for (size_t i = 0; i < g_gc_root_count; i++) {
-        if (g_gc_roots[i] == slot) return;
+    for (size_t i = 0; i < P2C_CTX->gc_root_count; i++) {
+        if (P2C_CTX->gc_roots[i] == slot) return;
     }
-    if (g_gc_root_count >= P2C_GC_ROOT_CAPACITY) {
-        p2c_platform_abort("Python Code to C Alpha0.6 GC root capacity exceeded");
+    if (P2C_CTX->gc_root_count >= P2C_GC_ROOT_CAPACITY) {
+        p2c_platform_write("p2c: limit exceeded: GC root table (limit=");
+        p2c_platform_write("P2C_GC_ROOT_CAPACITY) - rebuild with -DP2C_GC_ROOT_CAPACITY=<larger>\n");
+        p2c_platform_abort("GC root capacity exceeded");
         return;
     }
-    g_gc_roots[g_gc_root_count++] = slot;
+    P2C_CTX->gc_roots[P2C_CTX->gc_root_count++] = slot;
 }
 void p2c_gc_unregister_root(P2C_Object **slot) {
     if (!slot) return;
-    for (size_t i = 0; i < g_gc_root_count; i++) {
-        if (g_gc_roots[i] == slot) {
-            g_gc_roots[i] = g_gc_roots[g_gc_root_count - 1];
-            g_gc_roots[g_gc_root_count - 1] = NULL;
-            g_gc_root_count--;
+    for (size_t i = 0; i < P2C_CTX->gc_root_count; i++) {
+        if (P2C_CTX->gc_roots[i] == slot) {
+            P2C_CTX->gc_roots[i] = P2C_CTX->gc_roots[P2C_CTX->gc_root_count - 1];
+            P2C_CTX->gc_roots[P2C_CTX->gc_root_count - 1] = NULL;
+            P2C_CTX->gc_root_count--;
             return;
         }
     }
 }
 void p2c_gc_reset_roots(void) {
-    memset(g_gc_roots, 0, sizeof(g_gc_roots));
-    g_gc_root_count = 0;
+    memset(P2C_CTX->gc_roots, 0, sizeof(P2C_CTX->gc_roots));
+    P2C_CTX->gc_root_count = 0;
 }
 void p2c_gc_collect(void) {
-    if (!g_gc_enabled || g_gc_collecting) return;
+    if (!P2C_CTX->gc_enabled || P2C_CTX->gc_collecting) return;
     if (!p2c_gc_stack_scan_available()) {
         /* スタック境界が未登録。回収すると生存オブジェクトを解放してしまう
          * ため、ここでは何もしない（安全側の停止）。原因と対処を一度だけ
          * 診断出力し、以降は静かにスキップする。 */
-        if (!g_gc_scan_warned) {
-            g_gc_scan_warned = true;
+        if (!P2C_CTX->gc_scan_warned) {
+            P2C_CTX->gc_scan_warned = true;
             p2c_platform_write("Python Code to C: GC collection skipped because the stack "
                                "bounds are unknown; call p2c_gc_set_stack_bounds() "
                                "(or p2c_embed_start()) to enable collection.\n");
         }
         return;
     }
-    g_gc_collecting = true;
+    P2C_CTX->gc_collecting = true;
 
     /* ── 0. スタックスキャン用アドレス索引を構築（失敗時は線形探索へ） ── */
     (void)gc_scan_index_build();
@@ -18225,42 +19174,42 @@ void p2c_gc_collect(void) {
     /* ── 2. マークフェーズ ── */
 
     /* 2-a. 明示的ルート */
-    for (size_t i = 0; i < g_gc_root_count; i++) {
-        if (*g_gc_roots[i]) gc_mark(*g_gc_roots[i], NULL);
+    for (size_t i = 0; i < P2C_CTX->gc_root_count; i++) {
+        if (*P2C_CTX->gc_roots[i]) gc_mark(*P2C_CTX->gc_roots[i], NULL);
     }
 
-    /* 2-b. ランタイム内部レジストリ (g_module_registry, g_class_registry_objs) */
-    if (g_module_registry) {
-        for (size_t i = 0; i < g_module_registry->bucket_count; i++) {
-            for (P2C_MapEntry *e = g_module_registry->buckets[i]; e; e = e->next)
+    /* 2-b. ランタイム内部レジストリ (P2C_CTX->module_registry, P2C_CTX->class_objs) */
+    if (P2C_CTX->module_registry) {
+        for (size_t i = 0; i < P2C_CTX->module_registry->bucket_count; i++) {
+            for (P2C_MapEntry *e = P2C_CTX->module_registry->buckets[i]; e; e = e->next)
                 gc_mark((P2C_Object*)e->val, NULL);
         }
     }
-    /* クラスレジストリは固定配列 (g_class_registry_objs[]) 形式。
+    /* クラスレジストリは固定配列 (P2C_CTX->class_objs[]) 形式。
      * 定義（static）はこのファイル内の前方にあるため再宣言は不要。 */
     {
-        for (int _ci = 0; _ci < g_class_registry_count; _ci++)
-            gc_mark(g_class_registry_objs[_ci], NULL);
+        for (int _ci = 0; _ci < P2C_CTX->class_count; _ci++)
+            gc_mark(P2C_CTX->class_objs[_ci], NULL);
     }
 
     /* 2-c. refcount > 0 のオブジェクト (ネイティブコードがピン留め中) */
-    for (P2C_Object *o = g_gc_all; o; o = o->gc_next) {
+    for (P2C_Object *o = P2C_CTX->gc_all; o; o = o->gc_next) {
         if (o->refcount > 0) gc_mark(o, NULL);
     }
 
     /* 2-c'. ランタイム内部ルート（事前確保済みMemoryError。
      * メモリ枯渇時に再確保せず raise するため生存させ続ける）。 */
-    if (g_oom_exception) gc_mark(g_oom_exception, NULL);
+    if (P2C_CTX->oom_exception) gc_mark(P2C_CTX->oom_exception, NULL);
 
     /* 2-c''. TLS の一時値（式評価中の左オペランド、処理中の例外）。
      * これらはスタック上ではなく TLS に置かれるため、保守的スタックスキャン
      * では見えない。ルート化しないと、式の途中で自動収集が走ったときに
      * 左オペランドが解放され、p2c_binop_finish() が解放済みポインタを
      * 演算へ渡す（Pythonの式が静かに壊れる）。 */
-    g_gc_temp_roots = gc_mark_tls_temporaries();
+    P2C_CTX->gc_temp_roots = gc_mark_tls_temporaries();
 
     /* 2-d. 保守的スタックスキャン
-     * g_gc_stack_lo/hi は p2c_gc_init() が OS から取得した実スタック境界、
+     * P2C_CTX->gc_stack_lo/hi は p2c_gc_init() が OS から取得した実スタック境界、
      * p2c_gc_init() へ渡された「スタック上のアドレス（上端のヒント）」、
      * または p2c_gc_set_stack_bounds() でカーネルが宣言したタスクスタック区間。
      *
@@ -18273,9 +19222,9 @@ void p2c_gc_collect(void) {
      * スタック成長方向の仮定も不要（上下端を min/max で正規化するだけ）。 */
     {
         uintptr_t sp   = (uintptr_t)&env;
-        uintptr_t b1   = (uintptr_t)g_gc_stack_lo;
-        uintptr_t b2   = (uintptr_t)g_gc_stack_hi;
-        g_gc_scan_words = 0;
+        uintptr_t b1   = (uintptr_t)P2C_CTX->gc_stack_lo;
+        uintptr_t b2   = (uintptr_t)P2C_CTX->gc_stack_hi;
+        P2C_CTX->gc_scan_words = 0;
         /* 上下端を正規化（b1 は未宣言なら 0 なので下端として無害）。 */
         uintptr_t top  = b1 > b2 ? b1 : b2;
         uintptr_t low  = b1 < b2 ? b1 : b2;
@@ -18292,9 +19241,9 @@ void p2c_gc_collect(void) {
     gc_scan_index_clear();
 
     /* ── 3. スイープフェーズ ── */
-    P2C_Object **prev_next = &g_gc_all;
+    P2C_Object **prev_next = &P2C_CTX->gc_all;
     size_t freed = 0;
-    P2C_Object *cur = g_gc_all;
+    P2C_Object *cur = P2C_CTX->gc_all;
     while (cur) {
         P2C_Object *next = cur->gc_next;
         if (!cur->gc_marked) {
@@ -18303,7 +19252,7 @@ void p2c_gc_collect(void) {
             gc_free_obj_data(cur);
             p2c_heap_free(cur);
             freed++;
-            g_gc_obj_count--;
+            P2C_CTX->gc_obj_count--;
         } else {
             /* 生存: マークをクリアして次サイクルに備える */
             cur->gc_marked = 0;
@@ -18312,52 +19261,52 @@ void p2c_gc_collect(void) {
         cur = next;
     }
 
-    g_gc_bytes_alloc = 0;
-    g_gc_last_freed  = freed;
-    g_gc_collections++;
+    P2C_CTX->gc_bytes_alloc = 0;
+    P2C_CTX->gc_last_freed  = freed;
+    P2C_CTX->gc_collections++;
 
     /* ── 4. しきい値の適応調整 ──
      * 生存オブジェクトが多い（＝解放がほとんどない）のに毎回収集すると、
      * 保守的スタックスキャンのコストだけが積み上がる。この場合はしきい値を
      * 倍々に伸ばして収集頻度を下げる。逆に多く解放できたときは基準値へ
      * 戻していき、メモリを抱え込まないようにする。 */
-    if (g_gc_adaptive) {
-        size_t live = g_gc_obj_count;
+    if (P2C_CTX->gc_adaptive) {
+        size_t live = P2C_CTX->gc_obj_count;
         /* しきい値の上限は「生存集合の概算（オブジェクト1個あたりの平均確保量）」
          * とヒープ由来の上限の小さい方にする。生存集合が小さいのにしきい値だけ
          * 大きくなると、収集が止まって小さなヒープが枯渇する。 */
         size_t live_bytes = live * 96u;
-        size_t cap = live_bytes < g_gc_threshold_max ? live_bytes : g_gc_threshold_max;
-        if (cap < g_gc_threshold_base) cap = g_gc_threshold_base;
-        if (freed * 4u < live && g_gc_threshold < cap) {
-            size_t next = g_gc_threshold * 2u;
-            g_gc_threshold = next > cap ? cap : next;
-            g_gc_threshold_growths++;
-        } else if (freed > live / 2u && g_gc_threshold > g_gc_threshold_base) {
-            size_t next = g_gc_threshold - g_gc_threshold / 4u;   /* 25%ずつ戻す */
-            g_gc_threshold = next < g_gc_threshold_base ? g_gc_threshold_base : next;
+        size_t cap = live_bytes < P2C_CTX->gc_threshold_max ? live_bytes : P2C_CTX->gc_threshold_max;
+        if (cap < P2C_CTX->gc_threshold_base) cap = P2C_CTX->gc_threshold_base;
+        if (freed * 4u < live && P2C_CTX->gc_threshold < cap) {
+            size_t next = P2C_CTX->gc_threshold * 2u;
+            P2C_CTX->gc_threshold = next > cap ? cap : next;
+            P2C_CTX->gc_threshold_growths++;
+        } else if (freed > live / 2u && P2C_CTX->gc_threshold > P2C_CTX->gc_threshold_base) {
+            size_t next = P2C_CTX->gc_threshold - P2C_CTX->gc_threshold / 4u;   /* 25%ずつ戻す */
+            P2C_CTX->gc_threshold = next < P2C_CTX->gc_threshold_base ? P2C_CTX->gc_threshold_base : next;
         }
     }
-    g_gc_collecting  = false;
+    P2C_CTX->gc_collecting  = false;
 }
-void    p2c_gc_set_enabled(bool enabled)    { g_gc_enabled   = enabled; }
-bool    p2c_gc_is_enabled(void)             { return g_gc_enabled; }
+void    p2c_gc_set_enabled(bool enabled)    { P2C_CTX->gc_enabled   = enabled; }
+bool    p2c_gc_is_enabled(void)             { return P2C_CTX->gc_enabled; }
 void    p2c_gc_set_threshold(size_t bytes)  {
     /* 基準値と現在値の両方を設定し、適応による成長をリセットする。 */
-    g_gc_threshold_base = bytes ? bytes : 1u;
-    g_gc_threshold = g_gc_threshold_base;
-    g_gc_threshold_growths = 0;
+    P2C_CTX->gc_threshold_base = bytes ? bytes : 1u;
+    P2C_CTX->gc_threshold = P2C_CTX->gc_threshold_base;
+    P2C_CTX->gc_threshold_growths = 0;
 }
-void    p2c_gc_set_adaptive(bool enabled)   { g_gc_adaptive = enabled; }
+void    p2c_gc_set_adaptive(bool enabled)   { P2C_CTX->gc_adaptive = enabled; }
 void    p2c_gc_set_adaptive_limit(size_t max_threshold) {
     /* 適応GCがしきい値を伸ばせる上限。カーネル/組込みではヒープ容量に合わせて
      * 下げる（大きすぎる上限だと、小さなヒープで収集が止まり枯渇する）。 */
     if (max_threshold == 0) max_threshold = P2C_GC_THRESHOLD_MAX;
-    g_gc_threshold_max = max_threshold < 4096u ? 4096u : max_threshold;
-    if (g_gc_threshold > g_gc_threshold_max) g_gc_threshold = g_gc_threshold_max;
+    P2C_CTX->gc_threshold_max = max_threshold < 4096u ? 4096u : max_threshold;
+    if (P2C_CTX->gc_threshold > P2C_CTX->gc_threshold_max) P2C_CTX->gc_threshold = P2C_CTX->gc_threshold_max;
 }
-size_t  p2c_gc_adaptive_limit(void)         { return g_gc_threshold_max; }
-bool    p2c_gc_is_adaptive(void)            { return g_gc_adaptive; }
+size_t  p2c_gc_adaptive_limit(void)         { return P2C_CTX->gc_threshold_max; }
+bool    p2c_gc_is_adaptive(void)            { return P2C_CTX->gc_adaptive; }
 P2C_Object* p2c_fallback_expr(const char *where, const char *what) {
     char message[192];
     snprintf(message, sizeof(message),
@@ -18373,28 +19322,28 @@ void p2c_fallback_stmt(const char *where, const char *what) {
 
 void    p2c_gc_stats(P2C_GcStats *out) {
     if (!out) return;
-    out->collections = g_gc_collections;
-    out->objects = g_gc_obj_count;
-    out->peak_objects = g_gc_peak_objects;
-    out->last_freed = g_gc_last_freed;
-    out->threshold = g_gc_threshold;
-    out->base_threshold = g_gc_threshold_base;
-    out->threshold_growths = g_gc_threshold_growths;
-    out->oom_resets = g_gc_oom_resets;
-    out->scanned_words = g_gc_scan_words;
-    out->temp_roots = g_gc_temp_roots;
+    out->collections = P2C_CTX->gc_collections;
+    out->objects = P2C_CTX->gc_obj_count;
+    out->peak_objects = P2C_CTX->gc_peak_objects;
+    out->last_freed = P2C_CTX->gc_last_freed;
+    out->threshold = P2C_CTX->gc_threshold;
+    out->base_threshold = P2C_CTX->gc_threshold_base;
+    out->threshold_growths = P2C_CTX->gc_threshold_growths;
+    out->oom_resets = P2C_CTX->gc_oom_resets;
+    out->scanned_words = P2C_CTX->gc_scan_words;
+    out->temp_roots = P2C_CTX->gc_temp_roots;
 }
-bool    p2c_gc_is_collecting(void)         { return g_gc_collecting; }
-size_t  p2c_gc_object_count(void)          { return g_gc_obj_count; }
-size_t  p2c_gc_collections_run(void)       { return g_gc_collections; }
-size_t  p2c_gc_last_freed(void)            { return g_gc_last_freed; }
-size_t  p2c_gc_last_stack_words(void)      { return g_gc_scan_words; }
-size_t  p2c_gc_last_temp_roots(void)        { return g_gc_temp_roots; }
-size_t  p2c_gc_root_count(void)             { return g_gc_root_count; }
+bool    p2c_gc_is_collecting(void)         { return P2C_CTX->gc_collecting; }
+size_t  p2c_gc_object_count(void)          { return P2C_CTX->gc_obj_count; }
+size_t  p2c_gc_collections_run(void)       { return P2C_CTX->gc_collections; }
+size_t  p2c_gc_last_freed(void)            { return P2C_CTX->gc_last_freed; }
+size_t  p2c_gc_last_stack_words(void)      { return P2C_CTX->gc_scan_words; }
+size_t  p2c_gc_last_temp_roots(void)        { return P2C_CTX->gc_temp_roots; }
+size_t  p2c_gc_root_count(void)             { return P2C_CTX->gc_root_count; }
 size_t  p2c_gc_root_capacity(void)          { return P2C_GC_ROOT_CAPACITY; }
 
 void p2c_runtime_init(void *heap_base, size_t heap_sz) {
-    if (g_runtime_active) return;
+    if (P2C_CTX->active) return;
 #ifdef PYTHON_CODE_TO_C_NO_STDLIB
 #  ifndef PYTHON_CODE_TO_C_NO_LIBC_STUBS
     heap_start = (char*)heap_base; heap_size = heap_sz; heap_used = 0; heap_peak = 0;
@@ -18411,14 +19360,14 @@ void p2c_runtime_init(void *heap_base, size_t heap_sz) {
      * ときだけ true になる）。 */
     p2c_heap_note_stub_ready(heap_start != NULL && heap_size > 0);
 #endif
-    g_runtime_active = true;
+    P2C_CTX->active = true;
     p2c_platform_init();
-    if (!g_module_registry) g_module_registry = new_attr_map();
+    if (!P2C_CTX->module_registry) P2C_CTX->module_registry = new_attr_map();
     /* OOM通知用の MemoryError を事前確保しておく。この1個は「ランタイム内部
      * ルート」として毎回のマークフェーズで生存扱いし、メモリ枯渇時に再確保せず
      * raise できるようにする（ユーザーが登録するルート枠は消費しない）。 */
-    if (!g_oom_exception) {
-        g_oom_exception = p2c_make_exception("MemoryError", "out of memory");
+    if (!P2C_CTX->oom_exception) {
+        P2C_CTX->oom_exception = p2c_make_exception("MemoryError", "out of memory");
     }
 /* math モジュールは初期化時に約8KBのヒープを消費するため、組込み（HobbyOS等）で
  * 使わない場合は PYTHON_CODE_TO_C_NO_MATH_MODULE を定義して登録自体を省ける
@@ -18482,49 +19431,49 @@ void p2c_runtime_init(void *heap_base, size_t heap_sz) {
 #endif
 }
 void p2c_runtime_shutdown(void) {
-    if (!g_runtime_active) return;
+    if (!P2C_CTX->active) return;
 
     p2c_reset_async_queue();
     p2c_gc_reset_roots();
 #ifndef PYTHON_CODE_TO_C_NO_PYGAME
     p2c_pygame_runtime_reset();
 #endif
-    free_map_shallow(g_module_registry);
-    g_module_registry = NULL;
+    free_map_shallow(P2C_CTX->module_registry);
+    P2C_CTX->module_registry = NULL;
     p2c_reset_class_registry();
 
-    P2C_Object *cur = g_gc_all;
+    P2C_Object *cur = P2C_CTX->gc_all;
     while (cur) {
         P2C_Object *next = cur->gc_next;
         gc_free_obj_data(cur);
         p2c_heap_free(cur);
         cur = next;
     }
-    g_gc_all = NULL;
-    g_gc_obj_count = 0;
-    g_gc_bytes_alloc = 0;
-    g_gc_collections = 0;
-    g_gc_last_freed = 0;
-    g_gc_collecting = false;
-    g_gc_enabled = true;
-    g_gc_threshold_base = 256 * 1024;
-    g_gc_threshold = g_gc_threshold_base;
-    g_gc_threshold_growths = 0;
-    g_gc_peak_objects = 0;
-    g_gc_stack_bottom = NULL;
-    g_gc_stack_lo = NULL;
-    g_gc_stack_hi = NULL;
-    g_gc_scan_warned = false;
-    g_gc_addr_lo = (uintptr_t)-1;
-    g_gc_addr_hi = 0;
-    g_gc_scan_words = 0;
-    g_gc_temp_roots = 0;
+    P2C_CTX->gc_all = NULL;
+    P2C_CTX->gc_obj_count = 0;
+    P2C_CTX->gc_bytes_alloc = 0;
+    P2C_CTX->gc_collections = 0;
+    P2C_CTX->gc_last_freed = 0;
+    P2C_CTX->gc_collecting = false;
+    P2C_CTX->gc_enabled = true;
+    P2C_CTX->gc_threshold_base = 256 * 1024;
+    P2C_CTX->gc_threshold = P2C_CTX->gc_threshold_base;
+    P2C_CTX->gc_threshold_growths = 0;
+    P2C_CTX->gc_peak_objects = 0;
+    P2C_CTX->gc_stack_bottom = NULL;
+    P2C_CTX->gc_stack_lo = NULL;
+    P2C_CTX->gc_stack_hi = NULL;
+    P2C_CTX->gc_scan_warned = false;
+    P2C_CTX->gc_addr_lo = (uintptr_t)-1;
+    P2C_CTX->gc_addr_hi = 0;
+    P2C_CTX->gc_scan_words = 0;
+    P2C_CTX->gc_temp_roots = 0;
     /* 式評価の途中で停止した場合に備えて、TLS の一時値も空にする
      * （f-string のビルダはここで解放される）。 */
     p2c_binop_rewind(0);
     p2c_fstr_rewind(0);
-    g_oom_exception = NULL; /* 上で解放済み（再初期化時に作り直す） */
-    g_oom_in_handler = false;
+    P2C_CTX->oom_exception = NULL; /* 上で解放済み（再初期化時に作り直す） */
+    P2C_CTX->oom_in_handler = false;
     gc_scan_index_clear();
 #ifdef PYTHON_CODE_TO_C_NO_STDLIB
 #  ifndef PYTHON_CODE_TO_C_NO_LIBC_STUBS
@@ -18534,10 +19483,11 @@ void p2c_runtime_shutdown(void) {
 #endif
     p2c_exc_stack = NULL;
     p2c_active_exception = NULL;
-    g_runtime_active = false;
+    P2C_CTX->active = false;
     p2c_platform_shutdown();
 }
-bool p2c_runtime_is_active(void) { return g_runtime_active; }
+bool p2c_runtime_is_active(void) { return P2C_CTX->active; }
+size_t p2c_runtime_class_count(void) { return (size_t)P2C_CTX->class_count; }
 size_t p2c_runtime_heap_size(void) {
 #ifdef PYTHON_CODE_TO_C_NO_STDLIB
 #  ifndef PYTHON_CODE_TO_C_NO_LIBC_STUBS
@@ -18868,6 +19818,12 @@ static void p2c_write_quoted_str_buf(const char *s, P2C_String *out) {
 }
 
 static void p2c_obj_to_buf_ex(P2C_Object *obj, P2C_String *out, bool repr) {
+    /* range は要素を作らずに専用表記へ（Python は str と repr が同じ）。 */
+    if (obj && obj->cls && obj->cls->type_tag == OBJ_RANGE) {
+        (void)repr;
+        p2c_range_to_buf(obj, out);
+        return;
+    }
     if (!obj) { p2c_str_append(out, "None"); return; }
     switch (obj->cls ? obj->cls->type_tag : OBJ_NONE) {
         case OBJ_NONE: p2c_str_append(out, "None"); break;
@@ -19311,9 +20267,23 @@ P2C_Object* p2c_obj_slice(P2C_Object *obj, P2C_Object *start, P2C_Object *stop, 
     bool is_str = (obj->cls->type_tag == OBJ_STR);
     bool is_tuple = (obj->cls->type_tag == OBJ_TUPLE);
     bool is_list = (obj->cls->type_tag == OBJ_LIST);
-    if (!is_str && !is_tuple && !is_list) { p2c_raise(p2c_make_exception("TypeError", "object is not sliceable")); return &P2C_None; }
+    bool is_range = (obj->cls->type_tag == OBJ_RANGE);
+    if (!is_str && !is_tuple && !is_list && !is_range) { p2c_raise(p2c_make_exception("TypeError", "object is not sliceable")); return &P2C_None; }
 
-    int64_t len = (int64_t)(is_str ? obj->u.v_str.len : (is_tuple ? obj->u.v_tuple.len : obj->u.v_list.len));
+    int64_t len = 0;
+    if (is_str) len = (int64_t)p2c_utf8_count(obj->u.v_str.data, obj->u.v_str.len);
+    else if (is_tuple) len = (int64_t)obj->u.v_tuple.len;
+    else if (is_list) len = (int64_t)obj->u.v_list.len;
+    else {
+        /* range の長さ（int64 に収まらない巨大 range は OverflowError）。 */
+        uint64_t span = 0, mag = 1, count = 0;
+        if (!p2c_range_shape(obj, &span, &mag, &count)) {
+            p2c_raise(p2c_make_exception("OverflowError", "range length exceeds int64"));
+            return &P2C_None;
+        }
+        (void)span; (void)mag;
+        len = (int64_t)count;
+    }
     int64_t st = 1;
     if (step && step != &P2C_None && !p2c_obj_index_value(step, &st)) return &P2C_None;
     if (st == 0) { p2c_raise(p2c_make_exception("ValueError", "slice step cannot be zero")); return &P2C_None; }
@@ -19335,10 +20305,50 @@ P2C_Object* p2c_obj_slice(P2C_Object *obj, P2C_Object *start, P2C_Object *stop, 
         else { if (e_val < -1) e_val = -1; if (e_val >= len) e_val = len - 1; }
     }
 
+    if (is_range) {
+        /* 要素 a_i = start + i*step を選ぶので、新しい range は
+         *   (start + s_val*step, start + e_val*step, step*st)
+         * になる（s_val/e_val は上で Python のスライス規則どおりに丸めてある）。
+         * 例: range(10)[::-1] -> range(9, -1, -1)、range(0,20,3)[1:3] -> range(3, 9, 3)。 */
+        int64_t orig_step = obj->u.v_range.step;
+        uint64_t mag_orig = orig_step > 0 ? (uint64_t)orig_step : (uint64_t)0 - (uint64_t)orig_step;
+        uint64_t mag_slice = st > 0 ? (uint64_t)st : (uint64_t)0 - (uint64_t)st;
+        if (mag_orig != 0u && mag_slice > (uint64_t)INT64_MAX / mag_orig) {
+            p2c_raise(p2c_make_exception("OverflowError", "range slice step too large"));
+            return &P2C_None;
+        }
+        int64_t new_step = orig_step * st;
+        int64_t new_start = (int64_t)((uint64_t)obj->u.v_range.start + (uint64_t)s_val * (uint64_t)orig_step);
+        int64_t new_stop  = (int64_t)((uint64_t)obj->u.v_range.start + (uint64_t)e_val * (uint64_t)orig_step);
+        return p2c_range_new(new_start, new_stop, new_step);
+    }
     if (is_str) {
         P2C_String *buf = p2c_str_new(NULL);
-        if (st > 0) { for (int64_t i = s_val; i < e_val; i += st) { char c1[2] = { obj->u.v_str.data[i], '\0' }; p2c_str_append(buf, c1); } }
-        else { for (int64_t i = s_val; i > e_val; i += st) { char c1[2] = { obj->u.v_str.data[i], '\0' }; p2c_str_append(buf, c1); } }
+        {
+            const char *sb = obj->u.v_str.data ? obj->u.v_str.data : "";
+            size_t bytes = obj->u.v_str.len;
+            if (st > 0) {
+                for (int64_t i = s_val; i < e_val; i += st) {
+                    size_t off = p2c_utf8_offset(sb, bytes, (size_t)i);
+                    size_t n = p2c_utf8_step(sb, bytes, off);
+                    char c1[8];
+                    if (n == 0u) break;
+                    memcpy(c1, sb + off, n);
+                    c1[n] = '\0';
+                    p2c_str_append(buf, c1);
+                }
+            } else {
+                for (int64_t i = s_val; i > e_val; i += st) {
+                    size_t off = p2c_utf8_offset(sb, bytes, (size_t)i);
+                    size_t n = p2c_utf8_step(sb, bytes, off);
+                    char c1[8];
+                    if (n == 0u) break;
+                    memcpy(c1, sb + off, n);
+                    c1[n] = '\0';
+                    p2c_str_append(buf, c1);
+                }
+            }
+        }
         P2C_Object *out = p2c_obj_from_str(p2c_str_cstr(buf));
         p2c_str_free(buf);
         return out;
@@ -19578,7 +20588,9 @@ static bool p2c_obj_less(P2C_Object *a, P2C_Object *b) {
     bool a_seq, b_seq, a_num, b_num;
     if (a == b) return false;
     if (a && b && p2c_obj_is_str(a) && p2c_obj_is_str(b)) {
-        return strcmp(p2c_obj_as_str(a), p2c_obj_as_str(b)) < 0;
+        /* コードポイント順で比較する（バイト順だと非ASCIIの順序が Python と食い違う）。 */
+        return p2c_utf8_cmp(p2c_obj_as_str(a), p2c_obj_str_len(a),
+                            p2c_obj_as_str(b), p2c_obj_str_len(b)) < 0;
     }
     a_seq = a && (p2c_obj_is_tuple(a) || p2c_obj_is_list(a));
     b_seq = b && (p2c_obj_is_tuple(b) || p2c_obj_is_list(b));
@@ -19602,6 +20614,10 @@ P2C_Object* p2c_obj_abs(P2C_Object *obj) {
 }
 
 static P2C_Object** p2c_iter_items(P2C_Object *obj, size_t *out_n, bool *out_owned) {
+    /* range は要素を算術で求めて展開する（専用の反復子を作らない）。 */
+    if (obj && obj->cls && obj->cls->type_tag == OBJ_RANGE) {
+        return p2c_range_items(obj, out_n, out_owned);
+    }
     /* out_owned: 返した配列が新規mallocされたもの(呼び出し側でfreeが必要)か、
      * 既存オブジェクトのバッキング配列をそのまま指しているだけ(freeしては
      * いけない)かを呼び出し側に伝える。以前はこの区別がなく、dict等の
@@ -19610,10 +20626,19 @@ static P2C_Object** p2c_iter_items(P2C_Object *obj, size_t *out_n, bool *out_own
     *out_owned = false;
     if (obj && p2c_obj_is_list(obj)) { *out_n = obj->u.v_list.len; return obj->u.v_list.items; }
     if (obj && p2c_obj_is_str(obj)) {
-        size_t n = obj->u.v_str.len;
+        /* 反復はコードポイント単位（Python の list("aé") は ['a', 'é']）。 */
+        const char *sb = obj->u.v_str.data ? obj->u.v_str.data : "";
+        size_t bytes = obj->u.v_str.len;
+        size_t n = p2c_utf8_count(sb, bytes);
         P2C_Object **arr = n ? (P2C_Object**)p2c_malloc_checked(n * sizeof(P2C_Object*), "sorted copy") : NULL;
         if (arr) {
-            for (size_t i = 0; i < n; i++) arr[i] = p2c_obj_from_str_n(obj->u.v_str.data + i, 1);
+            size_t off = 0u;
+            for (size_t i = 0; i < n; i++) {
+                size_t step = p2c_utf8_step(sb, bytes, off);
+                if (step == 0u) { n = i; break; }
+                arr[i] = p2c_obj_from_str_n(sb + off, step);
+                off += step;
+            }
         }
         *out_n = arr ? n : 0;
         *out_owned = (arr != NULL);
@@ -19797,6 +20822,87 @@ P2C_Object* p2c_builtin_chr(P2C_Object *obj) {
     return p2c_obj_from_str_n(utf8, len);
 }
 
+/* int(x, base): 文字列を基数付きで整数へ変換する（CPython と同じ規則）。
+ *   - 前後の空白と符号を許す
+ *   - base=0 は接頭辞から基数を決める（0x/0o/0b、既定は 10）
+ *   - 数字の間の '_' を許す（先頭・末尾・連続は不可）
+ *   - base 付きで非文字列を渡した場合は TypeError
+ *   - int64 に収まらない値は OverflowError（CPython は多倍長だがこの処理系は int64） */
+P2C_Object* p2c_builtin_int_from_base(P2C_Object *obj, P2C_Object *base_obj) {
+    int64_t base = p2c_obj_as_int(base_obj);
+    if (base != 0 && (base < 2 || base > 36)) {
+        p2c_raise(p2c_make_exception("ValueError", "int() base must be >= 2 and <= 36, or 0"));
+        return &P2C_None;
+    }
+    if (!p2c_obj_is_str(obj)) {
+        if (base == 10) return p2c_obj_from_int(p2c_obj_as_int(obj));
+        p2c_raise(p2c_make_exception("TypeError", "int() can't convert non-string with explicit base"));
+        return &P2C_None;
+    }
+    const char *s = p2c_obj_as_str(obj);
+    const char *q = s;
+    while (*q == ' ' || *q == '\t' || *q == '\n' || *q == '\r' || *q == '\f' || *q == '\v') q++;
+    bool neg = false;
+    if (*q == '+' || *q == '-') { neg = (*q == '-'); q++; }
+    int b = (int)base;
+    if (b == 0) {
+        b = 10;
+        if (q[0] == '0' && (q[1] == 'x' || q[1] == 'X')) { b = 16; q += 2; }
+        else if (q[0] == '0' && (q[1] == 'o' || q[1] == 'O')) { b = 8; q += 2; }
+        else if (q[0] == '0' && (q[1] == 'b' || q[1] == 'B')) { b = 2; q += 2; }
+    } else if ((b == 16 && q[0] == '0' && (q[1] == 'x' || q[1] == 'X')) ||
+               (b == 8 && q[0] == '0' && (q[1] == 'o' || q[1] == 'O')) ||
+               (b == 2 && q[0] == '0' && (q[1] == 'b' || q[1] == 'B'))) {
+        q += 2;
+    }
+    uint64_t value = 0;
+    bool any = false, bad = false, prev_digit = false, overflow = false;
+    for (; *q; q++) {
+        if (*q == '_') {
+            if (!prev_digit) { bad = true; break; }
+            prev_digit = false;
+            continue;
+        }
+        int d;
+        if (*q >= '0' && *q <= '9') d = *q - '0';
+        else if (*q >= 'a' && *q <= 'z') d = *q - 'a' + 10;
+        else if (*q >= 'A' && *q <= 'Z') d = *q - 'A' + 10;
+        else break;   /* 末尾の空白などは下で判定する */
+        if (d >= b) { bad = true; break; }
+        if (value > (UINT64_MAX - (uint64_t)d) / (uint64_t)b) { overflow = true; break; }
+        value = value * (uint64_t)b + (uint64_t)d;
+        any = true;
+        prev_digit = true;
+    }
+    if (!prev_digit && any) bad = true;   /* 末尾が '_' */
+    while (*q == ' ' || *q == '\t' || *q == '\n' || *q == '\r' || *q == '\f' || *q == '\v') q++;
+    if (*q != '\0') bad = true;
+    if (bad || !any || overflow) {
+        char msg[160];
+        size_t pos = 0;
+        p2c_append_text(msg, sizeof(msg), &pos, "invalid literal for int() with base ");
+        p2c_append_size(msg, sizeof(msg), &pos, (size_t)b);
+        p2c_append_text(msg, sizeof(msg), &pos, ": '");
+        p2c_append_text(msg, sizeof(msg), &pos, s);
+        p2c_append_text(msg, sizeof(msg), &pos, "'");
+        p2c_raise(p2c_make_exception("ValueError", msg));
+        return &P2C_None;
+    }
+    if (neg) {
+        if (value > (uint64_t)INT64_MAX + 1u) {
+            p2c_raise(p2c_make_exception("OverflowError", "int literal too large for this runtime (int64)"));
+            return &P2C_None;
+        }
+        if (value == (uint64_t)INT64_MAX + 1u) return p2c_obj_from_int(INT64_MIN);
+        return p2c_obj_from_int(-(int64_t)value);
+    }
+    if (value > (uint64_t)INT64_MAX) {
+        p2c_raise(p2c_make_exception("OverflowError", "int literal too large for this runtime (int64)"));
+        return &P2C_None;
+    }
+    return p2c_obj_from_int((int64_t)value);
+}
+
 P2C_Object* p2c_builtin_int_base(P2C_Object *obj, unsigned base, const char *prefix) {
     static const char digits[] = "0123456789abcdef";
     char reversed[66];
@@ -19818,6 +20924,60 @@ P2C_Object* p2c_builtin_int_base(P2C_Object *obj, unsigned base, const char *pre
     while (count > 0) out[pos++] = reversed[--count];
     return p2c_obj_from_str_n(out, pos);
 }
+/* 組込み関数を「値」として取り出す（sorted(a, key=len) など）。
+ * 以前は codegen が生の識別子 len を出力していたため、生成 C が
+ * コンパイルできなかった（-Werror 以前に構文エラー）。 */
+static P2C_Object* p2c_builtin_str_ref_callable(P2C_Object **args, size_t nargs) {
+    if (nargs < 1) return p2c_obj_from_str("");
+    return p2c_obj_str(args[0]);
+}
+static P2C_Object* p2c_builtin_int_ref_callable(P2C_Object **args, size_t nargs) {
+    if (nargs < 1) return p2c_obj_from_int(0);
+    return p2c_obj_from_int(p2c_obj_as_int(args[0]));
+}
+static P2C_Object* p2c_builtin_float_ref_callable(P2C_Object **args, size_t nargs) {
+    if (nargs < 1) return p2c_obj_from_float(0.0);
+    return p2c_obj_from_float(p2c_obj_as_float(args[0]));
+}
+static P2C_Object* p2c_builtin_bool_ref_callable(P2C_Object **args, size_t nargs) {
+    if (nargs < 1) return &P2C_False;
+    return p2c_obj_from_bool(p2c_obj_is_truthy(args[0]));
+}
+static P2C_Object* p2c_builtin_repr_ref_callable(P2C_Object **args, size_t nargs) {
+    if (nargs < 1) return p2c_obj_from_str("None");
+    return p2c_obj_repr(args[0]);
+}
+
+/* 名前から呼び出し可能オブジェクトを作る。未対応の名前は NULL。 */
+P2C_Object* p2c_builtin_ref(const char *name) {
+    if (!name) return NULL;
+    if (strcmp(name, "len") == 0) return p2c_function_new("len", p2c_builtin_len_callable);
+    if (strcmp(name, "abs") == 0) return p2c_function_new("abs", p2c_builtin_abs_callable);
+    if (strcmp(name, "str") == 0) return p2c_function_new("str", p2c_builtin_str_ref_callable);
+    if (strcmp(name, "int") == 0) return p2c_function_new("int", p2c_builtin_int_ref_callable);
+    if (strcmp(name, "float") == 0) return p2c_function_new("float", p2c_builtin_float_ref_callable);
+    if (strcmp(name, "bool") == 0) return p2c_function_new("bool", p2c_builtin_bool_ref_callable);
+    if (strcmp(name, "repr") == 0) return p2c_function_new("repr", p2c_builtin_repr_ref_callable);
+    return NULL;
+}
+
+/* codegen 用: 未対応なら「黙って壊れた C」ではなく明確な例外にする。 */
+P2C_Object* p2c_builtin_ref_checked(const char *name) {
+    P2C_Object *fn = p2c_builtin_ref(name);
+    if (fn) return fn;
+    char msg[192];
+    size_t pos = 0;
+    p2c_append_text(msg, sizeof(msg), &pos, "builtin '");
+    p2c_append_text(msg, sizeof(msg), &pos, name ? name : "?");
+    p2c_append_text(msg, sizeof(msg), &pos, "' cannot be used as a value yet");
+    p2c_raise(p2c_make_exception("NotImplementedError", msg));
+    return &P2C_None;
+}
+
+P2C_Object* p2c_str_format_py(const char *fmt, P2C_Object **args, size_t nargs) {
+    return p2c_str_format_py_kw(fmt, args, nargs, NULL, NULL, 0);
+}
+
 /* キー列を使った安定マージソートの再帰部分。items/keysのlo..hi-1をソートする。
  * 比較関数はp2c_obj_less（順序を持たない型ではTypeErrorを送出する）。 */
 static void p2c_merge_sort_run(P2C_Object **items, P2C_Object **keys, P2C_Object **tmp_items, P2C_Object **tmp_keys, size_t lo, size_t hi, bool descending) {
@@ -20209,11 +21369,23 @@ P2C_Object* p2c_input(void) {
 int64_t p2c_len(P2C_Object *obj) {
     if (!obj) return 0;
     switch (obj->cls ? obj->cls->type_tag : OBJ_NONE) {
-        case OBJ_STR: return (int64_t)obj->u.v_str.len;
+        /* Python と同じくコードポイント数（バイト数ではない）。 */
+        case OBJ_STR: return (int64_t)p2c_utf8_count(obj->u.v_str.data, obj->u.v_str.len);
         case OBJ_LIST: return (int64_t)obj->u.v_list.len;
         case OBJ_DICT: return (int64_t)obj->u.v_dict.len;
         case OBJ_SET: return (int64_t)obj->u.v_dict.len;
         case OBJ_TUPLE: return (int64_t)obj->u.v_tuple.len;
+        case OBJ_RANGE: {
+            /* len() は int64 に収まる必要がある（CPython は OverflowError）。 */
+            uint64_t span = 0, mag = 1, len = 0;
+            if (!p2c_range_shape(obj, &span, &mag, &len)) {
+                (void)span; (void)mag;
+                p2c_raise(p2c_make_exception("OverflowError", "range length exceeds int64"));
+                return -1;
+            }
+            (void)span; (void)mag;
+            return (int64_t)len;
+        }
         case OBJ_INSTANCE:
             /* __len__ を実装しているインスタンスに対応する。
              * 以前はここが常に0を返しており、len(custom_obj) が
@@ -20227,13 +21399,145 @@ int64_t p2c_len(P2C_Object *obj) {
         default: return 0;
     }
 }
+/* range の引数は整数（bool を含む）。float/str などは CPython 同様 TypeError。 */
+static bool p2c_range_bound(P2C_Object *value, const char *what, int64_t *out) {
+    if (!value || !value->cls) return false;
+    int tag = (int)value->cls->type_tag;
+    if (tag == OBJ_INT || tag == OBJ_BOOL) { *out = p2c_obj_as_int(value); return true; }
+    (void)what;   /* CPython は引数名を付けない（'float' object cannot be ...） */
+    char msg[128];
+    size_t pos = 0;
+    p2c_append_text(msg, sizeof(msg), &pos, "'");
+    p2c_append_text(msg, sizeof(msg), &pos, (value->cls->name ? value->cls->name : "object"));
+    p2c_append_text(msg, sizeof(msg), &pos, "' object cannot be interpreted as an integer");
+    p2c_raise(p2c_make_exception("TypeError", msg));
+    return false;
+}
+
+/* 要素を作らない range オブジェクトを作る。 */
+static P2C_Object* p2c_range_new(int64_t start, int64_t stop, int64_t step) {
+    P2C_Object *o = p2c_obj_new(&P2C_Class_Range);
+    if (!o) return NULL;
+    o->u.v_range.start = start;
+    o->u.v_range.stop = stop;
+    o->u.v_range.step = step;
+    return o;
+}
+
+/* range の要素数。span は「要素間の総幅」（符号なしなので溢れない）。
+ * 要素数が int64 に収まらない場合は false を返す（呼び出し側が OverflowError）。 */
+static bool p2c_range_shape(const P2C_Object *o, uint64_t *span_out, uint64_t *mag_out, uint64_t *len_out) {
+    int64_t start = o->u.v_range.start, stop = o->u.v_range.stop, step = o->u.v_range.step;
+    uint64_t span, mag, len;
+    if (step > 0) {
+        mag = (uint64_t)step;
+        if (start >= stop) { *span_out = 0; *mag_out = mag; *len_out = 0; return true; }
+        span = (uint64_t)stop - (uint64_t)start;
+    } else {
+        mag = (uint64_t)0 - (uint64_t)step;   /* -step（INT64_MIN でも安全） */
+        if (start <= stop) { *span_out = 0; *mag_out = mag; *len_out = 0; return true; }
+        span = (uint64_t)start - (uint64_t)stop;
+    }
+    len = 1u + (span - 1u) / mag;             /* = ceil(span / mag)。溢れない形で計算 */
+    *span_out = span;
+    *mag_out = mag;
+    *len_out = len;
+    return len <= (uint64_t)INT64_MAX;
+}
+
+/* 添字（負は末尾から）を絶対位置へ。範囲外は -1。 */
+static int64_t p2c_range_pos(const P2C_Object *o, int64_t index) {
+    uint64_t span = 0, mag = 1, len = 0;
+    if (!p2c_range_shape(o, &span, &mag, &len) || len == 0) return -1;
+    int64_t n = (int64_t)len;
+    if (index < 0) index += n;
+    if (index < 0 || index >= n) return -1;
+    return index;
+}
+
+/* 絶対位置 pos（0 <= pos < len）の値。有効な pos では真の値が int64 に
+ * 収まるので、途中で溢れないよう符号なしで計算して戻す。 */
+static int64_t p2c_range_value(const P2C_Object *o, int64_t pos) {
+    uint64_t v = (uint64_t)o->u.v_range.start + (uint64_t)pos * (uint64_t)o->u.v_range.step;
+    return (int64_t)v;
+}
+
+/* x in range(...)。要素を作らず算術で判定する。
+ * 非整数（文字列など）は Python では TypeError だが、ここでは安全側に False。 */
+static bool p2c_range_contains(const P2C_Object *o, P2C_Object *item) {
+    if (!item || !item->cls) return false;
+    int64_t x = 0;
+    if (item->cls->type_tag == OBJ_INT || item->cls->type_tag == OBJ_BOOL) {
+        x = p2c_obj_as_int(item);
+    } else if (item->cls->type_tag == OBJ_FLOAT) {
+        double d = p2c_obj_as_float(item);
+        if (!(d >= -9007199254740992.0 && d <= 9007199254740992.0)) return false;
+        int64_t t = (int64_t)d;
+        /* 1.5 in range(3) は False（float の == は -Wfloat-equal が禁じるので差で判定）。 */
+        if ((double)t - d >= 0.5 || d - (double)t >= 0.5) return false;
+        x = t;
+    } else {
+        return false;
+    }
+    int64_t start = o->u.v_range.start, stop = o->u.v_range.stop, step = o->u.v_range.step;
+    if (step > 0) { if (x < start || x >= stop) return false; }
+    else { if (x > start || x <= stop) return false; }
+    uint64_t diff = (step > 0) ? (uint64_t)x - (uint64_t)start : (uint64_t)start - (uint64_t)x;
+    uint64_t mag = (step > 0) ? (uint64_t)step : (uint64_t)0 - (uint64_t)step;
+    return (diff % mag) == 0u;
+}
+
+/* list(range(...)) / sorted(range(...)) などのために配列へ展開する。
+ * 巨大な range ではメモリが足りなくなる（CPython も MemoryError）。 */
+static P2C_Object** p2c_range_items(P2C_Object *range_obj, size_t *n_out, bool *owned_out) {
+    uint64_t span = 0, mag = 1, len = 0;
+    if (n_out) *n_out = 0;
+    if (owned_out) *owned_out = false;
+    if (!p2c_range_shape(range_obj, &span, &mag, &len)) {
+        p2c_raise(p2c_make_exception("OverflowError", "range length exceeds int64"));
+        return NULL;
+    }
+    (void)span; (void)mag;
+    if (len == 0) return NULL;
+    size_t n = (size_t)len;
+    if (n > (size_t)1 << 40) {
+        p2c_raise(p2c_make_exception("MemoryError", "range too large to materialize"));
+        return NULL;
+    }
+    P2C_Object **items = (P2C_Object**)p2c_malloc_checked(n * sizeof(P2C_Object*), "range items");
+    if (!items) return NULL;
+    for (size_t i = 0; i < n; i++) items[i] = p2c_obj_from_int(p2c_range_value(range_obj, (int64_t)i));
+    if (n_out) *n_out = n;
+    if (owned_out) *owned_out = true;
+    return items;
+}
+
+/* repr/str 用の表記（CPython と同じく step が 1 のときは省く）。 */
+static void p2c_range_to_buf(const P2C_Object *o, P2C_String *out) {
+    p2c_str_append(out, "range(");
+    P2C_Object *a = p2c_obj_from_int(o->u.v_range.start);
+    P2C_Object *b = p2c_obj_from_int(o->u.v_range.stop);
+    P2C_Object *s = p2c_obj_from_int(o->u.v_range.step);
+    if (a) p2c_obj_to_buf_ex(a, out, false);
+    p2c_str_append(out, ", ");
+    if (b) p2c_obj_to_buf_ex(b, out, false);
+    if (o->u.v_range.step != 1) {
+        p2c_str_append(out, ", ");
+        if (s) p2c_obj_to_buf_ex(s, out, false);
+    }
+    p2c_str_append(out, ")");
+}
+
 P2C_Object* p2c_range(P2C_Object *start, P2C_Object *stop, P2C_Object *step) {
-    int64_t s = p2c_obj_as_int(start), e = p2c_obj_as_int(stop), inc = p2c_obj_as_int(step);
-    if (inc == 0) inc = 1;
-    P2C_Object *list = p2c_list_new(); if (!list) return NULL;
-    if (inc > 0) for (int64_t i = s; i < e; i += inc) p2c_list_append(list, p2c_obj_from_int(i));
-    else for (int64_t i = s; i > e; i += inc) p2c_list_append(list, p2c_obj_from_int(i));
-    return list;
+    int64_t s = 0, e = 0, inc = 1;
+    if (!p2c_range_bound(start, "start", &s)) return &P2C_None;
+    if (!p2c_range_bound(stop, "stop", &e)) return &P2C_None;
+    if (step && !p2c_range_bound(step, "step", &inc)) return &P2C_None;
+    if (inc == 0) {
+        p2c_raise(p2c_make_exception("ValueError", "range() arg 3 must not be zero"));
+        return &P2C_None;
+    }
+    return p2c_range_new(s, e, inc);
 }
 
 /* 属性の有無を「値がNoneかどうか」ではなく実際の存在有無で判定する
@@ -20363,6 +21667,16 @@ P2C_Object* p2c_iter_at(P2C_Object *obj, int64_t position) {
 }
 P2C_Object* p2c_subscript_get(P2C_Object *obj, P2C_Object *key) {
     if (!obj || !obj->cls) return &P2C_None;
+    /* range は要素を作らずに算術で求める（保守的: 負の添字・範囲外も Python 準拠）。 */
+    if (obj->cls->type_tag == OBJ_RANGE && key && key->cls &&
+        (key->cls->type_tag == OBJ_INT || key->cls->type_tag == OBJ_BOOL)) {
+        int64_t pos = p2c_range_pos(obj, p2c_obj_as_int(key));
+        if (pos < 0) {
+            p2c_raise(p2c_make_exception("IndexError", "range object index out of range"));
+            return &P2C_None;
+        }
+        return p2c_obj_from_int(p2c_range_value(obj, pos));
+    }
     switch (obj->cls->type_tag) {
         case OBJ_LIST: {
             int64_t idx = 0;
@@ -20383,11 +21697,17 @@ P2C_Object* p2c_subscript_get(P2C_Object *obj, P2C_Object *key) {
         case OBJ_STR: {
             int64_t idx = 0;
             if (!p2c_obj_index_value(key, &idx)) return &P2C_None;
-            size_t len = obj->u.v_str.len;
-            if (idx < 0) idx += (int64_t)len;
-            if (idx < 0 || (size_t)idx >= len) { p2c_raise(p2c_make_exception("IndexError", "string index out of range")); return &P2C_None; }
-            char buf[2] = { obj->u.v_str.data[idx], '\0' };
-            return p2c_obj_from_str(buf);
+            /* Python 同様、添字はコードポイント単位（1文字=1コードポイント）。 */
+            const char *sb = obj->u.v_str.data ? obj->u.v_str.data : "";
+            size_t bytes = obj->u.v_str.len;
+            size_t cps = p2c_utf8_count(sb, bytes);
+            if (idx < 0) idx += (int64_t)cps;
+            if (idx < 0 || (size_t)idx >= cps) { p2c_raise(p2c_make_exception("IndexError", "string index out of range")); return &P2C_None; }
+            {
+                size_t off = p2c_utf8_offset(sb, bytes, (size_t)idx);
+                size_t n = p2c_utf8_step(sb, bytes, off);
+                return p2c_obj_from_str_n(sb + off, n);
+            }
         }
         case OBJ_DICT: return p2c_dict_get(obj, key);
         case OBJ_INSTANCE:

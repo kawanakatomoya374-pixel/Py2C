@@ -526,22 +526,50 @@ static P2C_Token* read_fstring(P2C_Lexer *lex, char quote) {
 static P2C_Token* read_number(P2C_Lexer *lex) {
     size_t start = lex->pos;
     uint32_t start_col = lex->col;
-    
-    while (is_digit(peek_char(lex, 0))) advance(lex);
-    
+
+    /* 基数つき整数（0x/0o/0b）。Python と同じく '_' 区切りを許す。
+     * 表記の正規化（10 進化と '_' の除去）はパーサ側で行う。 */
+    if (peek_char(lex, 0) == '0') {
+        char p1 = peek_char(lex, 1);
+        char low = (p1 >= 'A' && p1 <= 'Z') ? (char)(p1 - 'A' + 'a') : p1;
+        if (low == 'x' || low == 'o' || low == 'b') {
+            advance(lex);          /* '0' */
+            advance(lex);          /* 'x' など */
+            bool any = false;
+            while (true) {
+                char c = peek_char(lex, 0);
+                bool ok = false;
+                if (low == 'x') ok = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+                else if (low == 'o') ok = (c >= '0' && c <= '7');
+                else ok = (c == '0' || c == '1');
+                if (ok) { any = true; advance(lex); continue; }
+                /* '_' は数字の間にだけ置ける（末尾の '_' は識別子側に残す）。 */
+                if (c == '_' && any && is_digit(peek_char(lex, 1))) { advance(lex); continue; }
+                break;
+            }
+            if (!any) return make_marker_token_at(lex, TOK_UNKNOWN, "invalidliteral", lex->line, start_col);
+            size_t rlen = lex->pos - start;
+            P2C_Token *rtok = make_token(lex, TOK_INT_LITERAL, lex->source + start, rlen);
+            if (rtok) rtok->col = start_col;
+            return rtok;
+        }
+    }
+
+    while (is_digit(peek_char(lex, 0)) || (peek_char(lex, 0) == '_' && is_digit(peek_char(lex, 1)))) advance(lex);
+
     bool is_float = false;
     if (peek_char(lex, 0) == '.' && is_digit(peek_char(lex, 1))) {
         is_float = true;
         advance(lex); /* '.' */
-        while (is_digit(peek_char(lex, 0))) advance(lex);
+        while (is_digit(peek_char(lex, 0)) || (peek_char(lex, 0) == '_' && is_digit(peek_char(lex, 1)))) advance(lex);
     }
-    
+
     /* 指数部 */
     if (peek_char(lex, 0) == 'e' || peek_char(lex, 0) == 'E') {
         is_float = true;
         advance(lex);
         if (peek_char(lex, 0) == '+' || peek_char(lex, 0) == '-') advance(lex);
-        while (is_digit(peek_char(lex, 0))) advance(lex);
+        while (is_digit(peek_char(lex, 0)) || (peek_char(lex, 0) == '_' && is_digit(peek_char(lex, 1)))) advance(lex);
     }
     
     /* 複素数リテラル (2j, 3.5J) は python_code_to_c 非対応。

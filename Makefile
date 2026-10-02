@@ -84,7 +84,7 @@ SRC := $(shell find src -type f -name '*.c' ! -path 'src/tools/gui_main.c' | sor
 OBJFILES := $(patsubst src/%.c,$(OBJ)/%.o,$(SRC))
 DEPS := $(OBJFILES:.o=.d)
 
-.PHONY: all help check-tools gui run run-gui freestanding freestanding-clean single-header test-single-header test-single-header-c11 test-single-header-c99 test-single-header-tcc test-single-header-freestanding full-build test test-sanitizers test-parser-sanitizers test-starred-unpack test-set test-set-comprehension-c11 test-decorator-diagnostics test-conformance test-container-fuzz test-portability test-gc-gui test-gc-lifecycle test-gc-allocation-failure test-fallback test-gc-adaptive test-gc-leaks test-integer-overflow test-platform-adapter test-allocator-injection test-setjmp-hook test-heap-unification test-generator-async-runtime test-async-generator test-py313-syntax test-baremetal-runtime test-embed-baseline test-embed-runtime test-freestanding-setjmp test-embed-compile test-crlf test-hobby-os-template test-embed-generated test-baremetal-exceptions test-gc-stack-scan-scope test-gc-temp-roots test-stack-usage test-sandbox test-sanitizers-core test-analyzer test-analyzer-clang test-baremetal-build test-baremetal-generated c99 check-tcc tcc test-c99 test-tcc-freestanding test-tcc hobby elf tcc-elf elf-full test-hobbyos-libc hobbyos-elf hobbyos install clean
+.PHONY: all help check-tools gui run run-gui freestanding freestanding-clean single-header test-single-header test-single-header-c11 test-single-header-c99 test-single-header-tcc test-single-header-freestanding full-build test test-sanitizers test-parser-sanitizers test-starred-unpack test-set test-set-comprehension-c11 test-decorator-diagnostics test-conformance test-container-fuzz test-portability test-gc-gui test-gc-lifecycle test-gc-allocation-failure test-probe test-limits test-fallback test-gc-adaptive test-gc-leaks test-integer-overflow test-platform-adapter test-allocator-injection test-setjmp-hook test-heap-unification test-generator-async-runtime test-async-generator test-py313-syntax test-baremetal-runtime test-embed-baseline test-embed-runtime test-freestanding-setjmp test-embed-compile test-crlf test-hobby-os-template test-embed-generated test-baremetal-exceptions test-gc-stack-scan-scope test-gc-temp-roots test-stack-usage test-sandbox test-sanitizers-core test-analyzer test-analyzer-clang test-baremetal-build test-baremetal-generated c99 check-tcc tcc test-c99 test-tcc-freestanding test-tcc hobby elf tcc-elf elf-full test-hobbyos-libc hobbyos-elf hobbyos install clean
 
 all: $(BUILD)/python-code-to-c
 	@mkdir -p bin
@@ -336,6 +336,12 @@ test-gc-allocation-failure:
 # 適応GC（しきい値の自動調整）の回帰。固定しきい値と比較して収集回数が減り、
 # 追跡オブジェクト数のピークが上限内に収まることを確認する。
 # 未対応構文のフォールバック（--fallback）の回帰。
+test-probe:
+	@sh tests/semantic_probe_alpha06.sh
+
+test-limits:
+	@sh tests/limit_diagnostics_alpha06.sh
+
 test-fallback:
 	P2C_COMPILER=$(BUILD)/python-code-to-c CC="$(CC)" sh tests/fallback_regression_alpha06.sh
 

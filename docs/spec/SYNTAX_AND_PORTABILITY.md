@@ -59,3 +59,27 @@ GC管理オブジェクトをOSの非同期キューや描画状態が保持す�
 ## 検証
 
 `make full-build` はクリーン状態からHosted CLI、ローカルGUI、freestandingコア、生成済み単一ヘッダーを、`-Werror`、`-Wpedantic`、`-Wshadow`、`-Wformat=2`、`-Wstrict-prototypes`、`-Wmissing-prototypes`、`-Wold-style-definition`、`-Wredundant-decls`、`-Wundef`、`-Wconversion`、`-Wsign-conversion`、`-Wcast-qual`、`-Wwrite-strings`、`-Wdouble-promotion`、`-Wvla`、`-Wfloat-equal`を含む警告即エラー設定（`-Wswitch-enum`と`-Wnull-dereference`は除外理由を`Makefile`へ明記）で構築します。`make test` はスモーク、GC・GUI Cテスト、64ビット整数境界テスト、プラットフォーム出力アダプタ、ジェネレータ・協調asyncランタイム、静的ヒープ・platform write・GC・awaitを通すベアメタル実行ハーネス、変換済みベアメタルPython例のfreestanding C11コンパイル、starred unpack、set回帰、for starred unpack、`print`キーワード、文字列探索範囲、`split(maxsplit)`、`strip(chars)`、prefix/suffix範囲、partition、文字種判定、splitlines、expandtabs、制御文字リテラル・repr、高次dict/set、list拡張、UTF-8 `ord`/`chr`、`bin`/`oct`/`hex`、開始値付き`sum`、`divmod`/`pow(a,b,mod)`/`format`/`callable`、`...`（Ellipsis）、文字列エスケープ（8進/16進/`\u`/`\U`/行継続/未知エスケープ）、Python 3.13型パラメータ・`type`文の型消去変換、位置専用引数、`yield from`、`raise from`、try/finally脱出順序の回帰、sequence/mapping/as/star/OR/guardとmapping `**rest`を含むHosted・strict C11・freestanding単一ヘッダー検証、**555件のCPython意味論差分コーパス**、既定3 seed・各48操作の決定的dict/set差分ファジング、strict C11・ネスト関数診断、ホストGUI、freestandingコア、自作OS統合ゲート（`p2c_embed` のヒープ・ライフサイクル・GC安全側停止・OOM・panic、カーネル提供setjmp/longjmp、カーネル相当環境での変換器コア実行、`--embed-entry`生成モジュールのCPython差分、組み込みテンプレートのコンパイル、LF/CRLF/CRでの生成C一致）の構築を実行します。GCCとClangの両方で`make full-build`と`make test`を通すことを品質基準とし、GCCがない環境でも`make CC=clang test-single-header-c11`で単一ヘッダーを`-pedantic-errors`の厳格C11として自己完結検証でき、`make CC=clang test-single-header-freestanding`でHosted allocator・出力・時刻参照のない実装部を検査できます。setはCPythonと異なり挿入順で内部保持・表示します。そのため順序を仕様としない集合の差分テストでは、`sorted()`で正規化して比較します。`make freestanding` は標準Cライブラリを使わないコア静的ライブラリを構築し、`make run INPUT=...` はHosted変換・コンパイル・実行を一括化します。ファジングのseed、失敗最小化、固定回帰への昇格は `docs/CONTAINER_FUZZING_ALPHA0.6.md` に定義します。
+
+## 固定上限と `-D` 上書き（Alpha0.6）
+
+組込み（カーネル）向けに一部の表は固定長配列で持っています。上限に達したときは
+**黙って処理を飛ばさず**、`p2c: limit exceeded: ...` を必ず出力します（同じ上限について一度だけ）。
+例外を投げても安全な場所（クラスレジストリ）では `RuntimeError` も投げます。
+
+| 上限 | 既定値 | 上書きマクロ | 上限に達したとき |
+|---|---|---|---|
+| クラスレジストリ | 256 | `-DP2C_MAX_CLASS_REGISTRY=N` | 通知 + `RuntimeError`（登録を無言で落とさない） |
+| MRO 名数 | 32 | `-DP2C_MRO_MAX_NAMES=N` | 通知（C3 を計算できないため DFS へフォールバック） |
+| MRO 基底数 | 8 | `-DP2C_MRO_MAX_BASES=N` | 同上 |
+| MRO 深さ | 12 | `-DP2C_MRO_MAX_DEPTH=N` | 同上 |
+| MRO アリーナ | 3072 bytes | `-DP2C_MRO_ARENA_BYTES=N` | 同上 |
+| GC ルート表 | 1024 | `-DP2C_GC_ROOT_CAPACITY=N` | 通知 + abort（回収を続けると不正解放になるため停止） |
+| async キュー | 256 | `-DP2C_ASYNC_QUEUE_CAPACITY=N` | `RuntimeError` |
+
+検証は `make test-limits`（`tests/limit_diagnostics_alpha06.sh`）:
+
+- 既定値: 通知なし・CPython と同一出力
+- `-DP2C_MAX_CLASS_REGISTRY=2`: 通知と `RuntimeError` が出る（無言スキップの廃止）
+- `-DP2C_MRO_MAX_NAMES=2`: 通知が出て、結果は CPython と同一か、さもなくば明示的に失敗する（無言の不一致を出さない）
+- `-DP2C_MAX_CLASS_REGISTRY=1024 -DP2C_MRO_MAX_NAMES=32`: 通知なし・CPython と同一出力（上書きが効く）
+
