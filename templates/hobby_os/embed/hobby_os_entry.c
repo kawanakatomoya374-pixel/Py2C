@@ -1,4 +1,4 @@
-/* HobbyOS向けELF（カーネルレス・スタンドアロン）のエントリポイント (Alpha0.6)
+/* HobbyOS向けELF（カーネルレス・スタンドアロン）のエントリポイント (Alpha1.0)
  *
  * `make hobbyos elf`（または `make hobbyos-elf`）で作られる「HobbyOSへそのまま
  * 組み込める自己完結ELF」の入口である。libc を使わず、ランタイム同梱の最小libc

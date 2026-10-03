@@ -1,4 +1,4 @@
-# Alpha0.6 で強化した変換精度・対応幅のデモ
+# Alpha1.0 で強化した変換精度・対応幅のデモ
 
 def summarize(*nums, **opts):
     total = sum(nums)

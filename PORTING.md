@@ -1,12 +1,12 @@
-# Python Code to C Alpha0.6 — 自作OS・freestanding移植ガイド
+# Python Code to C Alpha1.0 — 自作OS・freestanding移植ガイド
 
 ## 1. 目的と移植境界
 
-**Python Code to C Alpha0.6** は、変換器コア、ランタイム、OS依存のプラットフォーム層を分離しています。自作OS側が実装するのは、メモリ、出力、時刻を接続する小さな`P2C_Platform`アダプタです。CLI、ホストGUI、プロセス起動、ファイル入出力はfreestandingコアの必須要件ではありません。
+**Python Code to C Alpha1.0** は、変換器コア、ランタイム、OS依存のプラットフォーム層を分離しています。自作OS側が実装するのは、メモリ、出力、時刻を接続する小さな`P2C_Platform`アダプタです。CLI、ホストGUI、プロセス起動、ファイル入出力はfreestandingコアの必須要件ではありません。
 
 > freestandingコアは、OSアダプタを登録するまで確保・出力を行わない設計です。`python_to_c()`、生成Cの実行、またはGCの利用より**前**に、必ず有効な`P2C_Platform`を登録してください。
 
-| 層 | 自作OS側の責務 | Alpha0.6側の責務 |
+| 層 | 自作OS側の責務 | Alpha1.0側の責務 |
 |---|---|---|
 | メモリ | `alloc`、`realloc`、`free`をカーネルヒープ、arena、ページ割当て器へ接続 | コンパイラ・ランタイムの全確保をプラットフォーム契約へ委譲（共有ヒープ。§4.1） |
 | 出力 | `write`をシリアル、カーネルログ、画面コンソール等へ接続 | `print`、診断、例外メッセージの出力経路を提供 |
@@ -32,7 +32,7 @@
 標準のテンプレートは`templates/toolchains/freestanding-c11.mk`です。GCCという名前やx86固有フラグを既定にしません。`CC`、`AR`、`CFLAGS`、`CPPFLAGS`、`BUILD`を外側のビルドから置き換えられます。
 
 ```sh
-cd 'Python Code to C Alpha0.6'
+cd 'Python Code to C Alpha1.0'
 make -f templates/toolchains/freestanding-c11.mk \
   PROJECT_ROOT=. CC=clang AR=llvm-ar
 ```
@@ -111,7 +111,7 @@ void p2c_kernel_init(KernelP2CContext *ctx) {
 
 ### 4.1 単一ヒープの契約（変換器コアとランタイムの共有）
 
-`p2c_platform_set()`で登録した`alloc`/`realloc`/`free`は、**生成Cのランタイム（GC object、list/dict/set/tuple、文字列）と、変換器コア（字句解析・AST・文字列ビルダ・コード生成バッファ）の両方**が使います。Alpha0.6では共通層の共有ヒープ抽象（`p2c_heap_alloc`/`p2c_heap_calloc`/`p2c_heap_realloc`/`p2c_heap_free`）へ一本化しており、変換器コアの内部確保も同じヒープを通ります（例外は`python_to_c()`の戻り値である生成C文字列で、これは`malloc`/`free`契約のままなので呼び出し側が`free()`で解放します）。
+`p2c_platform_set()`で登録した`alloc`/`realloc`/`free`は、**生成Cのランタイム（GC object、list/dict/set/tuple、文字列）と、変換器コア（字句解析・AST・文字列ビルダ・コード生成バッファ）の両方**が使います。Alpha1.0では共通層の共有ヒープ抽象（`p2c_heap_alloc`/`p2c_heap_calloc`/`p2c_heap_realloc`/`p2c_heap_free`）へ一本化しており、変換器コアの内部確保も同じヒープを通ります（例外は`python_to_c()`の戻り値である生成C文字列で、これは`malloc`/`free`契約のままなので呼び出し側が`free()`で解放します）。
 
 | 事項 | 契約 |
 |---|---|
@@ -158,7 +158,7 @@ p2c_set_default_allocator(NULL);                     /* 組み込み既定へ戻
 
 ### 4.2 `setjmp`/`longjmp`の選択肢
 
-例外機構（`raise`/`except`、generatorの`StopIteration`、未処理例外の診断）は非局所脱出に`setjmp`/`longjmp`を使います。Alpha0.6は次の順で実装を選びます。
+例外機構（`raise`/`except`、generatorの`StopIteration`、未処理例外の診断）は非局所脱出に`setjmp`/`longjmp`を使います。Alpha1.0は次の順で実装を選びます。
 
 | 構成 | 実装 | 備考 |
 |---|---|---|
@@ -168,7 +168,7 @@ p2c_set_default_allocator(NULL);                     /* 組み込み既定へ戻
 | `PYTHON_CODE_TO_C_NO_COMPILER_SETJMP` | カーネル提供（組み込みマクロを無効化） | 独自実装をリンクしたい場合 |
 | `P2C_SETJMP`/`P2C_LONGJMP`の定義 | 上記すべてを上書きする差し替え点 | `-DP2C_SETJMP(env)=my_setjmp(env)`／`-DP2C_LONGJMP(env,val)=my_longjmp((env),(val))` |
 
-> Alpha0.6以前の組込みスタブは`longjmp`が無限ループであり、`raise`した瞬間にタスクが停止していました。現在はコンパイラ組み込みにより**libcなしでも例外が実際に機能します**。コンパイラ組み込みもカーネル実装も無い場合は、黙ってハングせず`p2c_platform_abort()`で診断します。
+> Alpha1.0以前の組込みスタブは`longjmp`が無限ループであり、`raise`した瞬間にタスクが停止していました。現在はコンパイラ組み込みにより**libcなしでも例外が実際に機能します**。コンパイラ組み込みもカーネル実装も無い場合は、黙ってハングせず`p2c_platform_abort()`で診断します。
 
 #### 4.2.1 `P2C_SETJMP`/`P2C_LONGJMP`による完全差し替え
 
@@ -261,7 +261,7 @@ GCルートの重複登録は無視されますが、解除漏れは不要なオ
 
 `p2c_runtime_shutdown()`は、runtime所有objectを解放し、module registry、class registry、協調async queue、明示root table、pygame互換moduleの静的class slotをresetします。終了後の`P2C_Object*`はすべて無効であり、OS側はキュー、割込み後処理、デバイス状態、GUI状態に残る参照を使用してはいけません。次の`p2c_runtime_init()`は新しいruntime epochを開始し、以前のobjectを再利用しません。
 
-| ライフサイクル段階 | OS側の必須操作 | Alpha0.6の保証 |
+| ライフサイクル段階 | OS側の必須操作 | Alpha1.0の保証 |
 |---|---|---|
 | 起動前 | platform adapterと長寿命root slotを用意 | runtime objectは未生成 |
 | 初期化後 | `p2c_runtime_init()`、`P2C_GC_ENTER_MAIN()`、必要なroot登録を順に実行 | registryとasync queueは新しいepochとして空から開始 |
@@ -302,7 +302,7 @@ make CC=clang test-single-header-c11
 | `P2C_GUI_LINE` | 座標系・クリッピング規約に従い線分を描画 |
 | `P2C_GUI_TEXT` | UTF-8/ASCII方針を明示してフォント描画器へ渡す |
 
-コマンド数またはテキストアリーナが上限を超えた場合、Alpha0.6は安全にドロップを記録します。OS側はフレーム終了時にドロップ数を監視し、バッファ容量の増加またはUI簡略化を判断してください。
+コマンド数またはテキストアリーナが上限を超えた場合、Alpha1.0は安全にドロップを記録します。OS側はフレーム終了時にドロップ数を監視し、バッファ容量の増加またはUI簡略化を判断してください。
 
 ## 9. 検証と障害切り分け
 
@@ -339,7 +339,7 @@ make CC=clang test-single-header-c11
 
 ## 10. 追加済みベアメタル実行ハーネス
 
-Alpha0.6には、移植手順そのものを検証可能にする最小ベアメタル資産が含まれます。`examples/baremetal/python_code_to_c_baremetal.c`は、標準ライブラリを使わない静的バンプヒープ、再確保、UART相当のバイト列出力、単調tick、platform互換フックを実装します。`p2c_baremetal_uart_write()`だけをターゲットOSのUART、カーネルログ、または画面コンソールへ接続してください。テスト時には同じ出力が固定バッファにも記録されるため、UARTドライバが未接続でも出力契約を検証できます。
+Alpha1.0には、移植手順そのものを検証可能にする最小ベアメタル資産が含まれます。`examples/baremetal/python_code_to_c_baremetal.c`は、標準ライブラリを使わない静的バンプヒープ、再確保、UART相当のバイト列出力、単調tick、platform互換フックを実装します。`p2c_baremetal_uart_write()`だけをターゲットOSのUART、カーネルログ、または画面コンソールへ接続してください。テスト時には同じ出力が固定バッファにも記録されるため、UARTドライバが未接続でも出力契約を検証できます。
 
 | 資産 | 役割 | 受入条件 |
 |---|---|---|
@@ -378,7 +378,7 @@ OSキュー、割込み後処理、デバイス待機表へ`P2C_Object*`を保�
 
 ## 12. Python 3.13型構文の型消去規約
 
-Python 3.13の`type Alias[params] = expression`、型パラメータ既定値、TypeVarTuple、ParamSpecは、Alpha0.6では**コンパイル時の型専用情報**として受理して消去します。したがってターゲットOSは`typing`、`TypeAliasType`、frame proxy、`exec`/`eval`を提供する必要がありません。aliasを実行時の値として使用するコードは移植対象外です。型構文を含む変換器・生成CのC11契約は、ホストで`make test-py313-syntax`により先に確認してください。詳細は[`docs/PYTHON_3_13_COMPATIBILITY_ALPHA0.6.md`](docs/PYTHON_3_13_COMPATIBILITY_ALPHA0.6.md)を参照します。
+Python 3.13の`type Alias[params] = expression`、型パラメータ既定値、TypeVarTuple、ParamSpecは、Alpha1.0では**コンパイル時の型専用情報**として受理して消去します。したがってターゲットOSは`typing`、`TypeAliasType`、frame proxy、`exec`/`eval`を提供する必要がありません。aliasを実行時の値として使用するコードは移植対象外です。型構文を含む変換器・生成CのC11契約は、ホストで`make test-py313-syntax`により先に確認してください。詳細は[`docs/PYTHON_3_13_COMPATIBILITY_ALPHA1.0.md`](docs/PYTHON_3_13_COMPATIBILITY_ALPHA1.0.md)を参照します。
 
 ## 13. ターゲットOSへの最終リンク
 

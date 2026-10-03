@@ -23,7 +23,7 @@ run_case() {
 }
 
 mkdir -p build/tests
-run_case tests/set_alpha06.py
-run_case tests/set_comprehension_alpha06.py
-run_case tests/frozenset_fallback_alpha06.py
+run_case tests/set_alpha10.py
+run_case tests/set_comprehension_alpha10.py
+run_case tests/frozenset_fallback_alpha10.py
 printf '%s\n' 'set_regression_ok'

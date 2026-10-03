@@ -14,7 +14,7 @@ extern "C" {
  * 目的: 「静的ヒープ・1つの出力シンク・1つの時計」さえカーネルが用意すれば、
  *       変換済みPythonモジュールをタスクとして走らせられるようにする。
  *
- * 典型的な使い方（詳細は docs/spec/HOBBY_OS_EMBEDDING_ALPHA0.6.md）:
+ * 典型的な使い方（詳細は docs/spec/HOBBY_OS_EMBEDDING_ALPHA1.0.md）:
  *
  *   static P2C_EmbedHeap heap;
  *   static unsigned char heap_storage[64 * 1024];

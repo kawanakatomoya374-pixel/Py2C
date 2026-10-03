@@ -30,7 +30,14 @@ static void host_write(int stream, const char *data, size_t len, void *user) {
 
 static uint64_t host_clock_ms(void *user) {
     (void)user;
-    return (uint64_t)(clock() * 1000 / (CLOCKS_PER_SEC ? CLOCKS_PER_SEC : 1));
+    /* ミリ秒換算は浮動小数で行い、clock() * 1000 の桁あふれを避ける。
+     * CLOCKS_PER_SEC は C11 7.27.1 で「1秒あたりのクロック数（正の定数）」と
+     * 規定されるため 0 除算ガードは不要で、clang -Wunreachable-code が指摘する
+     * 死コード（常に真の三項演算）になっていた。
+     * なお関数呼び出しの戻り値をキャストすると -Wbad-function-cast にかかる
+     * ため、いったん変数へ受けてから変換する。 */
+    clock_t ticks = clock();
+    return (uint64_t)((double)ticks * 1000.0 / (double)CLOCKS_PER_SEC);
 }
 
 static const P2C_Platform default_platform = {

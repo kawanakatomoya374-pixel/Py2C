@@ -59,7 +59,10 @@ struct P2C_CodeGen {
     P2C_Map *decorated_names; /* decorator適用後にP2C callable objectへ再束縛されるmodule-level定義名の集合 */
     P2C_Map *module_function_names; /* direct module-level function名の集合。decorator expressionをP2C callable adapterへ解決する */
     P2C_Map *decorator_callable_names; /* bare-name decoratorとして実際に参照されるmodule-level function名の集合 */
+    P2C_Map *function_value_names; /* 値（map/sortedのkey=等）として参照されたmodule-level function名の集合。末尾でcallable adapterを生成する */
     P2C_Map *class_methods; /* クラス名 -> (メソッド名 -> 1) のP2C_Map。super()がどのクラスにメソッドが実際に定義されているか調べるのに使用 */
+    P2C_Map *class_init_defs; /* クラス名 -> __init__ の P2C_AstFunctionDef*（クラス生成のキーワード引数解決用） */
+    P2C_Map *comprehension_targets; /* 現在生成中の内包表記ターゲット名（未定義名診断から除外するスコープ） */
     const char *current_class;      /* 現在コード生成中のメソッドが属するクラス名（トップレベル関数ではNULL）。super()解決に使用 */
     int lambda_counter; /* lambda式ごとに一意なC関数名を振るためのカウンタ */
     int generator_expression_counter; /* generator expressionごとに一意なC step関数名を振るためのカウンタ */

@@ -884,10 +884,22 @@ size_t p2c_map_len(P2C_Map *m) {
 
 /* ---- 文字列キー用 ---- */
 
-uint32_t p2c_hash_str(const void *key) {
+/* ハッシュは 32bit の剰余演算（ラップ）を意図している。clang の
+ * -fsanitize=integer は「定義済みだが情報が落ちる」演算まで報告するため、
+ * 意図的なラップを行う関数だけチェックを外す（GCC は属性を解釈しないので
+ * -Wattributes を避けて clang 限定にする）。 */
+#if defined(__clang__)
+#define P2C_INTENTIONAL_WRAP \
+    __attribute__((no_sanitize("integer", "shift", "implicit-conversion")))
+#else
+#define P2C_INTENTIONAL_WRAP
+#endif
+
+P2C_INTENTIONAL_WRAP uint32_t p2c_hash_str(const void *key) {
     const char *s = (const char*)key;
     uint32_t h = 5381;
     while (*s) {
+        /* djb2: h * 33 を 32bit でラップさせるのが仕様。 */
         h = ((h << 5) + h) + (unsigned char)*s++;
     }
     return h;

@@ -46,4 +46,4 @@ step関数は`p2c_builtin_next()`を`P2C_ExceptFrame`で囲み、StopIteration�
 
 ## CPython基準ケース
 
-`tests/generator_expression_alpha06.py`は、左端iterableがgenerator object作成時に一度だけ評価されること、要素式とfilterが`next()`時に進むこと、target名が外側へ漏れないことを固定する。CPython 3.13系互換の基準出力は`['source']`、`20`、`['source']`、`[40]`、`not-leaked`である。専用state machineを有効化するまで、このケースはコンフォーマンス台帳へ登録しない。
+`tests/generator_expression_alpha10.py`は、左端iterableがgenerator object作成時に一度だけ評価されること、要素式とfilterが`next()`時に進むこと、target名が外側へ漏れないことを固定する。CPython 3.13系互換の基準出力は`['source']`、`20`、`['source']`、`[40]`、`not-leaked`である。専用state machineを有効化するまで、このケースはコンフォーマンス台帳へ登録しない。

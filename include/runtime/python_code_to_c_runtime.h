@@ -121,7 +121,7 @@ struct P2C_Object {
         struct { char *name; P2C_CallableFn ctor; P2C_MethodDef *methods; P2C_Map *attrs; char *base_name; char *mro; } v_class;
         struct { P2C_Object *klass; P2C_Map *attrs; } v_instance;
         struct { char *name; P2C_Map *attrs; } v_module;
-        struct { char *msg; char *type_name; P2C_Object *cause; } v_exception;
+        struct { char *msg; char *type_name; P2C_Object *cause; P2C_Object *args_tuple; } v_exception;
         struct { P2C_Object *value; } v_cell;
         /* iter()/next() 用。sequenceベース（list/tuple/str/dict や
          * __len__+__getitem__ を実装するインスタンス）を反復する場合は
@@ -136,6 +136,7 @@ struct P2C_Object {
             P2C_Object *awaiting;
             P2C_Object *result;
             P2C_Object *exception;
+            P2C_Object *sent;      /* send() で渡された値（next() では None） */
             uint32_t state;
             bool is_coroutine;
             bool running;
@@ -207,10 +208,22 @@ bool p2c_obj_is_truthy(P2C_Object *obj);
 int64_t p2c_obj_as_int(P2C_Object *obj);
 double p2c_obj_as_float(P2C_Object *obj);
 const char* p2c_obj_as_str(P2C_Object *obj);
+/* isinstance(x, int) 用（bool は int のサブクラス）。 */
+bool p2c_obj_is_int_like(P2C_Object *obj);
 
 P2C_Object* p2c_obj_add(P2C_Object *a, P2C_Object *b);
 P2C_Object* p2c_obj_sub(P2C_Object *a, P2C_Object *b);
 P2C_Object* p2c_obj_mul(P2C_Object *a, P2C_Object *b);
+P2C_Object* p2c_obj_neg(P2C_Object *a);
+/* 拡張代入 (+=, -=, *=, |=, &=, ^=) 用。list/set/dict は __iadd__/__ior__ 等と
+ * 同様に左辺をその場で書き換える（別名からも変更が見える）。それ以外の型は
+ * 対応する二項演算へフォールバックする。 */
+P2C_Object* p2c_obj_iadd(P2C_Object *a, P2C_Object *b);
+P2C_Object* p2c_obj_isub(P2C_Object *a, P2C_Object *b);
+P2C_Object* p2c_obj_imul(P2C_Object *a, P2C_Object *b);
+P2C_Object* p2c_obj_ibitand(P2C_Object *a, P2C_Object *b);
+P2C_Object* p2c_obj_ibitor(P2C_Object *a, P2C_Object *b);
+P2C_Object* p2c_obj_ibitxor(P2C_Object *a, P2C_Object *b);
 P2C_Object* p2c_obj_div(P2C_Object *a, P2C_Object *b);
 P2C_Object* p2c_obj_floordiv(P2C_Object *a, P2C_Object *b);
 P2C_Object* p2c_obj_mod(P2C_Object *a, P2C_Object *b);
@@ -344,7 +357,10 @@ void p2c_oom_raise_memory_error(size_t requested, const char *context, void *use
 
 
 #ifndef P2C_GC_ROOT_CAPACITY
-#define P2C_GC_ROOT_CAPACITY 1024
+/* ルート表の初期容量（エントリ数）。埋まると倍々に自動拡張するため、
+ * これは上限ではなく「最初に確保する大きさ」である。組込み（小さなヒープ）
+ * を圧迫しないよう小さく始める。 */
+#define P2C_GC_ROOT_CAPACITY 64
 #endif
 
 /* ========================================
@@ -562,6 +578,7 @@ extern P2C_THREAD_LOCAL P2C_Object *p2c_active_exception;
 void p2c_raise(P2C_Object *exc);
 void p2c_reraise(void);
 P2C_Object* p2c_make_exception(const char *type_name, const char *msg);
+P2C_Object* p2c_make_exception_with_args(const char *type_name, P2C_Object **args, size_t nargs);
 P2C_Object* p2c_exception_with_cause(P2C_Object *exc, P2C_Object *cause);
 P2C_Object* p2c_posonly_keyword_error(const char *function_name, const char *parameter_name);
 bool p2c_exc_match(P2C_Object *exc, P2C_ClassDef *cls);
@@ -596,11 +613,21 @@ void p2c_slice_assign(P2C_Object *obj, P2C_Object *start, P2C_Object *stop, P2C_
 void p2c_slice_delete(P2C_Object *obj, P2C_Object *start, P2C_Object *stop, P2C_Object *step);
 P2C_Object* p2c_builtin_enumerate(P2C_Object *iterable, P2C_Object *start);
 P2C_Object* p2c_builtin_zip(P2C_Object **args, size_t nargs);
+P2C_Object* p2c_builtin_zip_star(P2C_Object *outer);
 bool p2c_isinstance_of_class(P2C_Object *obj, const char *class_name);
 bool p2c_isinstance_of_object(P2C_Object *obj, P2C_Object *class_obj);
+bool p2c_isinstance_of_typeobj(P2C_Object *obj, P2C_Object *type_like);
+/* issubclass() 用（第一引数はクラスオブジェクト）。 */
+bool p2c_issubclass_of_class(P2C_Object *cls, const char *base_name);
+bool p2c_issubclass_of_object(P2C_Object *cls, P2C_Object *base_obj);
+bool p2c_issubclass_of_typeobj(P2C_Object *cls, P2C_Object *base_like);
 bool p2c_has_method(P2C_Object *obj, const char *name);
 P2C_Object* p2c_builtin_type(P2C_Object *obj);
 P2C_Object* p2c_obj_abs(P2C_Object *obj);
+/* hash(obj)。int を返す（ハッシュ不能なら TypeError）。 */
+P2C_Object* p2c_builtin_hash(P2C_Object *obj);
+/* 未定義名参照の NameError（コード生成のフォールバック）。 */
+P2C_Object* p2c_name_error_ref(const char *name);
 P2C_Object* p2c_builtin_min(P2C_Object **args, size_t nargs);
 P2C_Object* p2c_builtin_min_key(P2C_Object **args, size_t nargs, P2C_Object *key);
 P2C_Object* p2c_builtin_max(P2C_Object **args, size_t nargs);
@@ -629,6 +656,10 @@ P2C_Object* p2c_builtin_all(P2C_Object *iterable);
 P2C_Object* p2c_builtin_map(P2C_Object *fn, P2C_Object *iterable);
 P2C_Object* p2c_builtin_filter(P2C_Object *fn, P2C_Object *iterable);
 P2C_Object* p2c_builtin_list(P2C_Object *iterable);
+/* 内包表記の反復対象を添字アクセス可能な系列へ正規化する（カスタム iterable 対応）。 */
+P2C_Object* p2c_iter_source(P2C_Object *obj);
+/* アンパック代入の右辺を位置添字で取り出せる系列へ正規化する。 */
+P2C_Object* p2c_unpack_source(P2C_Object *obj);
 P2C_Object* p2c_builtin_dict(P2C_Object *iterable);
 P2C_Object* p2c_builtin_set(P2C_Object *iterable);
 P2C_Object* p2c_builtin_tuple(P2C_Object *iterable);
@@ -659,6 +690,8 @@ void p2c_generator_local_set(P2C_Object *generator, const char *name, P2C_Object
 P2C_Object* p2c_generator_yield(P2C_Object *generator, P2C_Object *value, uint32_t next_state);
 P2C_Object* p2c_generator_finish(P2C_Object *generator, P2C_Object *value);
 P2C_Object* p2c_generator_finish_exception(P2C_Object *generator, P2C_Object *exception);
+P2C_Object* p2c_generator_send(P2C_Object *generator, P2C_Object *value);
+P2C_Object* p2c_generator_sent_value(P2C_Object *generator);
 P2C_Object* p2c_generator_result(P2C_Object *generator);
 P2C_Object* p2c_generator_await(P2C_Object *generator, P2C_Object *awaitable, uint32_t next_state);
 P2C_Object* p2c_generator_await_result(P2C_Object *generator);

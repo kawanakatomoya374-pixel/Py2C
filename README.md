@@ -1,17 +1,17 @@
-# Python Code to C Alpha0.6
+# Python Code to C Alpha1.0
 
-**Python Code to C Alpha0.6** は、Python 3系の実用的なサブセットをC11へ変換する、移植性重視のトランスパイラです。字句解析、AST構築、意味解析、Cコード生成、ランタイムを独立した層として構成し、通常のホストOSではCLIとして、自作OSや組み込み環境ではライブラリとして利用できます。
+**Python Code to C Alpha1.0** は、Python 3系の実用的なサブセットをC11へ変換する、移植性重視のトランスパイラです。字句解析、AST構築、意味解析、Cコード生成、ランタイムを独立した層として構成し、通常のホストOSではCLIとして、自作OSや組み込み環境ではライブラリとして利用できます。
 
-> Alpha0.6の設計目標は、ホスト環境での使いやすさを維持しながら、OS依存処理を明示的なプラットフォーム契約へ押し込み、コアをfreestandingビルドできるようにすることです。
+> Alpha1.0の設計目標は、ホスト環境での使いやすさを維持しながら、OS依存処理を明示的なプラットフォーム契約へ押し込み、コアをfreestandingビルドできるようにすることです。
 
-## Alpha0.6の主な変更
+## Alpha1.0の主な変更
 
-| 領域 | Alpha0.6での変更 |
+| 領域 | Alpha1.0での変更 |
 |---|---|
-| 製品名称 | ディレクトリ、ファイル名、マクロ、CLI名、生成コードコメントを `Python Code to C Alpha0.6` / `python-code-to-c` 系へ統一 |
+| 製品名称 | ディレクトリ、ファイル名、マクロ、CLI名、生成コードコメントを `Python Code to C Alpha1.0` / `python-code-to-c` 系へ統一 |
 | 自作OS組み込み | `P2C_Platform` にメモリ、出力、時刻のフックを集約し、OS向けコア静的ライブラリを生成 |
 | ビルド・起動 | `make` でHosted CLI、`make gui` でGUI、`make freestanding` でOS向けコアを構築。`make run INPUT=...`で変換・実行を一括化 |
-| 構文対応 | 式、関数、クラス、module-level decorator、コンテナ、例外、list/dict/set内包表記、f-string、import、with、複数context managerのasync with、try、可変長引数に加え、クラスメソッドの`*args`・`**kwargs`・名前付き引数・`**mapping`展開、`dict.fromkeys`、pair iterable `dict.update`、setの包含関係・`pop`を対応 |
+| 構文対応 | 式、関数、クラス、module-level decorator、コンテナ、例外、list/dict/set内包表記、f-string、import、with、複数context managerのasync with、try、可変長引数に加え、クラスメソッドの`*args`・`**kwargs`・名前付き引数・`**mapping`展開、`dict.fromkeys`、pair iterable `dict.update`、setの包含関係・`pop`、リテラル内の展開（`[*a, *b]`・`(*a,)`・`{*a}`・`{**d}`）、タプル値/連鎖代入（`x = 1, 2`・`a, b = c, d = 5, 6`）、ジェネレータの`send()`/`next()`と`x = yield v`、`zip(*m)`、`enumerate(..., start=n)`を対応 |
 | GC hardening | shutdown/reinit時のregistry・async queue・pygame static class slot reset、constructor後段allocation失敗のrollback、runtime active状態、式評価中のTLS一時値（二項演算の左オペランド・処理中の例外）の明示ルートと例外脱出時の深さ巻き戻しを追加 |
 | 診断 | 未対応構文を不正なCへ変換せず、ソース位置付きの明確なエラーとして報告 |
 | スライス操作 | listの`a[b:c:d] = iterable`、`+=`、`del a[b:c:d]`に対応。通常スライスは長さ変更、拡張スライスは要素数一致を検査し、自己参照代入は安全に複製 |
@@ -42,7 +42,7 @@ CLIの実行ファイルは `build/python-code-to-c` です。互換目的で `m
 
 ## 対応構文の範囲
 
-Alpha0.6は、数値・文字列・真偽値・リスト・タプル・辞書・set、`...`（Ellipsis）、添字・スライス・スライス代入・属性アクセス、算術・比較・論理演算、条件式、lambda、関数定義と呼び出し、**module-level function/class decorator**、位置引数・キーワード引数・`*args`・`**kwargs`、if・while・for、break・continue・return、class・継承・**ネストしたクラス定義**（`class Outer: class Inner:`。生成CではC名を`Outer__Inner`に前置して衝突を避け、外側クラスの`__classobj()`が属性として登録するため`Outer.Inner`で参照できる）、try・except・finally・raise、with、複数context managerのasync with、import、list/dict/set内包表記、f-string、`str.format()`、`format`/`divmod`/`pow(a,b,mod)`/`callable`、`\xHH`・`\ooo`・`\uXXXX`・`\UXXXXXXXX`エスケープ、型注釈付き代入、複合代入を扱います。decoratorは式を上から下へ評価して下から上へ適用し、function/class objectをGC root付きcallable slotへ再束縛します。
+Alpha1.0は、数値・文字列・真偽値・リスト・タプル・辞書・set、`...`（Ellipsis）、添字・スライス・スライス代入・属性アクセス、算術・比較・論理演算、条件式、lambda、関数定義と呼び出し、**module-level function/class decorator**、位置引数・キーワード引数・`*args`・`**kwargs`、if・while・for、break・continue・return、class・継承・**ネストしたクラス定義**（`class Outer: class Inner:`。生成CではC名を`Outer__Inner`に前置して衝突を避け、外側クラスの`__classobj()`が属性として登録するため`Outer.Inner`で参照できる）、try・except・finally・raise、with、複数context managerのasync with、import、list/dict/set内包表記、f-string、`str.format()`、`format`/`divmod`/`pow(a,b,mod)`/`callable`、`\xHH`・`\ooo`・`\uXXXX`・`\UXXXXXXXX`エスケープ、型注釈付き代入、複合代入を扱います。decoratorは式を上から下へ評価して下から上へ適用し、function/class objectをGC root付きcallable slotへ再束縛します。
 
 多重継承（`class D(B, C)`）はPythonと同じC3線形化でMROを決めるため、ダイヤモンド継承（`class D(B, C)`、`class B(A)`、`class C(A)`）でも基底メソッドの選択と`super()`の解決先がCPythonと一致します。基底クラスのクラス属性もサブクラスのインスタンスからMRO順に見えます。メソッドを値として取り出すと束縛メソッド（`m = obj.method`）になり、`sorted(key=...)`や`map()`、コールバック引数へそのまま渡せます。メソッドデコレータは`@staticmethod`（selfを渡さない）・`@classmethod`（先頭にクラスオブジェクト）・`@property`（属性読み出しでゲッター実行。インスタンス属性より優先）と **`@x.setter`**（プロパティへの代入処理。setter未実装の代入は`AttributeError`）に対応し、プロパティはMRO順に継承・オーバーライドされます。`import math`は`floor`/`ceil`/`trunc`/`fabs`/`fmod`/`hypot`/`copysign`/`ldexp`/`degrees`/`radians`/`sin`/`cos`/`tan`/`asin`/`acos`/`atan`/`atan2`/`exp`/`expm1`/`log`/`log2`/`log10`/`log1p`/`sqrt`/`cbrt`/`pow`/`isnan`/`isinf`/`isfinite`/`fsum`/`prod`/`factorial`/`gcd`/`isqrt`/`comb`/`perm`/`erf`/`erfc`/`gamma`/`lgamma`と`pi`/`e`/`tau`/`inf`/`nan`を提供します。ジェネレータ式は複数for節・タプルターゲット・`if`フィルタに対応し、最も外側のiterableだけを生成時に評価するPythonの規則にも従います。`finally`内の`return`/`break`/`continue`は、finally本体を実行したうえで保留中の制御フロー（例外・`return`）を上書きします。`sorted()`/`min()`/`max()`はタプル・リストの辞書式比較に対応し、CPythonと同じく安定ソート（O(n log n)）で並べ替えます。順序を持たない型同士の比較はCPython同様`TypeError`になります。
 
@@ -63,6 +63,13 @@ Python標準ライブラリ全体やCPythonの完全互換を目標にはして�
 ```sh
 make test-stack-usage   # freestandingランタイムの全フレームが STACK_USAGE_LIMIT(既定4096バイト) 以下か
 make test-analyzer      # GCC -fanalyzer で解放後利用・NULL経路・確保失敗の取り違えを検出
+make test-warn-clang    # clang を第二の警告源にし、GCCが見ない軸(64→32切り詰め等)を検査
+make test-asan-strict   # 生成プログラム+ランタイムを厳格ASanで実行（コーパス+プローブ）
+make test-ubsan-deep    # UBSan最大構成（bounds-strict/object-size/builtin等）
+make test-msan          # clang MemorySanitizerで未初期化メモリ読み出しを検出
+make test-hardened-core # 変換器本体を -fhardened でビルドして回帰を実行
+make test-avinit-differential # 未初期化スタックの影響をpattern初期化との差分で検出
+make test-strict-profiles # 上記の厳格プロファイルを一括実行（長時間）
 ```
 
 `test-stack-usage` はカーネルのスタックが数KiBしか無い環境を想定した検査で、`-Wstack-usage` を`-Werror`と併用します（現状の最大は約3.4KiB）。`-fanalyzer` は実行時間が長いため既定の`make test`には含めず、明示的に実行します（指摘があれば`-Werror`で失敗します）。
@@ -106,11 +113,11 @@ p2c_sandbox_set(&limits);   /* 0 は無制限。タスクごとに呼ぶ */
 
 ## C99（TinyCC）ビルドとELF生成
 
-既定ビルドはC11＋厳格警告のまま、**C99専用コンパイラ（TinyCC等）向けのビルド経路** と **ELF生成** を追加しました。詳細は [`docs/build/C99_TINYC_AND_ELF_ALPHA0.6.md`](docs/build/C99_TINYC_AND_ELF_ALPHA0.6.md) を参照してください。
+既定ビルドはC11＋厳格警告のまま、**C99専用コンパイラ（TinyCC等）向けのビルド経路** と **ELF生成** を追加しました。詳細は [`docs/build/C99_TINYC_AND_ELF_ALPHA1.0.md`](docs/build/C99_TINYC_AND_ELF_ALPHA1.0.md) を参照してください。
 
 ```sh
 make c99             # コンパイラ本体を -std=c99 -pedantic -Wall -Wextra -Werror でビルド
-make test-c99        # C99で変換器と生成Cをビルドし、CPython差分コーパス（749件）を実行
+make test-c99        # C99で変換器と生成Cをビルドし、CPython差分コーパス（847件）を実行
 make tcc             # CC=tcc でフル機能ビルド（TCC=/path/to/tcc で指定可）
 make test-tcc        # tccで変換器・生成C・単一ヘッダーをビルドして差分コーパスを実行
 
@@ -153,7 +160,7 @@ make freestanding
 
 成果物は `build/freestanding/libpython-code-to-c-core.a` です。対象OSのクロスコンパイラを使う場合は、コンパイラ名やx86固有フラグを既定にしない`templates/toolchains/freestanding-c11.mk`を使い、`CC`、`AR`、`FREESTANDING_ARCH_CFLAGS`、`FREESTANDING_EXTRA_CFLAGS`、リンカ設定を外側のビルドから指定してください。`make -f templates/toolchains/freestanding-c11.mk PROJECT_ROOT=. print-config`で実効設定を確認できます。
 
-OS側の実装は `include/platform/python_code_to_c_platform.h` の `P2C_Platform` に接続します。メモリ確保、再確保、解放、診断出力、時刻を提供し、`python_to_c()`や生成Cの実行より前に`p2c_platform_set()`で登録します。アロケータだけを差し替えたい場合は `p2c_platform_set_allocator(kalloc, krealloc, kfree, ctx)` の1回でカーネルのヒープを唯一のヒープにでき、`P2C_Allocator` を変換器コアの既定として注入する場合は `p2c_set_default_allocator()` を使います。`p2c_core_static_allocator_active()` が `false` なら、変換器はカーネルのヒープだけを使っています（静的フォールバックは `P2C_COMPILER_FALLBACK_HEAP_SIZE` でサイズ変更・無効化でき、既定は64KiB）。非局所脱出（`raise`/`except`/generator/`with`/`finally`）は `P2C_SETJMP`/`P2C_LONGJMP` の2つのマクロだけを通るため、カーネルの実装へ完全に差し替えられます（既定はfreestandingでコンパイラ組み込み、hostedでlibc）。`print`と例外診断は登録済み`write`コールバックへ出力されます。CLI・ファイルシステム・プロセス生成・GUIに依存せず、字句解析からCコード生成までを直接呼び出せます。詳細な段階的手順は [`PORTING.md`](PORTING.md) を、Hosted起動・makeターゲット・クロス構築の実行手順は [`docs/build/BUILD_AND_LAUNCH_ALPHA0.6.md`](docs/build/BUILD_AND_LAUNCH_ALPHA0.6.md) を参照してください。
+OS側の実装は `include/platform/python_code_to_c_platform.h` の `P2C_Platform` に接続します。メモリ確保、再確保、解放、診断出力、時刻を提供し、`python_to_c()`や生成Cの実行より前に`p2c_platform_set()`で登録します。アロケータだけを差し替えたい場合は `p2c_platform_set_allocator(kalloc, krealloc, kfree, ctx)` の1回でカーネルのヒープを唯一のヒープにでき、`P2C_Allocator` を変換器コアの既定として注入する場合は `p2c_set_default_allocator()` を使います。`p2c_core_static_allocator_active()` が `false` なら、変換器はカーネルのヒープだけを使っています（静的フォールバックは `P2C_COMPILER_FALLBACK_HEAP_SIZE` でサイズ変更・無効化でき、既定は64KiB）。非局所脱出（`raise`/`except`/generator/`with`/`finally`）は `P2C_SETJMP`/`P2C_LONGJMP` の2つのマクロだけを通るため、カーネルの実装へ完全に差し替えられます（既定はfreestandingでコンパイラ組み込み、hostedでlibc）。`print`と例外診断は登録済み`write`コールバックへ出力されます。CLI・ファイルシステム・プロセス生成・GUIに依存せず、字句解析からCコード生成までを直接呼び出せます。詳細な段階的手順は [`PORTING.md`](PORTING.md) を、Hosted起動・makeターゲット・クロス構築の実行手順は [`docs/build/BUILD_AND_LAUNCH_ALPHA1.0.md`](docs/build/BUILD_AND_LAUNCH_ALPHA1.0.md) を参照してください。
 
 ### 変換済みモジュールをカーネルタスクとして実行する
 
@@ -177,7 +184,7 @@ p2c_embed_run_program(kernel_python_program);
 p2c_embed_stop();
 ```
 
-`p2c_embed` は組込みヒープ（境界タグ＋空きリスト＋隣接合体）、出力シンク、GCのスタック境界宣言、OOM方針（`MemoryError`送出またはpanic）、ヒープ/GC統計、未処理例外の診断を提供します。変換器コア自体も標準Cライブラリ無しでビルド・実行できるため、OS内でPythonソースをCへ変換することもできます。テンプレートは [`templates/hobby_os/`](templates/hobby_os/README.md)、契約の詳細は [`docs/spec/HOBBY_OS_EMBEDDING_ALPHA0.6.md`](docs/spec/HOBBY_OS_EMBEDDING_ALPHA0.6.md) を参照してください。
+`p2c_embed` は組込みヒープ（境界タグ＋空きリスト＋隣接合体）、出力シンク、GCのスタック境界宣言、OOM方針（`MemoryError`送出またはpanic）、ヒープ/GC統計、未処理例外の診断を提供します。変換器コア自体も標準Cライブラリ無しでビルド・実行できるため、OS内でPythonソースをCへ変換することもできます。テンプレートは [`templates/hobby_os/`](templates/hobby_os/README.md)、契約の詳細は [`docs/spec/HOBBY_OS_EMBEDDING_ALPHA1.0.md`](docs/spec/HOBBY_OS_EMBEDDING_ALPHA1.0.md) を参照してください。
 
 ## ディレクトリ構成
 
@@ -206,7 +213,7 @@ make freestanding
 
 ## バージョン
 
-本リリースの識別子は **Python Code to C Alpha0.6 / 0.6.0** です。公開ヘッダー、ビルド定義、CLIの版番号はこの識別子に同期しています。変更履歴は [`CHANGELOG_ALPHA0.6.md`](CHANGELOG_ALPHA0.6.md)、移植仕様は [`PORTING.md`](PORTING.md)、構文・移植性の詳細は [`docs/spec/SYNTAX_AND_PORTABILITY.md`](docs/spec/SYNTAX_AND_PORTABILITY.md)、[`docs/spec/ASYNC_WITH_AND_SET_COMPREHENSION_ALPHA0.6.md`](docs/spec/ASYNC_WITH_AND_SET_COMPREHENSION_ALPHA0.6.md)、および[`docs/spec/DECORATORS_ALPHA0.6.md`](docs/spec/DECORATORS_ALPHA0.6.md)、単一ヘッダー統合は [`docs/build/SINGLE_HEADER_INTEGRATION_ALPHA0.6.md`](docs/build/SINGLE_HEADER_INTEGRATION_ALPHA0.6.md)、起動・ビルド手順は [`docs/build/BUILD_AND_LAUNCH_ALPHA0.6.md`](docs/build/BUILD_AND_LAUNCH_ALPHA0.6.md)、決定的コンテナファジングは [`docs/testing/CONTAINER_FUZZING_ALPHA0.6.md`](docs/testing/CONTAINER_FUZZING_ALPHA0.6.md) に記載しています。
+本リリースの識別子は **Python Code to C Alpha1.0 / 1.0.0** です。公開ヘッダー、ビルド定義、CLIの版番号はこの識別子に同期しています。変更履歴は [`CHANGELOG_ALPHA1.0.md`](CHANGELOG_ALPHA1.0.md)、移植仕様は [`PORTING.md`](PORTING.md)、構文・移植性の詳細は [`docs/spec/SYNTAX_AND_PORTABILITY.md`](docs/spec/SYNTAX_AND_PORTABILITY.md)、[`docs/spec/ASYNC_WITH_AND_SET_COMPREHENSION_ALPHA1.0.md`](docs/spec/ASYNC_WITH_AND_SET_COMPREHENSION_ALPHA1.0.md)、および[`docs/spec/DECORATORS_ALPHA1.0.md`](docs/spec/DECORATORS_ALPHA1.0.md)、単一ヘッダー統合は [`docs/build/SINGLE_HEADER_INTEGRATION_ALPHA1.0.md`](docs/build/SINGLE_HEADER_INTEGRATION_ALPHA1.0.md)、起動・ビルド手順は [`docs/build/BUILD_AND_LAUNCH_ALPHA1.0.md`](docs/build/BUILD_AND_LAUNCH_ALPHA1.0.md)、決定的コンテナファジングは [`docs/testing/CONTAINER_FUZZING_ALPHA1.0.md`](docs/testing/CONTAINER_FUZZING_ALPHA1.0.md) に記載しています。
 
 ## GCと自作OS向け描画
 
@@ -216,4 +223,4 @@ GCには重複登録を抑止する明示的ルート表、`p2c_gc_unregister_ro
 
 ## 複雑回帰テスト
 
-`tests/complex_alpha06.py` は算術、文字列、コンテナ、内包表記、反復、関数、可変長引数、例外、クラス、デフォルト引数、f-string、辞書操作、組み込み関数などを含む60ケースのコーパスです。`make test` は通常のスモークテストに加えて `tests/test_gc_gui.c`、複数runtime epochとroot/cycleを検証する`tests/test_gc_runtime_reinit.c`、決定的allocator失敗rollbackを検証する`tests/test_gc_allocation_failure.c`をビルド・実行します。
+`tests/complex_alpha10.py` は算術、文字列、コンテナ、内包表記、反復、関数、可変長引数、例外、クラス、デフォルト引数、f-string、辞書操作、組み込み関数などを含む60ケースのコーパスです。`make test` は通常のスモークテストに加えて `tests/test_gc_gui.c`、複数runtime epochとroot/cycleを検証する`tests/test_gc_runtime_reinit.c`、決定的allocator失敗rollbackを検証する`tests/test_gc_allocation_failure.c`をビルド・実行します。

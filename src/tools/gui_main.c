@@ -140,7 +140,7 @@ static void hr(void) {
 static void banner(void) {
     if (g_use_color) printf("\x1b[1;36m");
     printf("============================================================\n");
-    printf("  Python Code to C / C to Python - Converter GUI (Alpha0.6)\n");
+    printf("  Python Code to C / C to Python - Converter GUI (Alpha1.0)\n");
     printf("============================================================\n");
     if (g_use_color) printf("\x1b[0m");
 }

@@ -1,8 +1,8 @@
-# Python Code to C Alpha0.6
+# Python Code to C Alpha1.0
 # Hosted build: make
 # Freestanding build: make TOOLCHAIN=templates/toolchains/freestanding-c11.mk
 PROJECT := python-code-to-c
-VERSION := 0.6.0
+VERSION := 1.0.0
 CC ?= cc
 AR ?= ar
 PYTHON ?= python3
@@ -57,7 +57,12 @@ WARN_CFLAGS ?= -Wall -Wextra -Werror -Wpedantic \
 # ホスト環境でのみ意味のある実行時ハードニング（開発機・CIでの検証用）。
 # 組込み/freestanding構成ではスタック保護もFORTIFYも存在しないため、
 # HOSTED_CFLAGSとして分離し、CFLAGSの既定値にのみ含める。
-HOSTED_HARDEN ?= -fstack-protector-strong -fstack-clash-protection -D_FORTIFY_SOURCE=3
+#   -ftrivial-auto-var-init=zero ... 自動変数を常にゼロ初期化する。未初期化読み出しの
+#       温床（不定値の分岐・ポインタ）を決定的に潰し、再現しない不具合を減らす。
+#       GCC12+/clang8+ で利用可能。-ftrivial-auto-var-init=pattern に差し替えると
+#       未初期化読み出しを 0xFE で露出させられる（tests/avinit_differential_alpha10.sh）。
+HOSTED_HARDEN ?= -fstack-protector-strong -fstack-clash-protection -D_FORTIFY_SOURCE=3 \
+	-ftrivial-auto-var-init=zero
 CFLAGS ?= -std=c11 -O2 $(HOSTED_HARDEN) $(WARN_CFLAGS)
 CPPFLAGS ?= -I./include
 # 依存関係生成。TinyCCは -MMD/-MP を持たないため、tcc構成では DEPFLAGS= で無効化する。
@@ -76,6 +81,19 @@ EMBED_CFLAGS ?= -DPYTHON_CODE_TO_C_NO_STDLIB -DPYTHON_CODE_TO_C_NO_PYGAME -DPYTH
 # ホスト側（カーネル相当のタスク情報を提供する側）は標準Cライブラリ込みでビルドする。
 HOST_STACK_CFLAGS ?= -std=c11 -O2 $(WARN_CFLAGS)
 SANITIZER_ENV ?= ASAN_OPTIONS=detect_leaks=0:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1
+# --- 追加の厳格プロファイル（開発機/CIでのバグ狩り専用。既定ビルドは不変）------
+# 既定CFLAGSへ入れると freestanding/tcc/C99/ELF の移植性を壊すため、専用ターゲット
+# （make test-asan-strict / test-ubsan-deep / test-msan / test-avinit-differential 等）
+# からのみ使う。既定の警告基準は WARN_CFLAGS（-Wconversion 等を含む）で既に最大級
+# なので、ここでは「動的解析」と「リンク時硬化」の軸を足す。
+#   -fhardened             ... GCC14+ の総合硬化（FORTIFY3/PIE/CF保護/zero初期化）
+#   -fstrict-flex-arrays=3 ... 末尾可変長配列の範囲外アクセスを厳格に扱う
+#   -ftrivial-auto-var-init=pattern ... 自動変数を 0xFE で埋め、未初期化読み出しを
+#                                      決定的に露出させる（差分ハーネスで検出）
+HARDENED_CFLAGS ?= -fhardened -fstrict-flex-arrays=3
+HARDENED_LDFLAGS ?= -Wl,-z,relro,-z,now,-z,noexecstack
+AVINIT_CFLAGS ?= -ftrivial-auto-var-init=pattern
+STRICT_SAN_CC ?= clang
 BUILD ?= build
 OBJ ?= obj
 
@@ -84,14 +102,14 @@ SRC := $(shell find src -type f -name '*.c' ! -path 'src/tools/gui_main.c' | sor
 OBJFILES := $(patsubst src/%.c,$(OBJ)/%.o,$(SRC))
 DEPS := $(OBJFILES:.o=.d)
 
-.PHONY: all help check-tools gui run run-gui freestanding freestanding-clean single-header test-single-header test-single-header-c11 test-single-header-c99 test-single-header-tcc test-single-header-freestanding full-build test test-sanitizers test-parser-sanitizers test-starred-unpack test-set test-set-comprehension-c11 test-decorator-diagnostics test-conformance test-container-fuzz test-portability test-gc-gui test-gc-lifecycle test-gc-allocation-failure test-probe test-limits test-fallback test-gc-adaptive test-gc-leaks test-integer-overflow test-platform-adapter test-allocator-injection test-setjmp-hook test-heap-unification test-generator-async-runtime test-async-generator test-py313-syntax test-baremetal-runtime test-embed-baseline test-embed-runtime test-freestanding-setjmp test-embed-compile test-crlf test-hobby-os-template test-embed-generated test-baremetal-exceptions test-gc-stack-scan-scope test-gc-temp-roots test-stack-usage test-sandbox test-sanitizers-core test-analyzer test-analyzer-clang test-baremetal-build test-baremetal-generated c99 check-tcc tcc test-c99 test-tcc-freestanding test-tcc hobby elf tcc-elf elf-full test-hobbyos-libc hobbyos-elf hobbyos install clean
+.PHONY: all help check-tools gui run run-gui freestanding freestanding-clean single-header test-single-header test-single-header-c11 test-single-header-c99 test-single-header-tcc test-single-header-freestanding full-build test test-sanitizers test-parser-sanitizers test-starred-unpack test-set test-set-comprehension-c11 test-decorator-diagnostics test-conformance test-container-fuzz test-portability test-gc-gui test-gc-lifecycle test-gc-allocation-failure test-probe test-limits test-fallback test-gc-adaptive test-gc-hardening test-gc-leaks test-integer-overflow test-platform-adapter test-allocator-injection test-setjmp-hook test-heap-unification test-generator-async-runtime test-async-generator test-py313-syntax test-baremetal-runtime test-embed-baseline test-embed-runtime test-freestanding-setjmp test-embed-compile test-crlf test-hobby-os-template test-embed-generated test-baremetal-exceptions test-gc-stack-scan-scope test-gc-temp-roots test-stack-usage test-sandbox test-sanitizers-core test-analyzer test-analyzer-clang test-baremetal-build test-baremetal-generated c99 check-tcc tcc test-c99 test-tcc-freestanding test-tcc hobby elf tcc-elf elf-full test-hobbyos-libc hobbyos-elf hobbyos install clean test-asan-strict test-ubsan-deep test-msan test-lsan-generated test-clang-integer test-harden-generated test-hardened-core test-avinit-differential test-strict-profiles test-warn-clang test-clang-build
 
 all: $(BUILD)/python-code-to-c
 	@mkdir -p bin
 	@ln -sf ../$(BUILD)/python-code-to-c bin/python_code_to_c
 
 help:
-	@printf '%s\n' 'Python Code to C Alpha0.6 build targets:'
+	@printf '%s\n' 'Python Code to C Alpha1.0 build targets:'
 	@printf '%s\n' '  make all                         Build the hosted CLI.'
 	@printf '%s\n' '  make gui                         Build the local GUI frontend.'
 	@printf '%s\n' '  make run INPUT=path/to/file.py   Build, transpile, compile, and run Python input.'
@@ -121,6 +139,17 @@ help:
 	@printf '%s\n' '  make test-analyzer               Run GCC -fanalyzer over every source file.'
 	@printf '%s\n' '  make test-analyzer-clang         Cross-check with the clang static analyzer (optional).'
 	@printf '%s\n' '  make test-sanitizers-core        Run the converter pipeline under ASan/UBSan.'
+	@printf '%s\n' '  make test-asan-strict            Corpus+probes under strict ASan (use-after-return, invalid pointer pairs).'
+	@printf '%s\n' '  make test-ubsan-deep             Corpus+probes under maximal UBSan (bounds-strict, object-size, builtin).'
+	@printf '%s\n' '  make test-msan                   Corpus+probes under clang MemorySanitizer (uninitialized reads).'
+	@printf '%s\n' '  make test-lsan-generated         Corpus under LeakSanitizer (leaks in the runtime/GC).'
+	@printf '%s\n' '  make test-clang-integer          Corpus+probes under clang integer/implicit-conversion sanitizers.'
+	@printf '%s\n' '  make test-harden-generated       Build generated programs with _FORTIFY_SOURCE=3 + stack protector.'
+	@printf '%s\n' '  make test-hardened-core          Build the CLI with -fhardened and run the corpus+probes.'
+	@printf '%s\n' '  make test-avinit-differential    Detect uninitialized stack reads by diffing pattern-init builds.'
+	@printf '%s\n' '  make test-strict-profiles        Run every strict profile above (slow).'
+	@printf '%s\n' '  make test-warn-clang             Second-opinion warnings from clang (GCC-independent checks).'
+	@printf '%s\n' '  make test-clang-build            Build the converter with clang and run the corpus+probes.'
 	@printf '%s\n' '  make c99                         Build the CLI as strict C99 (GCC -std=c99 -pedantic -Wall -Wextra -Werror).'
 	@printf '%s\n' '  make test-c99                    Run the CPython-differential corpus built and compiled as C99.'
 	@printf '%s\n' '  make test-single-header-c99      Build and run the single header as strict C99 (GCC -pedantic-errors).'
@@ -135,6 +164,7 @@ help:
 	@printf '%s\n' '  make test-tcc-freestanding       Compile the NO_STDLIB core/templates/setjmp with TinyCC.'
 	@printf '%s\n' '  make test-hobbyos-libc           Compare the HobbyOS reference libm/libc against the host.'
 	@printf '%s\n' '  make test-gc-adaptive            Check the adaptive GC threshold reduces collections.'
+	@printf '%s\n' '  make test-gc-hardening           Check dynamic GC roots and non-recursive marking.'
 	@printf '%s\n' '  make test-fallback               Check --fallback stubs (strict diag / unreached / reached).'
 	@printf '%s\n' '  make test-sandbox               Check the sandbox step/alloc budgets raise SandboxError, not hang.'
 
@@ -255,6 +285,7 @@ test: all
 	$(MAKE) test-single-header-freestanding
 	$(MAKE) test-sandbox
 	$(MAKE) test-gc-adaptive
+	$(MAKE) test-gc-hardening
 	$(MAKE) test-fallback
 	$(MAKE) test-stack-usage
 	$(MAKE) test-hobbyos-libc
@@ -267,7 +298,7 @@ test: all
 # サンドボックス（実行予算: ステップ/確保）の回帰。予算超過が SandboxError で
 # 止まること（ハング・クラッシュにしない）と、生成whileループの計装を確認する。
 test-sandbox:
-	CC="$(CC)" sh tests/sandbox_regression_alpha06.sh
+	CC="$(CC)" sh tests/sandbox_regression_alpha10.sh
 
 test-sanitizers:
 	$(MAKE) clean
@@ -277,33 +308,99 @@ test-sanitizers:
 	$(MAKE) BUILD=build/sanitize OBJ=obj/sanitize CFLAGS="$(CFLAGS) $(SANITIZER_CFLAGS)" LDFLAGS="$(LDFLAGS) $(SANITIZER_CFLAGS)" test-gc-allocation-failure
 	$(SANITIZER_ENV) P2C_COMPILER=./build/sanitize/python-code-to-c P2C_TEST_CFLAGS="-Wall -Wextra -Werror -std=gnu11 $(SANITIZER_CFLAGS)" P2C_TEST_LDFLAGS="$(SANITIZER_CFLAGS)" CC="$(CC)" sh tests/conformance_regression.sh
 
+# --- 厳格プロファイル（バグ狩り） ----------------------------------------------
+# 生成プログラム+ランタイムを各サニタイザ構成でビルドし、CPython差分コーパス
+# （749アサーション）と意味論プローブ（61件）を実行する。
+# 各プロファイルの内容は tests/strict_dynamic_alpha10.sh を参照。
+test-asan-strict: all
+	sh tests/strict_dynamic_alpha10.sh asan-strict
+
+test-ubsan-deep: all
+	sh tests/strict_dynamic_alpha10.sh ubsan-deep
+
+test-msan: all
+	CC=$(STRICT_SAN_CC) sh tests/strict_dynamic_alpha10.sh msan
+
+test-lsan-generated: all
+	sh tests/strict_dynamic_alpha10.sh lsan
+
+test-clang-integer: all
+	CC=$(STRICT_SAN_CC) sh tests/strict_dynamic_alpha10.sh clang-int
+
+test-harden-generated: all
+	sh tests/strict_dynamic_alpha10.sh harden
+
+# 変換器本体を -fhardened でビルドし、その変換器でコーパスを走らせる。
+test-hardened-core:
+	$(MAKE) BUILD=build/hardened OBJ=obj/hardened \
+		CFLAGS="$(CFLAGS) $(HARDENED_CFLAGS)" LDFLAGS="$(LDFLAGS) $(HARDENED_LDFLAGS)" all
+	P2C_COMPILER=./build/hardened/python-code-to-c sh tests/conformance_regression.sh
+	P2C_COMPILER=./build/hardened/python-code-to-c sh tests/semantic_probe_alpha10.sh
+
+# 未初期化スタック読み出しの差分検出（変換器の出力 + 生成プログラムの実行結果）。
+test-avinit-differential: all
+	$(MAKE) BUILD=build/avinit OBJ=obj/avinit CFLAGS="$(CFLAGS) $(AVINIT_CFLAGS)" all
+	AVINIT_RUN=1 sh tests/avinit_differential_alpha10.sh ./build/python-code-to-c ./build/avinit/python-code-to-c
+
+# clang を「第二の警告源」として全ソースに当てる。GCC の WARN_CFLAGS では
+# 拾えない軸（64→32切り詰め、条件付き未初期化、enum 変換、到達不能コード）を補完する。
+CLANG_EXTRA_WARN ?= -Wshorten-64-to-32 -Wconditional-uninitialized -Wenum-conversion \
+	-Wimplicit-int-conversion -Wshadow-all -Wunreachable-code -Wassign-enum -Wcomma \
+	-Wabsolute-value -Wloop-analysis -Wsizeof-array-decay -Wformat-non-iso
+test-warn-clang: all
+	@command -v $(firstword $(CLANG)) > /dev/null || { printf '%s\n' "$(CLANG) not found (optional cross-check)"; exit 1; }
+	@mkdir -p $(BUILD)/tests
+	@for src in $(SRC); do \
+		out=$(BUILD)/tests/clangwarn_$$(basename $$src .c).o; \
+		$(CLANG) -I./include -std=c11 -O1 -Wall -Wextra -Werror \
+			-Wcast-qual -Wvla -Wpointer-arith -Wcast-align \
+			-Wstrict-prototypes -Wmissing-prototypes \
+			$(CLANG_EXTRA_WARN) -c $$src -o $$out || exit 1; \
+	done
+	@printf '%s\n' 'clang_warn_ok: second-opinion clang warnings are clean'
+
+# clang で変換器本体をビルドし、その変換器でコーパスを走らせる（第二コンパイラ）。
+test-clang-build:
+	sh tests/clang_build_alpha10.sh
+
+# 動的解析系の厳格プロファイルをまとめて実行する（時間がかかる）。
+test-strict-profiles: all
+	$(MAKE) test-warn-clang
+	$(MAKE) test-clang-build
+	$(MAKE) test-asan-strict
+	$(MAKE) test-ubsan-deep
+	$(MAKE) test-clang-integer
+	$(MAKE) test-harden-generated
+	$(MAKE) test-hardened-core
+	$(MAKE) test-avinit-differential
+
 test-parser-sanitizers: all
 	@mkdir -p $(BUILD)/tests
-	$(SANITIZER_ENV) ./$(BUILD)/python-code-to-c tests/parser_starred_unpack_asan_alpha06.py -o $(BUILD)/tests/parser_starred_unpack_asan_alpha06.c
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(BUILD)/tests/parser_starred_unpack_asan_alpha06.c src/runtime/python_code_to_c_runtime.c src/common/python_code_to_c_common.c src/platform/python_code_to_c_platform.c src/platform/python_code_to_c_platform_hosted.c src/platform/python_code_to_c_gui.c src/modules/python_code_to_c_pygame.c $(LDFLAGS) $(LDLIBS) -o $(BUILD)/tests/parser_starred_unpack_asan_alpha06
-	$(SANITIZER_ENV) $(BUILD)/tests/parser_starred_unpack_asan_alpha06 > $(BUILD)/tests/parser_starred_unpack_asan_alpha06.out
-	printf '10 [20, 30] 40\n1 (2, 3, 4) 5\n' > $(BUILD)/tests/parser_starred_unpack_asan_alpha06.expected
-	diff -u $(BUILD)/tests/parser_starred_unpack_asan_alpha06.expected $(BUILD)/tests/parser_starred_unpack_asan_alpha06.out
+	$(SANITIZER_ENV) ./$(BUILD)/python-code-to-c tests/parser_starred_unpack_asan_alpha10.py -o $(BUILD)/tests/parser_starred_unpack_asan_alpha10.c
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(BUILD)/tests/parser_starred_unpack_asan_alpha10.c src/runtime/python_code_to_c_runtime.c src/common/python_code_to_c_common.c src/platform/python_code_to_c_platform.c src/platform/python_code_to_c_platform_hosted.c src/platform/python_code_to_c_gui.c src/modules/python_code_to_c_pygame.c $(LDFLAGS) $(LDLIBS) -o $(BUILD)/tests/parser_starred_unpack_asan_alpha10
+	$(SANITIZER_ENV) $(BUILD)/tests/parser_starred_unpack_asan_alpha10 > $(BUILD)/tests/parser_starred_unpack_asan_alpha10.out
+	printf '10 [20, 30] 40\n1 (2, 3, 4) 5\n' > $(BUILD)/tests/parser_starred_unpack_asan_alpha10.expected
+	diff -u $(BUILD)/tests/parser_starred_unpack_asan_alpha10.expected $(BUILD)/tests/parser_starred_unpack_asan_alpha10.out
 
 test-starred-unpack:
 	@mkdir -p build/tests
-	./build/python-code-to-c tests/starred_unpack_alpha06.py -o build/tests/starred_unpack_alpha06.c
-	$(CC) $(CPPFLAGS) $(CFLAGS) build/tests/starred_unpack_alpha06.c src/runtime/python_code_to_c_runtime.c src/common/python_code_to_c_common.c src/platform/python_code_to_c_platform.c src/platform/python_code_to_c_platform_hosted.c src/platform/python_code_to_c_gui.c src/modules/python_code_to_c_pygame.c $(LDLIBS) -o build/tests/starred_unpack_alpha06
-	build/tests/starred_unpack_alpha06 > build/tests/starred_unpack_alpha06.out
-	printf '1 [2, 3, 4] 5\n[10, 20] 30\n7 [8, 9]\n' > build/tests/starred_unpack_alpha06.expected
-	diff -u build/tests/starred_unpack_alpha06.expected build/tests/starred_unpack_alpha06.out
+	./build/python-code-to-c tests/starred_unpack_alpha10.py -o build/tests/starred_unpack_alpha10.c
+	$(CC) $(CPPFLAGS) $(CFLAGS) build/tests/starred_unpack_alpha10.c src/runtime/python_code_to_c_runtime.c src/common/python_code_to_c_common.c src/platform/python_code_to_c_platform.c src/platform/python_code_to_c_platform_hosted.c src/platform/python_code_to_c_gui.c src/modules/python_code_to_c_pygame.c $(LDLIBS) -o build/tests/starred_unpack_alpha10
+	build/tests/starred_unpack_alpha10 > build/tests/starred_unpack_alpha10.out
+	printf '1 [2, 3, 4] 5\n[10, 20] 30\n7 [8, 9]\n' > build/tests/starred_unpack_alpha10.expected
+	diff -u build/tests/starred_unpack_alpha10.expected build/tests/starred_unpack_alpha10.out
 
 test-set: all
 	sh tests/set_regression.sh
 
 test-set-comprehension-c11: all
 	@mkdir -p build/tests
-	@if ./build/python-code-to-c --c11 tests/set_comprehension_alpha06.py -o build/tests/set_comprehension_alpha06.c11.c >build/tests/set_comprehension_alpha06.c11.out 2>build/tests/set_comprehension_alpha06.c11.err; then printf '%s\n' 'set comprehension unexpectedly passed --c11' >&2; exit 1; fi
-	@grep -F 'comprehensions are unavailable in strict ISO C11 mode' build/tests/set_comprehension_alpha06.c11.err >/dev/null
+	@if ./build/python-code-to-c --c11 tests/set_comprehension_alpha10.py -o build/tests/set_comprehension_alpha10.c11.c >build/tests/set_comprehension_alpha10.c11.out 2>build/tests/set_comprehension_alpha10.c11.err; then printf '%s\n' 'set comprehension unexpectedly passed --c11' >&2; exit 1; fi
+	@grep -F 'comprehensions are unavailable in strict ISO C11 mode' build/tests/set_comprehension_alpha10.c11.err >/dev/null
 	@printf '%s\n' 'set_comprehension_c11_diagnostic_ok'
 
 test-decorator-diagnostics: all
-	sh tests/decorator_diagnostics_alpha06.sh
+	sh tests/decorator_diagnostics_alpha10.sh
 
 test-conformance: all
 	sh tests/conformance_regression.sh
@@ -337,13 +434,13 @@ test-gc-allocation-failure:
 # 追跡オブジェクト数のピークが上限内に収まることを確認する。
 # 未対応構文のフォールバック（--fallback）の回帰。
 test-probe:
-	@sh tests/semantic_probe_alpha06.sh
+	@sh tests/semantic_probe_alpha10.sh
 
 test-limits:
-	@sh tests/limit_diagnostics_alpha06.sh
+	@sh tests/limit_diagnostics_alpha10.sh
 
 test-fallback:
-	P2C_COMPILER=$(BUILD)/python-code-to-c CC="$(CC)" sh tests/fallback_regression_alpha06.sh
+	P2C_COMPILER=$(BUILD)/python-code-to-c CC="$(CC)" sh tests/fallback_regression_alpha10.sh
 
 test-gc-adaptive:
 	@mkdir -p $(BUILD)/tests
@@ -352,6 +449,15 @@ test-gc-adaptive:
 		src/common/python_code_to_c_common.c src/platform/python_code_to_c_platform.c \
 		src/platform/python_code_to_c_platform_hosted.c $(LDLIBS) -o $(BUILD)/tests/test_gc_adaptive
 	$(BUILD)/tests/test_gc_adaptive
+
+# GCハードニング: ルート表の動的拡張（>1024 globals）と、深い入れ子の
+# 反復マーク（旧実装は再帰で深さ分だけCスタックを消費した）を回帰検証する。
+test-gc-hardening:
+	@mkdir -p $(BUILD)/tests
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/test_gc_hardening.c src/runtime/python_code_to_c_runtime.c src/common/python_code_to_c_common.c src/platform/python_code_to_c_platform.c src/platform/python_code_to_c_platform_hosted.c src/platform/python_code_to_c_gui.c src/modules/python_code_to_c_pygame.c $(LDLIBS) -o $(BUILD)/tests/test_gc_hardening
+	$(BUILD)/tests/test_gc_hardening
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(SANITIZER_CFLAGS) tests/test_gc_hardening.c src/runtime/python_code_to_c_runtime.c src/common/python_code_to_c_common.c src/platform/python_code_to_c_platform.c src/platform/python_code_to_c_platform_hosted.c src/platform/python_code_to_c_gui.c src/modules/python_code_to_c_pygame.c $(SANITIZER_CFLAGS) $(LDLIBS) -o $(BUILD)/tests/test_gc_hardening_lsan
+	ASAN_OPTIONS=detect_stack_use_after_return=0:detect_leaks=1:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 $(BUILD)/tests/test_gc_hardening_lsan
 
 test-gc-leaks:
 	@mkdir -p build/tests
@@ -414,16 +520,16 @@ test-async-generator: all
 
 test-py313-syntax: all
 	@mkdir -p build/tests
-	./build/python-code-to-c tests/py313_type_params_syntax_alpha06.py -o build/tests/py313_type_params_syntax_alpha06.c
-	$(CC) $(CPPFLAGS) $(CFLAGS) build/tests/py313_type_params_syntax_alpha06.c src/runtime/python_code_to_c_runtime.c src/common/python_code_to_c_common.c src/platform/python_code_to_c_platform.c src/platform/python_code_to_c_platform_hosted.c src/platform/python_code_to_c_gui.c src/modules/python_code_to_c_pygame.c $(LDLIBS) -o build/tests/py313_type_params_syntax_alpha06
-	printf '42\n' > build/tests/py313_type_params_syntax_alpha06.expected
-	build/tests/py313_type_params_syntax_alpha06 > build/tests/py313_type_params_syntax_alpha06.actual
-	diff -u build/tests/py313_type_params_syntax_alpha06.expected build/tests/py313_type_params_syntax_alpha06.actual
-	./build/python-code-to-c tests/py313_type_params_extended_syntax_alpha06.py -o build/tests/py313_type_params_extended_syntax_alpha06.c
-	$(CC) $(CPPFLAGS) $(CFLAGS) build/tests/py313_type_params_extended_syntax_alpha06.c src/runtime/python_code_to_c_runtime.c src/common/python_code_to_c_common.c src/platform/python_code_to_c_platform.c src/platform/python_code_to_c_platform_hosted.c src/platform/python_code_to_c_gui.c src/modules/python_code_to_c_pygame.c $(LDLIBS) -o build/tests/py313_type_params_extended_syntax_alpha06
-	printf '15\n' > build/tests/py313_type_params_extended_syntax_alpha06.expected
-	build/tests/py313_type_params_extended_syntax_alpha06 > build/tests/py313_type_params_extended_syntax_alpha06.actual
-	diff -u build/tests/py313_type_params_extended_syntax_alpha06.expected build/tests/py313_type_params_extended_syntax_alpha06.actual
+	./build/python-code-to-c tests/py313_type_params_syntax_alpha10.py -o build/tests/py313_type_params_syntax_alpha10.c
+	$(CC) $(CPPFLAGS) $(CFLAGS) build/tests/py313_type_params_syntax_alpha10.c src/runtime/python_code_to_c_runtime.c src/common/python_code_to_c_common.c src/platform/python_code_to_c_platform.c src/platform/python_code_to_c_platform_hosted.c src/platform/python_code_to_c_gui.c src/modules/python_code_to_c_pygame.c $(LDLIBS) -o build/tests/py313_type_params_syntax_alpha10
+	printf '42\n' > build/tests/py313_type_params_syntax_alpha10.expected
+	build/tests/py313_type_params_syntax_alpha10 > build/tests/py313_type_params_syntax_alpha10.actual
+	diff -u build/tests/py313_type_params_syntax_alpha10.expected build/tests/py313_type_params_syntax_alpha10.actual
+	./build/python-code-to-c tests/py313_type_params_extended_syntax_alpha10.py -o build/tests/py313_type_params_extended_syntax_alpha10.c
+	$(CC) $(CPPFLAGS) $(CFLAGS) build/tests/py313_type_params_extended_syntax_alpha10.c src/runtime/python_code_to_c_runtime.c src/common/python_code_to_c_common.c src/platform/python_code_to_c_platform.c src/platform/python_code_to_c_platform_hosted.c src/platform/python_code_to_c_gui.c src/modules/python_code_to_c_pygame.c $(LDLIBS) -o build/tests/py313_type_params_extended_syntax_alpha10
+	printf '15\n' > build/tests/py313_type_params_extended_syntax_alpha10.expected
+	build/tests/py313_type_params_extended_syntax_alpha10 > build/tests/py313_type_params_extended_syntax_alpha10.actual
+	diff -u build/tests/py313_type_params_extended_syntax_alpha10.expected build/tests/py313_type_params_extended_syntax_alpha10.actual
 
 test-baremetal-runtime:
 	@mkdir -p build/tests
@@ -597,7 +703,7 @@ test-sanitizers-core:
 	@mkdir -p build/tests
 	$(MAKE) BUILD=build/sanitize-core OBJ=obj/sanitize-core \
 		CFLAGS="$(CFLAGS) $(SANITIZER_CFLAGS)" LDFLAGS="$(LDFLAGS) $(SANITIZER_CFLAGS)" all
-	$(SANITIZER_ENV) sh tests/sanitize_pipeline_alpha06.sh build/sanitize-core/python-code-to-c
+	$(SANITIZER_ENV) sh tests/sanitize_pipeline_alpha10.sh build/sanitize-core/python-code-to-c
 
 test-analyzer:
 	@mkdir -p $(BUILD)/tests
@@ -631,7 +737,7 @@ test-baremetal-generated: all
 	./build/python-code-to-c examples/baremetal/baremetal_hello.py -o build/baremetal/baremetal_hello.generated.c
 	$(CC) -I./include -DPYTHON_CODE_TO_C_NO_STDLIB -DPYTHON_CODE_TO_C_NO_PYGAME -ffreestanding -fno-builtin -fno-stack-protector -std=c11 -O2 $(WARN_CFLAGS) -c build/baremetal/baremetal_hello.generated.c -o build/baremetal/baremetal_hello.generated.o
 
-# ── C99 / TinyCC 構成 (Alpha0.6) ───────────────────────────────────────────
+# ── C99 / TinyCC 構成 (Alpha1.0) ───────────────────────────────────────────
 # 既定ビルドはC11＋厳格警告（-Wconversion等）のまま維持し、C99専用コンパイラ
 # （TinyCC等）向けのビルド経路を別ターゲットとして用意する。C99では使えない
 # 厳格警告はC99構成では有効化せず、C99で意味のある最小限
@@ -702,7 +808,7 @@ test-tcc-freestanding: check-tcc
 test-tcc: tcc test-single-header-tcc test-tcc-freestanding
 	P2C_COMPILER=$(TCC_BUILD)/python-code-to-c P2C_TEST_CFLAGS="-std=c99 -Wall -D_POSIX_C_SOURCE=200809L" CC="$(TCC)" sh tests/conformance_regression.sh
 
-# ── ELF 生成 (Alpha0.6) ────────────────────────────────────────────────────
+# ── ELF 生成 (Alpha1.0) ────────────────────────────────────────────────────
 # make elf           : 完全版（ホスト機能込み・libc静的リンク）の自己完結ELF
 # make hobbyos elf    : HobbyOS向け（libcなし・p2c_embed＋カーネルフック）のELF
 # make hobbyos-elf    : 上と同じ（明示的なターゲット名）
@@ -744,9 +850,9 @@ tcc-elf: tcc
 			-o $(HOBBYOS_TCC_BUILD)/program.c; \
 		TCC="$(TCC)" HOBBYOS_ELF_BUILD="$(HOBBYOS_TCC_BUILD)" \
 			PROGRAM_C="$(HOBBYOS_TCC_BUILD)/program.c" \
-			sh tests/build_tcc_elf_alpha06.sh hobbyos; \
+			sh tests/build_tcc_elf_alpha10.sh hobbyos; \
 	else \
-		TCC="$(TCC)" ELF_BUILD="$(ELF_TCC_BUILD)" sh tests/build_tcc_elf_alpha06.sh full; \
+		TCC="$(TCC)" ELF_BUILD="$(ELF_TCC_BUILD)" sh tests/build_tcc_elf_alpha10.sh full; \
 	fi
 
 elf-full: all

@@ -1,4 +1,4 @@
-# HobbyOS integration build fragment (Alpha0.6)
+# HobbyOS integration build fragment (Alpha1.0)
 #
 # カーネルのMakefileから `include templates/hobby_os/hobby_os.mk` するか、
 # 下記変数を自分のビルドへコピーしてください。`make -f templates/hobby_os/hobby_os.mk`

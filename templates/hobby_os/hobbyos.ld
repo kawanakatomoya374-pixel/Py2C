@@ -1,4 +1,4 @@
-/* HobbyOS向けELFのリンカスクリプト (Alpha0.6)
+/* HobbyOS向けELFのリンカスクリプト (Alpha1.0)
  *
  * `make hobbyos elf` が作る「libcを使わない自己完結ELF」用の最小構成。
  * ロードアドレスはカーネルのローダに合わせて HOBBYOS_LOAD_ADDR で上書きできます

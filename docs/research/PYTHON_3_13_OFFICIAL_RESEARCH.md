@@ -4,10 +4,10 @@
 
 ## 一次資料
 
-| 資料 | URL | Alpha0.6への含意 |
+| 資料 | URL | Alpha1.0への含意 |
 |---|---|---|
 | What’s New In Python 3.13 | https://docs.python.org/3/whatsnew/3.13.html | Python 3.13の言語・実装・標準ライブラリ変更を区別する。コンパイラの対象は主に言語構文・組込み意味論であり、REPL、free-threading、JITはホストCPython実装の機能である。 |
-| PEP 696 | https://peps.python.org/pep-0696/ | 型パラメータの既定値をPython 3.13構文として定義する。型注釈を実行時無視するAlpha0.6では、パラメータリストを構文受理して安全に消去できる候補である。 |
+| PEP 696 | https://peps.python.org/pep-0696/ | 型パラメータの既定値をPython 3.13構文として定義する。型注釈を実行時無視するAlpha1.0では、パラメータリストを構文受理して安全に消去できる候補である。 |
 | PEP 667 | https://peps.python.org/pep-0667/ | 最適化スコープの`locals()`は独立スナップショット、`frame.f_locals`はwrite-through proxyという定義になる。フレーム・`exec`・`eval`を持たないfreestandingコアでは完全実装ではなく、明示的な安全フォールバックまたは限定的スナップショットが必要である。 |
 
 ## 初期結論
@@ -22,7 +22,7 @@ Python 3.13で実行構文そのものとして新規性が大きいのは、PEP
 |---|---|---|
 | Compound statements language reference | https://docs.python.org/3/reference/compound_stmts.html | 文法には`async_for_stmt`、`async_with_stmt`、`async_funcdef`、`match_stmt`、`except*`が含まれる。既存の協調コルーチンは`async def`を持つため、`async for`/`async with`は状態機械の停止・例外・cleanupを横断するため段階的に扱う。`except*`はExceptionGroupの分割規則を必要とし、初期拡張の対象外とする。`match`はAS、sequence、mapping、class、starパターンを段階的に追加できる。 |
 
-## Alpha0.6拡張実装契約
+## Alpha1.0拡張実装契約
 
 1. **大規模に実装する対象**は、既存C11コード生成に局所的に追加できる`raise ... from ...`、デコレータ適用、`yield from`、位置専用・keyword-only引数の検証、型パラメータと`type`文の構文消去、追加のmatchパターン、`locals()`の明示的スナップショット、C11安全な組込み・コンテナAPIとする。
 2. **協調asyncへ拡張する対象**は、既存の状態機械実装が安全に保存・再開・cleanupできる場合の`async for`と`async with`であり、フックが不足する独自awaitable、Task、I/O待機、キャンセル、プリエンプションは対象外とする。
@@ -31,7 +31,7 @@ Python 3.13で実行構文そのものとして新規性が大きいのは、PEP
 
 ## Python 3.13固定版のsimple statement仕様
 
-| 構文 | 公式仕様 | Alpha0.6実装方針 |
+| 構文 | 公式仕様 | Alpha1.0実装方針 |
 |---|---|---|
 | `type Name [type_params] = expression` | Python 3.13の`type`文はsoft keywordであり、遅延評価される`typing.TypeAliasType`を生成する。これは3.12導入構文で、3.13の型パラメータ既定値と組み合わせられる。資料: https://docs.python.org/3.13/reference/simple_stmts.html | freestandingターゲットにはtyping実行時オブジェクトがないため、まず構文と型パラメータ既定値を受理して実行時に安全に消去する。右辺式を評価しないPython型注釈と整合する「型専用alias」互換モードとして明文化する。 |
 | `yield from expression` | 同じPython 3.13 simple statementリファレンスのyield規則で定義される委譲yieldであり、完全互換には`send`/`throw`/`close`も関連する。 | 初期段階では既存ジェネレータに対する反復・yield値伝播のみを実装候補とし、`send`/`throw`/`close`を要する完全委譲は安全な明示制限として残す。 |

@@ -184,6 +184,10 @@ static P2C_AstExpr* fstr_concat(P2C_Parser *p, P2C_AstExpr *a, P2C_AstExpr *b, u
     return n;
 }
 
+/* 書式指定 ({:...}) に入れ子フィールドを含む場合、実行時に文字列を組み立てる
+ * ための式を作る（例: ">{w}" → ">" + str(w)）。定義は後方。 */
+static P2C_AstExpr* fstr_build_spec_expr(P2C_Parser *p, const char *spec, size_t len, uint32_t line, uint32_t col);
+
 /* {expr} を str(expr) 呼び出しに、{expr:.Nf} を p2c_format_fixed(expr, N) 呼び出しに包む。
  * それ以外の書式指定は p2c_fstr_fmt(expr, spec) 経由でランタイムに委譲する。 */
 static P2C_AstExpr* fstr_wrap_value(P2C_Parser *p, P2C_AstExpr *inner, char conversion, const char *spec, size_t spec_len, uint32_t line, uint32_t col) {
@@ -224,6 +228,26 @@ static P2C_AstExpr* fstr_wrap_value(P2C_Parser *p, P2C_AstExpr *inner, char conv
         }
     }
 
+    /* 書式指定中の入れ子フィールド ({:>{}} / {:{}.{}f}) は実行時に組み立てる。
+     * memchr は NO_STDLIB 構成（自前ヘッダのみ）で宣言されないため手で探す。 */
+    bool spec_has_field = false;
+    for (size_t k = 0; spec && k < spec_len; k++) {
+        if (spec[k] == '{') { spec_has_field = true; break; }
+    }
+    if (spec_has_field) {
+        P2C_AstExpr *spec_expr = fstr_build_spec_expr(p, spec, spec_len, line, col);
+        if (spec_expr) {
+            P2C_AstExpr *call = p2c_ast_expr_new(p->alloc, AST_CALL, line, col);
+            if (call) {
+                call->base.u.call.args = p2c_vec_new(p->alloc, NULL);
+                p2c_vec_push(call->base.u.call.args, inner);
+                p2c_vec_push(call->base.u.call.args, spec_expr);
+                call->base.u.call.func = p2c_ast_name(p->alloc, "p2c_fstr_fmt", line, col);
+                return call;
+            }
+        }
+    }
+
     /* それ以外の書式指定: p2c_fstr_fmt(expr, "spec") でランタイムに委譲する
      * これで :05d / :>10s / :+.3e などすべてのPython書式に対応できる。 */
     char *spec_copy = p2c_alloc(p->alloc, spec_len + 1);
@@ -243,6 +267,88 @@ static P2C_AstExpr* fstr_wrap_value(P2C_Parser *p, P2C_AstExpr *inner, char conv
     call->base.u.call.func = p2c_ast_name(p->alloc, "p2c_fstr_fmt", line, col);
     p2c_vec_push(call->base.u.call.args, p2c_ast_const_str(p->alloc, spec_copy, line, col));
     return call;
+}
+
+/* 書式指定内の入れ子フィールドを実行時の文字列連結式へ変換する。
+ *   ">{w}"   → ">" + str(w)
+ *   "{}.{}f" → str(w1) + "." + str(w2) + "f"
+ * 入れ子フィールド自身が書式指定を持つ場合（"{:>{w:03d}}"）は
+ * fstr_wrap_value() を再帰的に通す。 */
+static P2C_AstExpr* fstr_build_spec_expr(P2C_Parser *p, const char *spec, size_t len, uint32_t line, uint32_t col) {
+    P2C_AstExpr *result = NULL;
+    P2C_String *lit = p2c_str_new(p->alloc);
+    if (!lit) return NULL;
+    size_t i = 0;
+    while (i < len) {
+        if (spec[i] == '{' && i + 1 < len && spec[i + 1] == '{') {
+            p2c_str_append_char(lit, '{');
+            i += 2;
+        } else if (spec[i] == '}' && i + 1 < len && spec[i + 1] == '}') {
+            p2c_str_append_char(lit, '}');
+            i += 2;
+        } else if (spec[i] == '{') {
+            if (p2c_str_len(lit) > 0) {
+                P2C_AstExpr *lit_node = p2c_ast_const_str(p->alloc, p2c_str_cstr(lit), line, col);
+                result = fstr_concat(p, result, lit_node, line, col);
+                p2c_str_free(lit);
+                lit = p2c_str_new(p->alloc);
+                if (!lit) return result;
+            }
+            size_t j = i + 1;
+            int depth = 1;
+            char q = 0;
+            while (j < len && depth > 0) {
+                char c = spec[j];
+                if (q) { if (c == '\\') { j += 2; continue; } if (c == q) q = 0; j++; continue; }
+                if (c == '"' || c == '\'') { q = c; j++; continue; }
+                if (c == '{') depth++;
+                if (c == '}') { depth--; if (depth == 0) break; }
+                j++;
+            }
+            size_t content_start = i + 1, content_end = (j < len) ? j : len;
+            size_t expr_end = content_end;
+            size_t spec_start = (size_t)-1;
+            char conversion = 0;
+            {
+                int d2 = 0; char q2 = 0;
+                for (size_t k = content_start; k < content_end; k++) {
+                    char c = spec[k];
+                    if (q2) { if (c == '\\') { k++; continue; } if (c == q2) q2 = 0; continue; }
+                    if (c == '"' || c == '\'') { q2 = c; continue; }
+                    if (c == '(' || c == '[') d2++;
+                    if (c == ')' || c == ']') d2--;
+                    if (c == '!' && d2 == 0 && k + 1 < content_end) {
+                        conversion = spec[k + 1];
+                        expr_end = k;
+                        if (k + 2 < content_end && spec[k + 2] == ':') spec_start = k + 3;
+                        break;
+                    }
+                    if (c == ':' && d2 == 0) { expr_end = k; spec_start = k + 1; break; }
+                }
+            }
+            if (expr_end > content_start) {
+                P2C_Result sub_err = P2C_OK;
+                P2C_AstExpr *sub = parse_expr_from_substring(p, spec + content_start, expr_end - content_start, &sub_err);
+                if (sub) {
+                    const char *ispec = (spec_start != (size_t)-1) ? spec + spec_start : NULL;
+                    size_t ispec_len = (spec_start != (size_t)-1) ? content_end - spec_start : 0;
+                    P2C_AstExpr *wrapped = fstr_wrap_value(p, sub, conversion, ispec, ispec_len, line, col);
+                    result = fstr_concat(p, result, wrapped, line, col);
+                }
+            }
+            i = (j < len) ? j + 1 : j;
+        } else {
+            p2c_str_append_char(lit, spec[i]);
+            i++;
+        }
+    }
+    if (p2c_str_len(lit) > 0) {
+        P2C_AstExpr *lit_node = p2c_ast_const_str(p->alloc, p2c_str_cstr(lit), line, col);
+        result = fstr_concat(p, result, lit_node, line, col);
+    }
+    p2c_str_free(lit);
+    /* 入れ子フィールドが無い（= 全部リテラル）なら const str が返る。 */
+    return result;
 }
 
 static P2C_AstExpr* build_fstring_expr(P2C_Parser *p, const char *text, size_t len, uint32_t line, uint32_t col, P2C_Result *err) {
@@ -473,6 +579,22 @@ static char* normalize_number_text(P2C_Parser *p, const char *text, size_t len, 
     return out;
 }
 
+/* リスト/タプル/集合リテラルの要素。先頭の '*'（イテラブル展開）を受理して
+ * AST_STARRED で包む。Python の [*a, b] / (*a,) / {*a, b} に対応する。 */
+static P2C_AstExpr* parse_literal_element(P2C_Parser *p, P2C_Result *err) {
+    if (CURRENT(p) && CURRENT(p)->type == TOK_STAR) {
+        uint32_t line = CURRENT(p)->line, col = CURRENT(p)->col;
+        NEXT(p);
+        P2C_AstExpr *inner = parse_expr(p, err);
+        if (!inner) return NULL;
+        P2C_AstExpr *starred = p2c_ast_expr_new(p->alloc, AST_STARRED, line, col);
+        if (!starred) return NULL;
+        starred->base.u.starred.value = inner;
+        return starred;
+    }
+    return parse_expr(p, err);
+}
+
 static P2C_AstExpr* parse_atom(P2C_Parser *p, P2C_Result *err) {
     P2C_Token *tok = CURRENT(p);
     if (!tok || !tok->text) { if (err) *err = P2C_ERR_SYNTAX; return NULL; }
@@ -533,7 +655,7 @@ static P2C_AstExpr* parse_atom(P2C_Parser *p, P2C_Result *err) {
                 if (e) e->base.u.tuple.elts = p2c_vec_new(p->alloc, NULL);
                 return e;
             }
-            P2C_AstExpr *inner = parse_expr(p, err);
+            P2C_AstExpr *inner = parse_literal_element(p, err);
             if (!inner) return NULL;
             if (CURRENT(p) && CURRENT(p)->type == TOK_KW_FOR) {
                 P2C_Vector *gens = parse_comprehension_generators(p, err);
@@ -553,7 +675,7 @@ static P2C_AstExpr* parse_atom(P2C_Parser *p, P2C_Result *err) {
                 p2c_vec_push(tuple->base.u.tuple.elts, inner);
                 if (CURRENT(p) && CURRENT(p)->type != TOK_RPAREN) {
                     while (1) {
-                        P2C_AstExpr *item = parse_expr(p, err);
+                        P2C_AstExpr *item = parse_literal_element(p, err);
                         if (!item) return NULL;
                         p2c_vec_push(tuple->base.u.tuple.elts, item);
                         if (!CONSUME(p, TOK_COMMA)) break;
@@ -565,6 +687,11 @@ static P2C_AstExpr* parse_atom(P2C_Parser *p, P2C_Result *err) {
                     return NULL;
                 }
                 return tuple;
+            }
+            if (inner->base.type == AST_STARRED) {
+                /* `(*a)` は Python でも構文エラー（タプルにするには `(*a,)`）。 */
+                set_error(p, "can't use a starred expression here (did you mean '(*a,)'?)");
+                return NULL;
             }
             if (!EXPECT(p, TOK_RPAREN, err)) {
                 set_error(p, "expected ')'");
@@ -579,7 +706,7 @@ static P2C_AstExpr* parse_atom(P2C_Parser *p, P2C_Result *err) {
             e->base.u.list.elts = p2c_vec_new(p->alloc, NULL);
             if (CURRENT(p) && CURRENT(p)->type != TOK_RBRACKET) {
                 while (1) {
-                    P2C_AstExpr *item = parse_expr(p, err);
+                    P2C_AstExpr *item = parse_literal_element(p, err);
                     if (!item) return NULL;
                     if (CURRENT(p) && CURRENT(p)->type == TOK_KW_FOR) {
                         /* リスト内包表記 [item for target in iter (if cond)*]。
@@ -615,6 +742,23 @@ static P2C_AstExpr* parse_atom(P2C_Parser *p, P2C_Result *err) {
             e->base.u.dict.values = p2c_vec_new(p->alloc, NULL);
             if (CURRENT(p) && CURRENT(p)->type != TOK_RBRACE) {
                 while (1) {
+                    if (CURRENT(p) && CURRENT(p)->type == TOK_STAR) {
+                        /* {*a, b}: 集合リテラルの先頭要素がイテラブル展開の場合。 */
+                        P2C_AstExpr *starred = parse_literal_element(p, err);
+                        if (!starred) return NULL;
+                        e->base.type = AST_SET;
+                        p2c_vec_push(e->base.u.dict.keys, starred);
+                        p2c_vec_free(e->base.u.dict.values);
+                        e->base.u.list.elts = e->base.u.dict.keys;
+                        while (CONSUME(p, TOK_COMMA)) {
+                            if (CURRENT(p) && CURRENT(p)->type == TOK_RBRACE) break;
+                            P2C_AstExpr *item = parse_literal_element(p, err);
+                            if (!item) return NULL;
+                            p2c_vec_push(e->base.u.list.elts, item);
+                        }
+                        if (!EXPECT(p, TOK_RBRACE, err)) { set_error(p, "expected '}'"); return NULL; }
+                        return e;
+                    }
                     if (CURRENT(p) && CURRENT(p)->type == TOK_DBL_STAR) {
                         NEXT(p);
                         P2C_AstExpr *mapping = parse_expr(p, err);
@@ -648,7 +792,7 @@ static P2C_AstExpr* parse_atom(P2C_Parser *p, P2C_Result *err) {
                         e->base.u.list.elts = e->base.u.dict.keys;
                         while (CONSUME(p, TOK_COMMA)) {
                             if (CURRENT(p) && CURRENT(p)->type == TOK_RBRACE) break;
-                            P2C_AstExpr *item = parse_expr(p, err);
+                            P2C_AstExpr *item = parse_literal_element(p, err);
                             if (!item) return NULL;
                             if (CURRENT(p) && CURRENT(p)->type == TOK_KW_FOR) {
                                 set_unsupported_error(p, "set comprehensions ({x for x in ...})",
@@ -1265,7 +1409,7 @@ static P2C_AstExpr* parse_lambda(P2C_Parser *p, P2C_Result *err) {
         if (!e) return NULL;
         e->base.u.lambda.args = p2c_vec_new(p->alloc, NULL);
         
-        /* 引数リスト（簡易実装：カンマ区切りの名前のみ） */
+        /* 引数リスト（カンマ区切りの名前。既定値 `name=expr` に対応） */
         while (CURRENT(p) && CURRENT(p)->type == TOK_IDENTIFIER) {
             P2C_AstArg *arg = p2c_alloc(p->alloc, sizeof(P2C_AstArg));
             P2C_Token *tok = CURRENT(p);
@@ -1275,6 +1419,10 @@ static P2C_AstExpr* parse_lambda(P2C_Parser *p, P2C_Result *err) {
             arg->default_val = NULL;
             p2c_vec_push(e->base.u.lambda.args, arg);
             NEXT(p);
+            if (CONSUME(p, TOK_ASSIGN)) {
+                arg->default_val = parse_expr(p, err);
+                if (!arg->default_val) return NULL;
+            }
             if (!CONSUME(p, TOK_COMMA)) break;
         }
         
@@ -1424,6 +1572,28 @@ static P2C_AstStmt* parse_type_stmt(P2C_Parser *p, P2C_Result *err) {
         NEXT(p);
     }
     return p2c_ast_stmt_new(p->alloc, AST_PASS, line, col);
+}
+
+/* 代入の右辺/連鎖代入の各段: カンマ区切りならタプルとしてまとめる。
+ * `x = 1, 2` や `x, y = y, x = 1, 2` を扱う（以前はどちらも構文エラーだった）。 */
+static P2C_AstExpr* parse_assign_chain_item(P2C_Parser *p, P2C_Result *err, uint32_t line, uint32_t col) {
+    P2C_AstExpr *first = parse_expr(p, err);
+    if (!first) return NULL;
+    if (!CURRENT(p) || CURRENT(p)->type != TOK_COMMA) return first;
+    P2C_Vector *elts = p2c_vec_new(p->alloc, NULL);
+    if (!elts) return NULL;
+    p2c_vec_push(elts, first);
+    while (CONSUME(p, TOK_COMMA)) {
+        if (!CURRENT(p) || CURRENT(p)->type == TOK_ASSIGN || CURRENT(p)->type == TOK_NEWLINE ||
+            CURRENT(p)->type == TOK_EOF || CURRENT(p)->type == TOK_SEMICOLON) break;
+        P2C_AstExpr *item = parse_expr(p, err);
+        if (!item) { p2c_vec_free(elts); return NULL; }
+        p2c_vec_push(elts, item);
+    }
+    P2C_AstExpr *tup = p2c_ast_expr_new(p->alloc, AST_TUPLE, line, col);
+    if (!tup) { p2c_vec_free(elts); return NULL; }
+    tup->base.u.tuple.elts = elts;
+    return tup;
 }
 
 /* assignment_or_expr: target_list '=' ... | expr_stmt */
@@ -1611,32 +1781,23 @@ static P2C_AstStmt* parse_assignment_or_expr(P2C_Parser *p, P2C_Result *err) {
         target_tuple->base.u.tuple.elts = elts;
 
         if (CURRENT(p) && CURRENT(p)->type == TOK_ASSIGN) {
-            NEXT(p);
-            P2C_AstExpr *v0 = parse_expr(p, err);
-            if (!v0) return NULL;
-            P2C_AstExpr *value;
-            if (CURRENT(p) && CURRENT(p)->type == TOK_COMMA) {
-                P2C_Vector *velts = p2c_vec_new(p->alloc, NULL);
-                if (!velts) return NULL;
-                p2c_vec_push(velts, v0);
-                while (CONSUME(p, TOK_COMMA)) {
-                    if (!CURRENT(p) || CURRENT(p)->type == TOK_NEWLINE || CURRENT(p)->type == TOK_EOF || CURRENT(p)->type == TOK_SEMICOLON) break;
-                    P2C_AstExpr *vitem = parse_expr(p, err);
-                    if (!vitem) { p2c_vec_free(velts); return NULL; }
-                    p2c_vec_push(velts, vitem);
-                }
-                P2C_AstExpr *value_tuple = p2c_ast_expr_new(p->alloc, AST_TUPLE, line, col);
-                if (!value_tuple) { p2c_vec_free(velts); return NULL; }
-                value_tuple->base.u.tuple.elts = velts;
-                value = value_tuple;
-            } else {
-                value = v0; /* 右辺が単一式（例: 関数呼び出しがタプルを返す）の場合はそのまま展開対象にする */
-            }
+            /* タプルターゲットへの代入。右辺もタプルになり得るほか、
+             * `a, b = c, d = 5, 6` のような連鎖代入も受け付ける。 */
             P2C_AstStmt *s = p2c_ast_stmt_new(p->alloc, AST_ASSIGN, line, col);
             if (!s) return NULL;
             s->base.u.assign.targets = p2c_vec_new(p->alloc, NULL);
             p2c_vec_push(s->base.u.assign.targets, target_tuple);
-            s->base.u.assign.value = value;
+            while (1) {
+                if (!CONSUME(p, TOK_ASSIGN)) { set_error(p, "expected '=' in assignment"); return NULL; }
+                P2C_AstExpr *item = parse_assign_chain_item(p, err, line, col);
+                if (!item) return NULL;
+                if (CURRENT(p) && CURRENT(p)->type == TOK_ASSIGN) {
+                    p2c_vec_push(s->base.u.assign.targets, item);
+                    continue;   /* さらに連鎖する */
+                }
+                s->base.u.assign.value = item;
+                break;
+            }
             return s;
         }
         /* 代入でなければ裸のタプル式文として扱う */
@@ -1654,8 +1815,9 @@ static P2C_AstStmt* parse_assignment_or_expr(P2C_Parser *p, P2C_Result *err) {
         p2c_vec_push(s->base.u.assign.targets, first);
         
         while (CONSUME(p, TOK_ASSIGN)) {
-            /* 連鎖代入 */
-            P2C_AstExpr *next = parse_expr(p, err);
+            /* 連鎖代入。右辺がカンマ区切りならタプルとして扱う
+             * （`x = 1, 2` / `x, y = y, x = 1, 2`）。 */
+            P2C_AstExpr *next = parse_assign_chain_item(p, err, line, col);
             if (!next) return NULL;
             /* 最後の値が実際の値、それ以外はターゲット */
             if (CURRENT(p) && CURRENT(p)->type == TOK_ASSIGN) {

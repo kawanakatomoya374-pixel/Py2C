@@ -56,6 +56,13 @@ typedef signed short int16_t;
 typedef signed int int32_t;
 typedef signed long long int64_t;
 typedef unsigned long uintptr_t;
+/* <stdint.h> のリミットマクロ。コンパイラ提供の型ヘッダを使わない構成
+ * （-nostdinc の自作OS等）では stdint.h に INT64_MAX/UINT64_MAX が無いため、
+ * ここで定義する。parser/runtime が 64bit 範囲検査に使う。これが無いと
+ * freestanding ビルドが「UINT64_MAX undeclared」で停止する。 */
+#define INT64_MAX ((int64_t)(((uint64_t)-1) >> 1))
+#define INT64_MIN (-INT64_MAX - 1)
+#define UINT64_MAX ((uint64_t)-1)
 typedef uint8_t bool;
 #define true 1
 #define false 0

@@ -105,7 +105,9 @@ static int write_text_file(const char *path, const char *text) {
 
 static int run_self_test(void) {
     printf("=======================================\n");
-    printf("Python Code to C Alpha0.6 / python_code_to_c v%s\n", p2c_version_string());
+    printf("Python Code to C Alpha1.0 / python_code_to_c v%d.%d.%d (%s)\n",
+           PYTHON_CODE_TO_C_VERSION_MAJOR, PYTHON_CODE_TO_C_VERSION_MINOR,
+           PYTHON_CODE_TO_C_VERSION_PATCH, p2c_version_string());
     printf("=======================================\n\n");
 
     int passed = 0;

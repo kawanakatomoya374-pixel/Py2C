@@ -12,11 +12,11 @@ extern "C" {
  * Pythonコードの文字列をCコードの文字列に変換
  * ======================================== */
 
-/* バージョン情報 */
-#define PYTHON_CODE_TO_C_VERSION_MAJOR 0
-#define PYTHON_CODE_TO_C_VERSION_MINOR 4
+/* バージョン情報（数値は Makefile の VERSION と対応させる） */
+#define PYTHON_CODE_TO_C_VERSION_MAJOR 1
+#define PYTHON_CODE_TO_C_VERSION_MINOR 0
 #define PYTHON_CODE_TO_C_VERSION_PATCH 0
-#define PYTHON_CODE_TO_C_VERSION_STRING "Alpha0.6"
+#define PYTHON_CODE_TO_C_VERSION_STRING "Alpha1.0"
 
 /* 変換オプション */
 typedef struct {
@@ -33,7 +33,7 @@ typedef struct {
     /* NULL以外なら int main(void) の代わりに、カーネルから呼び出せる
      * "P2C_Object *<name>(void)" を生成する（CLI: --embed-entry <name>）。
      * ランタイム/GCの初期化はカーネル側の責務になる。
-     * docs/spec/HOBBY_OS_EMBEDDING_ALPHA0.6.md 参照。 */
+     * docs/spec/HOBBY_OS_EMBEDDING_ALPHA1.0.md 参照。 */
     const char *embed_entry;
 } P2C_TranspileOptions;
 

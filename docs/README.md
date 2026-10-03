@@ -1,6 +1,6 @@
-# Python Code to C Alpha0.6 Documentation
+# Python Code to C Alpha1.0 Documentation
 
-Alpha0.6の資料は、目的別に以下のカテゴリへ整理しています。
+Alpha1.0の資料は、目的別に以下のカテゴリへ整理しています。
 
 | カテゴリ | 内容 |
 |---|---|
@@ -9,9 +9,9 @@ Alpha0.6の資料は、目的別に以下のカテゴリへ整理しています
 | [testing](testing/) | コンフォーマンス、ファジング、sanitizer、テストレポート |
 | [runtime](runtime/) | ランタイム、コンテナ、GC、API拡張 |
 | [review](review/) | 監査、品質基線、厳格レビュー、コード方針 |
-| [release](release/) | Alpha0.6リリースノート |
+| [release](release/) | Alpha1.0リリースノート |
 | [research](research/) | Python公式仕様と設計調査 |
 
 ## 直近の構文拡張
 
-`async with`の状態機械、class内protocol methodのawait、set comprehensionの通常生成とstrict ISO C11診断は、[async with・set comprehension拡張仕様](spec/ASYNC_WITH_AND_SET_COMPREHENSION_ALPHA0.6.md)にまとめています。module-level function/class decoratorの評価順、callable再束縛、GC root、期待診断は、[decorator拡張仕様](spec/DECORATORS_ALPHA0.6.md)にまとめています。常駐hostのshutdown/reinit、registry reset、allocator rollback、LeakSanitizer境界は、[GC hardening監査](review/GC_HARDENING_AUDIT_ALPHA0.6.md)を参照してください。CPython差分IDは[コンフォーマンス台帳](testing/CONFORMANCE_TEST_MATRIX_ALPHA0.6.md)を参照してください。
+`async with`の状態機械、class内protocol methodのawait、set comprehensionの通常生成とstrict ISO C11診断は、[async with・set comprehension拡張仕様](spec/ASYNC_WITH_AND_SET_COMPREHENSION_ALPHA1.0.md)にまとめています。module-level function/class decoratorの評価順、callable再束縛、GC root、期待診断は、[decorator拡張仕様](spec/DECORATORS_ALPHA1.0.md)にまとめています。常駐hostのshutdown/reinit、registry reset、allocator rollback、LeakSanitizer境界は、[GC hardening監査](review/GC_HARDENING_AUDIT_ALPHA1.0.md)を参照してください。CPython差分IDは[コンフォーマンス台帳](testing/CONFORMANCE_TEST_MATRIX_ALPHA1.0.md)を参照してください。

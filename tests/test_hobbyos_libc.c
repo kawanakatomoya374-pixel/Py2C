@@ -1,4 +1,4 @@
-/* HobbyOS向け参照libc（templates/hobby_os/embed/hobby_os_libc.c）の検証 (Alpha0.6)
+/* HobbyOS向け参照libc（templates/hobby_os/embed/hobby_os_libc.c）の検証 (Alpha1.0)
  *
  * 参照実装は libc/libm を持たないターゲット向けに自前の級数・近似で実装して
  * いるため、ホストの libm と比較して精度と境界（±inf/NaN/0/負値）の扱いを

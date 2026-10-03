@@ -2,7 +2,7 @@
 
 ## 目的
 
-本記録は、**Python Code to C Alpha0.6** における三つの拡張、すなわち関数ローカル自由変数のcapture、任意の式位置に現れる`await`、および`async for`を、GNU拡張へ依存せずISO C11とfreestanding構成を維持して導入するための実装契約である。対象はCPython全実装ではなく、既存の協調FIFOスケジューラおよびgenerator state machineと意味論上整合する移植可能な部分集合である。
+本記録は、**Python Code to C Alpha1.0** における三つの拡張、すなわち関数ローカル自由変数のcapture、任意の式位置に現れる`await`、および`async for`を、GNU拡張へ依存せずISO C11とfreestanding構成を維持して導入するための実装契約である。対象はCPython全実装ではなく、既存の協調FIFOスケジューラおよびgenerator state machineと意味論上整合する移植可能な部分集合である。
 
 ## 公式意味論からの受入基準
 
@@ -103,7 +103,7 @@ nonlocal共有cell実装の開始前に、最新作業ツリーはClangの`-std=
 
 `AST_ASYNC_FOR`はAST dumpにも統合し、Clang警告即エラー構築で確認した。これによりstate machine lowering前でも構文受理結果を可視化して検証できる。
 
-async for lowering実装前のpreflightとして、コンパイラ実行可能状態と`tests/async_for_alpha06.py`の存在を確認した。
+async for lowering実装前のpreflightとして、コンパイラ実行可能状態と`tests/async_for_alpha10.py`の存在を確認した。
 
 同期forの既存実装は専用の`active_loop_id`と`_p2c_loop_broken_N`でbreakとelse節を区別している。async for loweringでは同等のbroken状態をgenerator localsへ保存し、`StopAsyncIteration`の通常終了時だけelse stateへ遷移し、breakではelseを迂回する必要がある。
 

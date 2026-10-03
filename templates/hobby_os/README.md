@@ -1,4 +1,4 @@
-# HobbyOS integration template (Alpha0.6)
+# HobbyOS integration template (Alpha1.0)
 
 `p2c_embed` は「ヒープ・出力・時計・スタック区間」だけをカーネルから受け取り、
 `P2C_Platform`・ランタイム初期化・GCのスタック境界・OOM方針をまとめて設定する
@@ -112,4 +112,4 @@ p2c_embed_stop();                     /* タスク終了。再startで再実行�
 | `make test-setjmp-hook` | `P2C_SETJMP`/`P2C_LONGJMP` の差し替えがランタイムと生成Cに効くこと |
 | `make test-heap-unification` | ランタイム同梱スタブの `malloc/free` がカーネルアロケータ（共有ヒープ）へ委譲され、変換器・ランタイムと1つのヒープを共有すること |
 
-詳細は [`../../docs/spec/HOBBY_OS_EMBEDDING_ALPHA0.6.md`](../../docs/spec/HOBBY_OS_EMBEDDING_ALPHA0.6.md) を参照してください。
+詳細は [`../../docs/spec/HOBBY_OS_EMBEDDING_ALPHA1.0.md`](../../docs/spec/HOBBY_OS_EMBEDDING_ALPHA1.0.md) を参照してください。

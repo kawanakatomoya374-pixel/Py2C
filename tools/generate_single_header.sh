@@ -12,7 +12,7 @@ emit_without_project_includes() {
 {
     cat <<'PROLOGUE'
 /*
- * Python Code to C Alpha0.6 — single-header distribution.
+ * Python Code to C Alpha1.0 — single-header distribution.
  *
  * Define P2C_SINGLE_HEADER_IMPLEMENTATION in exactly one translation unit
  * before including this file to emit the compiler, runtime and GUI core.

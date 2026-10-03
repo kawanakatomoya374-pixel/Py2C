@@ -46,7 +46,7 @@ int main(void) {
     if (strstr(generated, "int main(void)") == NULL) { free(generated); p2c_embed_stop(); return 21; }
     /* 変換結果が実際にPython意味論を反映していること */
     if (strstr(generated, "p2c_builtin_iter") == NULL) { free(generated); p2c_embed_stop(); return 22; }
-    if (strstr(generated, "p2c_obj_add") == NULL) { free(generated); p2c_embed_stop(); return 23; }
+    if (strstr(generated, "p2c_obj_iadd") == NULL) { free(generated); p2c_embed_stop(); return 23; }
     if (strstr(generated, "total") == NULL) { free(generated); p2c_embed_stop(); return 24; }
 
     /* 共有ヒープ: プラットフォーム（embed ヒープ）が変換器コアの確保にも

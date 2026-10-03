@@ -13,7 +13,7 @@
  * A hobby OS must provide setjmp/longjmp for *that* layout (libc headers are
  * not included, so the libc jmp_buf type is not visible and must not be used).
  * This file is a compact, dependency-free implementation of the contract for
- * x86-64 System V, used by the Alpha0.6 embedded test-suite and intended as a
+ * x86-64 System V, used by the Alpha1.0 embedded test-suite and intended as a
  * starting point for kernels:
  *
  *   buf[0] = rip   (resume address)

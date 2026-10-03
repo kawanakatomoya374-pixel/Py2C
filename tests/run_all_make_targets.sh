@@ -28,7 +28,7 @@ for cmd in "${CMDS[@]}"; do
     # make run は INPUT が必要。freestanding は cross-cc のプレースホルダを外す。
     case "$cmd" in
         run|"run INPUT="*|"run INPUT"*)
-            full="make run INPUT=tests/complex_alpha06.py" ;;
+            full="make run INPUT=tests/complex_alpha10.py" ;;
         "freestanding CC="*|"freestanding"*"<cross-cc>"*)
             full="make freestanding" ;;
         "run-gui")
