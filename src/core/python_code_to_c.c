@@ -22,6 +22,7 @@ const P2C_TranspileOptions P2C_DEFAULT_TRANSPILER_OPTIONS = {
     .debug_comments = false,
     .strict_c11 = false,
     .fallback_unsupported = false,
+    .unbox_int_locals = false,
     .indent_spaces = 4,
     .embed_entry = NULL
 };
@@ -406,6 +407,7 @@ static P2C_Result p2c_python_to_c_impl(const char *python_code, P2C_TranspileOpt
     cg_opts.debug_info = opts.debug_comments;
     cg_opts.strict_c11 = opts.strict_c11;
     cg_opts.fallback_unsupported = opts.fallback_unsupported;
+    cg_opts.unbox_int_locals = opts.unbox_int_locals;
     cg_opts.indent_width = opts.indent_spaces;
     cg_opts.embed_entry = opts.embed_entry;
     

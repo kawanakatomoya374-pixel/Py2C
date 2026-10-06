@@ -166,6 +166,77 @@ ASan の**偽スタック**（`detect_stack_use_after_return=1`）が有効だ�
 未対応のまま明示診断: `try`/`finally`・`with` をまたぐ `yield`、クロージャ内ジェネレータ、`bytes` リテラル、
 `*args/**kwargs` を受ける callable 変数の可変長呼び出し。
 
+### 8.7 Round-5: ビルド基準の強化と、そこで見つかった不具合
+
+警告は「実バグを捕まえるものだけ」を採用し、ノイズ源は理由付きで除外した（根拠は Makefile の
+コメントに明記）。追加した基準で、次の実在する不具合を検出して修正した。
+
+| 追加した基準 | 検出・修正した内容 |
+|---|---|
+| `-Wclobbered`（setjmp/longjmp をまたぐ変数） | for/ジェネレータ反復は `P2C_SETJMP` を挟むため、反復子の受け皿が longjmp 後に不定値となり得た。生成Cの該当ローカルを `volatile` 化 |
+| 生成Cへの `-Wredundant-decls` 等 | ジェネレータメソッドで前方宣言が二重出力されていた（`static P2C_Object* Class__method(...)` が2回） |
+| 生成Cへの `-Wshadow=local` | 入れ子アンパック代入の一時変数名が固定で、内側の宣言が外側を影にしていた（一意な連番付与に変更） |
+| `-Wstack-usage` | ホスト用ツールの `run_mode` が 46,560 バイト、GUI 側が 21,168 バイトのスタックフレームを持っていた。探索結果（約25KiB）を static へ、8KiB のログをヒープへ移し、実測最大を約8.3KiBへ削減 |
+| `-Wformat-security` / `-Wbidi-chars=any,ucn` / `-Wtrampolines` | 追加時点で違反0件（非リテラル書式・Trojan Source・実行可能スタックの不在を確認） |
+| `-Wstrict-aliasing=2`（`-O2`） | 追加時点で違反0件。union/キャストを多用するランタイムがエイリアス規則に適合していることを確認できたため、`-fno-strict-aliasing` は不要と判断（抑制ではなく検査を選んだ） |
+| `-Wpointer-to-int-cast` / `-Wint-to-pointer-cast` / `-Wstringop-overread` / `-Warray-compare` / `-Wsizeof-pointer-div` / `-Wmemset-*` / `-Wabsolute-value` / `-Wenum-conversion` / `-Wshift-*` / `-Wtautological-compare` / `-Winit-self` / `-Wlogical-not-parentheses` / `-Wzero-length-bounds` / `-Wflex-array-member-not-at-end` / `-Wvla-parameter` / `-Woverlength-strings` / `-Wnormalized=nfkc` | 追加時点で違反0件（境界・サイズ・引数順・符号・正規化の古典的な取り違えを今後は自動で検出） |
+| 生成Cの警告基準（`GENERATED_CFLAGS`） | 本体と同じ「実バグを捕まえる」基準を成果物である生成Cにも適用。`-Wconversion` のみ、意図的な int64/size_t 変換が大量に出るため除外（理由をコメント化） |
+
+除外した基準（無条件に厳しくしないための線引き）:
+
+| 除外 | 理由 |
+|---|---|
+| `-Wc++-compat` | C++ 互換は対象外。`void*` からの暗黙変換だけで108件出る |
+| `-Wnull-dereference` | 単一ヘッダ構成で全域解析になり、未チェック確保と誤検出が混在した約300件を報告する。全域のNULL契約監査が前提 |
+| `-Wuseless-cast` | 「型の明示」として意図的に書いた冗長キャストを41件指摘する。可読性のための記述で、実バグ検出に寄与しない |
+| `-Wdeclaration-after-statement` | C11 では宣言と文の混在は合法。C89スタイルの強制は言語仕様に反する |
+| `-Wsuggest-attribute=const,pure` / `-Wunsafe-loop-optimizations` | 性能ヒントであり正しさの検査ではない。`make test-opt-hints`（違反しても失敗しない読み物として）へ分離 |
+| `-Wshadow`（生成Cに global まで） | Python では関数引数がモジュール変数を隠すのは正常なスコープ規則。生成Cのみ `-Wshadow=local` に限定 |
+
+さらに、追加した構文・修正:
+
+| 追加 / 修正 | 内容 |
+|---|---|
+| `assert cond, expr` | リテラル以外のメッセージ式も評価し、`AssertionError.args` に載せる（従来は "assertion failed" に置き換わり、式の副作用も落ちていた）。ジェネレータ内 assert も同様 |
+| `dict` の `\|` / `\|=` | CPython 3.9 以降と同じ「右優先のマージ」であることを回帰テストで固定（実装は既存） |
+| `str.removeprefix` / `str.removesuffix` | 実装済みであることを回帰テストで固定 |
+| スタック予算の回帰ゲート | `make test-stack-budget` が組込みコアを 4096 バイト予算で再ビルドし、余裕を数値で担保する |
+| 生成Cの品質ゲート | `make test-conformance` が生成Cを `GENERATED_CFLAGS`（本体と同等の警告基準）でコンパイルする |
+
+
+### 8.8 Round-6: 全体精査で見つけた不具合と、初心者向けの入口整備
+
+`src/` と `include/` の全ファイルを対象に、差分コーパス（新規 16 ケース）と
+GCC `-fanalyzer` / サニタイザ / 厳格ビルドで精査し、次を修正した。
+
+| 修正 | 症状 / 内容 |
+|---|---|
+| **式評価スタックの動的化** | `p2c_binop_begin`/`p2c_fstr_begin` が固定長（64/32 段）だったため、**再帰呼び出しを含む式**（`return 1 + f(n-1)` を 200 段）で「binary expression nesting limit exceeded」を誤って送出し、実行時 abort になっていた。必要に応じて伸長する動的スタックへ変更（中身は従来どおり GC がルートとして走査し、`p2c_runtime_shutdown` で解放） |
+| **入れ子 for ターゲットの無言 None** | `for (a, (b, c)) in ...` で内側の変数が `None` のままだった（タプル 1 段しか見ていなかった）。`gen_for_bind_from_expr` に一本化し、入れ子・starred を再帰的に束縛。属性/添字など未対応形は位置つき診断へ |
+| **括弧付き for ターゲットの構文エラー** | `for (p, q) in ...` / `for (x) in ...` が「expected loop variable name」で拒否されていた。括弧付きは通常のアンパック用パーサで読むようにした |
+| **`test-sanitizers` が既定ビルドを破壊** | サニタイザ目標が冒頭で `make clean` を呼び、通常ビルドの `build/` を消していた（他目標の成果物を壊す）。サニタイザ専用ディレクトリのみを掃除するよう修正 |
+| クロージャの捕獲仕様を明文化 | 捕獲は「値」であり Python の遅延束縛と異なる（`for i in ...: lambda: i` は `0,1,2`）。`lambda i=i: ...` で固定する旨を仕様書・入門ガイドに明記 |
+
+さらに、初心者向けの入口を整備した。
+
+| 追加 | 内容 |
+|---|---|
+| `py2c help` | 引数なし・`help`/`Help`/`HELP`/`--help`/`-h`/`-?`/`usage` で、**使い方・主なオプション・はじめの一歩・自分でビルドする手順・つまずいたときの切り分け**を表示する（大小文字を無視） |
+| `--version` | バージョンだけを表示する |
+| 誤り時の案内 | 不明なオプションや存在しない入力ファイルで `help` への導線を表示（終了コード 2） |
+| `make py2c` | `build/py2c` と `bin/py2c` を用意（`./build/py2c help` がそのまま使える） |
+| `docs/GETTING_STARTED_ALPHA1.0.md` | 変換の流れ、3 コマンドでの動作確認、オプションの使い分け、切り分け手順、知っておくべき仕様（GC・setjmp・クロージャ）をまとめた入門ガイド |
+
+`*args/**kwargs` を受ける callable 変数の可変長呼び出し。
+
+### 8.9 Round-6: ビルド基準とリンク時硬化の追加
+
+| 追加 | 根拠 |
+|---|---|
+| `-fno-common` | 一時定義のマージを禁じ、シンボル重複をリンク時に検出する（GCC10+ の既定を明示化し環境差をなくす） |
+| `HOSTED_LDFLAGS`（Linux のみ自動適用） | ホスト CLI/GUI に `-Wl,-z,relro,-z,now,-z,noexecstack` を付与。GOT 書き換えとスタック実行を防ぐ。macOS 等では自動的に無効化し、`make HOSTED_LDFLAGS=...` で上書き可能 |
+| `make py2c` | 初心者向けの短い入口（`build/py2c`）を用意 |
+
 
 ### 8.2 契約違反（実行時 abort を出していた未対応構文）
 
@@ -206,3 +277,17 @@ ASan の**偽スタック**（`detect_stack_use_after_return=1`）が有効だ�
   ジェネレータのループ・`break`/`continue`/`else`/`yield from`/メソッド を CPython と差分比較。
 - `make test-gc-hardening`: ルート表の動的拡張と反復マークの回帰（ASan/UBSan/LSan）。
 - 総アサーション数: 803 → 832。
+
+### 8.10 Round-9: 整数比較の精度落ち（CPython と結果が食い違っていた）
+
+| 項目 | 内容 |
+|---|---|
+| 症状 | `9223372036854775806 < 9223372036854775807` が **False**（CPython は True）。`>=` は逆に True |
+| 原因 | 順序比較 `p2c_obj_order_cmp()` が str・list/tuple 以外をすべて `double` へ変換して比較していた。int64 を double にすると 2^53 を超える桁が丸められ、隣接する 2 つの整数が同じ値になる |
+| 修正 | int 同士は int64 のまま厳密に比較する分岐を追加（float や bool が混ざる場合は従来どおり数値比較） |
+| 発見の経緯 | AOT アンボクシング用の生 int 演算ヘルパ（`p2c_int_*_raw`）のテスト `tests/test_int_raw_ops.c` が「P2C_Object* 版と結果が一致しない」として検出。境界値（2^53 超・INT64_MAX/MIN）を含む値のマトリクスで全演算子を突き合わせている |
+| 回帰 | `make test-int-raw-ops`（値マトリクスの全演算子 × 例外名の一致）と、CPython 差分（`9007199254740993 > 9007199254740992` 等）で固定 |
+
+> `==`/`!=` は元から厳密だったため、この不具合は順序比較（`< <= > >=`）だけに
+> 出ていた。2^53 を超える整数を比較するプログラムでのみ再現する。
+

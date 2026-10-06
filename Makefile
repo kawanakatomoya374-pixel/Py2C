@@ -39,12 +39,54 @@ P2C_FUZZ_SEEDS ?= 12648430 24237 17412
 #     全ソースが1TUになりGCCの関数間解析が効くため、未チェック確保と誤検出が
 #     混在した約300件の "potential null pointer dereference" を報告する。
 #     有効化には全域のNULL契約監査が前提となるため、別途監査タスクとして扱う。
+# 警告基準（Round-5で拡張）。各項目は「実バグを捕まえる」ことを確認したうえで
+# 採用しており、ノイズ源になるものは理由付きで除外している。
+#   -Wclobbered: setjmp/longjmp をまたいで変更された自動変数（＝longjmp後に不定値に
+#     なり得る変数）を指摘する。本ランタイムは例外とジェネレータで P2C_SETJMP を
+#     多用するため最優先で有効化した（実際に生成C側の潜在不具合を1件検出し、
+#     volatile 付与で修正済み）。
+#   -Wformat-security: 非リテラル書式（printf(fmt) 形式）の脆弱性を指摘。
+#   -Wbidi-chars=any,ucn: 双方向制御文字（Trojan Source）を検出。ソースコードを
+#     入力として扱うツールなので、表示と実体の食い違いを許さない。
+#   -Wtrampolines: 実行可能スタックを要するトランポリン生成を禁止（組込み/自作OS）。
+#   -Wstrict-aliasing=2: union/キャストを多用するランタイムで型破り参照を検査。
+#   -Wpointer-to-int-cast / -Wint-to-pointer-cast: 32bit/64bit 取り違えの検出。
+#   -Wzero-length-bounds / -Wflex-array-member-not-at-end / -Wstringop-overread /
+#     -Warray-compare / -Wsizeof-pointer-div / -Wsizeof-array-div /
+#     -Wmemset-transposed-args / -Wmemset-elt-size / -Wnonnull-compare:
+#     境界・サイズ・引数順に関する古典的な取り違えを静的に検出。
+#   -Wtautological-compare / -Winit-self / -Wshift-negative-value /
+#     -Wshift-count-overflow / -Wlogical-not-parentheses / -Wabsolute-value /
+#     -Wenum-conversion: 常真比較・自己初期化・未定義シフト・符号なしabs など
+#     「書いたつもりの意味と違う」式を検出。
+#   -Wvla-parameter / -Woverlength-strings / -Wnormalized=nfkc: 移植性（可変長配列
+#     引数・C90の翻訳限界・識別子正規化）を担保。
+#   -fno-common: 一時定義のマージを禁止し、シンボル定義の重複をリンク時に検出する
+#     （GCC 10以降の既定だが、明示して環境差をなくす）。
+#
+# STACK_USAGE_BUDGET は組込み向けのスタック予算（後述）。
+#   -Wstack-usage=$(STACK_USAGE_BUDGET): 組込み/自作OS向けにスタック使用量の上限を
+#     ビルド時に強制する。既定 16384 は全ソース（ホスト側ツールを含む）を対象とした
+#     安全側の上限で、実測の最大はツールの 8304 バイト・組込みコアの 3456 バイト。
+#     組込みコアだけを厳しく締めたい場合は STACK_USAGE_BUDGET を下げるか、
+#     make test-stack-budget（コアを 4096 でビルド）を使う。
+# 不採用（理由付き）:
+#   -Wc++-compat       : C++互換は対象外（void*からの暗黙変換だけで108件）。
+#   -Wnull-dereference : 単一ヘッダ構成で全域解析になり約300件の誤検出混在。
+#                        全域のNULL契約監査が前提のため別タスク扱い。
+#   -Wuseless-cast     : 「型の明示」として意図的に書いたキャストを41件指摘する。
+#                        冗長キャストは可読性のための記述であり、実バグ検出に寄与しない。
+#   -Wdeclaration-after-statement: C11では宣言と文の混在は合法。C89スタイルを強制する
+#                        この警告は言語仕様に反する制約になるため不採用。
+#   -Wsuggest-attribute / -Wunsafe-loop-optimizations: 性能ヒントであり正しさの
+#                        検査ではない。make test-opt-hints に分離した。
+STACK_USAGE_BUDGET ?= 16384
 WARN_CFLAGS ?= -Wall -Wextra -Werror -Wpedantic \
-	-Wshadow -Wformat=2 -Wno-format-nonliteral \
+	-Wshadow -Wformat=2 -Wformat-security -Wno-format-nonliteral \
 	-Wstrict-prototypes -Wmissing-prototypes -Wold-style-definition \
 	-Wredundant-decls -Wundef \
 	-Wconversion -Wsign-conversion -Wcast-qual -Wwrite-strings \
-	-Wdouble-promotion -Wvla -Wfloat-equal \
+	-Wdouble-promotion -Wvla -Wvla-parameter -Wfloat-equal \
 	-Wcast-align=strict -Wpointer-arith -Wbad-function-cast -Wnested-externs \
 	-Wjump-misses-init -Wlogical-op -Wduplicated-cond -Wduplicated-branches \
 	-Wrestrict -Wshift-overflow=2 -Wformat-overflow=2 -Wformat-truncation=2 \
@@ -53,7 +95,15 @@ WARN_CFLAGS ?= -Wall -Wextra -Werror -Wpedantic \
 	-Wmultistatement-macros -Wsizeof-pointer-memaccess -Wsizeof-array-argument \
 	-Wuse-after-free=3 -Wunused-macros -Wswitch-default -Wcast-function-type \
 	-Wimplicit-fallthrough=5 -Wmissing-parameter-type -Wcalloc-transposed-args \
-	-Wstrict-overflow=2
+	-Wstrict-overflow=2 -Wstrict-aliasing=2 -Wno-error=strict-aliasing \
+	-Wclobbered -Wtautological-compare -Winit-self -Wshift-negative-value \
+	-Wshift-count-overflow -Wlogical-not-parentheses -Wabsolute-value \
+	-Wenum-conversion -Wzero-length-bounds -Wflex-array-member-not-at-end \
+	-Wstringop-overread -Warray-compare -Wsizeof-pointer-div -Wsizeof-array-div \
+	-Wmemset-transposed-args -Wmemset-elt-size -Wnonnull-compare \
+	-Wpointer-to-int-cast -Wint-to-pointer-cast \
+	-Wtrampolines -Wbidi-chars=any,ucn -Woverlength-strings -Wnormalized=nfkc \
+	-Wstack-usage=$(STACK_USAGE_BUDGET) -fno-common
 # ホスト環境でのみ意味のある実行時ハードニング（開発機・CIでの検証用）。
 # 組込み/freestanding構成ではスタック保護もFORTIFYも存在しないため、
 # HOSTED_CFLAGSとして分離し、CFLAGSの既定値にのみ含める。
@@ -67,6 +117,14 @@ CFLAGS ?= -std=c11 -O2 $(HOSTED_HARDEN) $(WARN_CFLAGS)
 CPPFLAGS ?= -I./include
 # 依存関係生成。TinyCCは -MMD/-MP を持たないため、tcc構成では DEPFLAGS= で無効化する。
 DEPFLAGS ?= -MMD -MP
+# ホストCLI/GUIだけに適用するリンク時硬化（ELF向け）。relro/now（遅延解決をやめて
+# GOT書き換えを防止）と noexecstack（スタック実行の禁止）はLinuxでは常に妥当なので
+# 既定で有効にし、対象外の環境（macOS等）では自動的に無効化する。
+# `make HOSTED_LDFLAGS=...` で明示的に上書きできる。
+# 注意: $(if ...) の引数はカンマ区切りなので、カンマを含む値は変数へ入れてから渡す
+#       （直接書くと "-Wl" だけが渡ってしまう）。
+HOSTED_RELRO_LDFLAGS := -Wl,-z,relro,-z,now,-z,noexecstack
+HOSTED_LDFLAGS ?= $(if $(filter Linux,$(shell uname -s 2>/dev/null)),$(HOSTED_RELRO_LDFLAGS),)
 LDFLAGS ?=
 LDLIBS ?= -lm
 SANITIZER_CFLAGS ?= -fsanitize=address,undefined -fno-omit-frame-pointer -g
@@ -74,7 +132,25 @@ SANITIZER_CFLAGS ?= -fsanitize=address,undefined -fno-omit-frame-pointer -g
 # 使うため、プロジェクト本体の -Wpedantic 基準ではなく、既存の回帰テストと
 # 同じ「生成コード基準」でコンパイルする。ISO C11だけを対象にする場合は
 # --c11 でその構文を変換時に拒否する。
-GENERATED_CFLAGS ?= -std=gnu11 -Wall -Wextra -Werror
+# Round-5 で生成Cにも品質基準を追加した（生成Cは利用者に渡る成果物なので、
+# 本体と同じ「実バグを捕まえる」警告を当てる）。コーパス全体で警告0を確認済み。
+#   -Wclobbered          : for/ジェネレータ反復が P2C_SETJMP を挟むため必須。
+#   -Wshadow=local       : 関数内でローカルが別のローカルを影にする場合だけを検出。
+#                          Python では関数引数がモジュール変数を隠すのは正常な
+#                          スコープ規則なので、-Wshadow（global 含む）だと誤検知になる。
+#   -Wcast-qual / -Wwrite-strings : 文字列リテラルや const の書き換えを検出。
+#   -Wstrict-prototypes / -Wmissing-prototypes / -Wmissing-declarations /
+#     -Wredundant-decls  : 生成する静的関数の宣言規律（重複宣言を実際に1件検出）。
+#   -Wundef / -Wpointer-arith / -Wcast-align=strict / -Wvla :
+#     移植性（未定義マクロ・ポインタ演算・アラインメント・可変長配列）。
+#   -Wtautological-compare / -Winit-self / -Wstrict-aliasing=2 : 式の取り違え。
+# -Wconversion は生成Cには適用しない（int64_t/size_t の相互変換を意図的に多用する
+# ため、意味のない指摘が大量に出る）。
+GENERATED_CFLAGS ?= -std=gnu11 -Wall -Wextra -Werror \
+	-Wshadow=local -Wclobbered -Wcast-qual -Wwrite-strings \
+	-Wstrict-prototypes -Wmissing-prototypes -Wmissing-declarations \
+	-Wredundant-decls -Wundef -Wpointer-arith -Wcast-align=strict -Wvla \
+	-Wtautological-compare -Winit-self -Wstrict-aliasing=2
 # 自作OS統合テスト(embed)用: 標準Cライブラリのプラットフォーム層を使わず、
 # p2c_embed が互換フックと malloc/free を提供する構成でビルドする。
 EMBED_CFLAGS ?= -DPYTHON_CODE_TO_C_NO_STDLIB -DPYTHON_CODE_TO_C_NO_PYGAME -DPYTHON_CODE_TO_C_NO_LIBC_STUBS -DP2C_EMBED_PROVIDE_LIBC_HEAP -DP2C_EMBED_PROVIDE_PLATFORM_COMPAT -ffreestanding -fno-builtin -fno-stack-protector -std=c11 -O2 $(WARN_CFLAGS)
@@ -102,16 +178,26 @@ SRC := $(shell find src -type f -name '*.c' ! -path 'src/tools/gui_main.c' | sor
 OBJFILES := $(patsubst src/%.c,$(OBJ)/%.o,$(SRC))
 DEPS := $(OBJFILES:.o=.d)
 
-.PHONY: all help check-tools gui run run-gui freestanding freestanding-clean single-header test-single-header test-single-header-c11 test-single-header-c99 test-single-header-tcc test-single-header-freestanding full-build test test-sanitizers test-parser-sanitizers test-starred-unpack test-set test-set-comprehension-c11 test-decorator-diagnostics test-conformance test-container-fuzz test-portability test-gc-gui test-gc-lifecycle test-gc-allocation-failure test-probe test-limits test-fallback test-gc-adaptive test-gc-hardening test-gc-leaks test-integer-overflow test-platform-adapter test-allocator-injection test-setjmp-hook test-heap-unification test-generator-async-runtime test-async-generator test-py313-syntax test-baremetal-runtime test-embed-baseline test-embed-runtime test-freestanding-setjmp test-embed-compile test-crlf test-hobby-os-template test-embed-generated test-baremetal-exceptions test-gc-stack-scan-scope test-gc-temp-roots test-stack-usage test-sandbox test-sanitizers-core test-analyzer test-analyzer-clang test-baremetal-build test-baremetal-generated c99 check-tcc tcc test-c99 test-tcc-freestanding test-tcc hobby elf tcc-elf elf-full test-hobbyos-libc hobbyos-elf hobbyos install clean test-asan-strict test-ubsan-deep test-msan test-lsan-generated test-clang-integer test-harden-generated test-hardened-core test-avinit-differential test-strict-profiles test-warn-clang test-clang-build
+.PHONY: all help py2c check-tools gui run run-gui freestanding freestanding-clean single-header test-single-header test-single-header-c11 test-single-header-c99 test-single-header-tcc test-single-header-freestanding full-build test test-sanitizers test-parser-sanitizers test-starred-unpack test-set test-set-comprehension-c11 test-decorator-diagnostics test-conformance test-container-fuzz test-portability test-gc-gui test-gc-lifecycle test-gc-allocation-failure test-probe test-limits test-fallback test-gc-adaptive test-gc-hardening test-gc-leaks test-integer-overflow test-platform-adapter test-allocator-injection test-setjmp-hook test-heap-unification test-generator-async-runtime test-async-generator test-py313-syntax test-baremetal-runtime test-embed-baseline test-embed-runtime test-freestanding-setjmp test-embed-compile test-crlf test-hobby-os-template test-embed-generated test-baremetal-exceptions test-gc-stack-scan-scope test-gc-temp-roots test-stack-usage test-sandbox test-sanitizers-core test-analyzer test-analyzer-clang test-opt-hints test-stack-budget test-baremetal-build test-baremetal-generated c99 check-tcc tcc test-c99 test-tcc-freestanding test-tcc hobby elf tcc-elf elf-full test-hobbyos-libc hobbyos-elf hobbyos install clean test-asan-strict test-ubsan-deep test-msan test-lsan-generated test-clang-integer test-harden-generated test-hardened-core test-avinit-differential test-strict-profiles test-warn-clang test-clang-build
 
 all: $(BUILD)/python-code-to-c
 	@mkdir -p bin
 	@ln -sf ../$(BUILD)/python-code-to-c bin/python_code_to_c
 
+# 初心者向けの短い入口。README とヘルプでは `py2c` の名前で案内しているため、
+# 同じ実行ファイルを build/py2c としても置く（argv[0] をそのままヘルプに使うので、
+# `py2c help` と打てば py2c の名前で使い方が表示される）。
+py2c: all
+	@cp $(BUILD)/python-code-to-c $(BUILD)/py2c
+	@mkdir -p bin
+	@ln -sf ../$(BUILD)/py2c bin/py2c
+	@printf '%s\n' "py2c_ok: $(BUILD)/py2c (使い方: $(BUILD)/py2c help)"
+
 help:
 	@printf '%s\n' 'Python Code to C Alpha1.0 build targets:'
 	@printf '%s\n' '  make all                         Build the hosted CLI.'
 	@printf '%s\n' '  make gui                         Build the local GUI frontend.'
+	@printf '%s\n' '  make py2c                        Also place build/py2c (short beginner entry; build/py2c help).'
 	@printf '%s\n' '  make run INPUT=path/to/file.py   Build, transpile, compile, and run Python input.'
 	@printf '%s\n' '  make run-gui                     Build and start the local GUI frontend.'
 	@printf '%s\n' '  make freestanding CC=<cross-cc> AR=<cross-ar>  Build the C11 freestanding core.'
@@ -138,6 +224,8 @@ help:
 	@printf '%s\n' '  make test-stack-usage            Check the freestanding runtime frames stay within STACK_USAGE_LIMIT.'
 	@printf '%s\n' '  make test-analyzer               Run GCC -fanalyzer over every source file.'
 	@printf '%s\n' '  make test-analyzer-clang         Cross-check with the clang static analyzer (optional).'
+	@printf '%s\n' '  make test-opt-hints             Check performance hints only (const/pure, unsafe loops, 512B stack).'
+	@printf '%s\n' '  make test-stack-budget          Rebuild with a 512-byte stack-usage budget (embedded gate).'
 	@printf '%s\n' '  make test-sanitizers-core        Run the converter pipeline under ASan/UBSan.'
 	@printf '%s\n' '  make test-asan-strict            Corpus+probes under strict ASan (use-after-return, invalid pointer pairs).'
 	@printf '%s\n' '  make test-ubsan-deep             Corpus+probes under maximal UBSan (bounds-strict, object-size, builtin).'
@@ -186,11 +274,11 @@ GUI_OBJFILES := $(filter-out $(OBJ)/tools/main.o,$(OBJFILES))
 
 $(BUILD)/python-code-to-c-gui: $(GUI_OBJFILES) $(OBJ)/tools/gui_main.o
 	@mkdir -p $(@D)
-	$(CC) $(CFLAGS) $(LDFLAGS) $^ $(LDLIBS) -o $@
+	$(CC) $(CFLAGS) $(LDFLAGS) $(HOSTED_LDFLAGS) $^ $(LDLIBS) -o $@
 
 $(BUILD)/python-code-to-c: $(OBJFILES)
 	@mkdir -p $(@D)
-	$(CC) $(CFLAGS) $(LDFLAGS) $^ $(LDLIBS) -o $@
+	$(CC) $(CFLAGS) $(LDFLAGS) $(HOSTED_LDFLAGS) $^ $(LDLIBS) -o $@
 
 $(OBJ)/%.o: src/%.c
 	@mkdir -p $(@D)
@@ -257,6 +345,10 @@ test: all
 	$(MAKE) test-gc-stack-scan-scope
 	$(MAKE) test-gc-temp-roots
 	$(MAKE) test-gc-allocation-failure
+	$(MAKE) test-static-literals
+	$(MAKE) test-runtime-instances
+	$(MAKE) test-int-raw-ops
+	$(MAKE) test-stack-budget
 	$(MAKE) test-integer-overflow
 	$(MAKE) test-platform-adapter
 	$(MAKE) test-allocator-injection
@@ -301,11 +393,16 @@ test-sandbox:
 	CC="$(CC)" sh tests/sandbox_regression_alpha10.sh
 
 test-sanitizers:
-	$(MAKE) clean
+	@# 既定の build/ を消さないよう、サニタイザ専用ディレクトリだけを掃除する
+	@# （以前は `make clean` を呼んでおり、通常ビルドの成果物まで消えていた）。
+	@rm -rf build/sanitize obj/sanitize
 	@mkdir -p build/tests
 	$(MAKE) BUILD=build/sanitize OBJ=obj/sanitize CFLAGS="$(CFLAGS) $(SANITIZER_CFLAGS)" LDFLAGS="$(LDFLAGS) $(SANITIZER_CFLAGS)" test-parser-sanitizers
 	$(MAKE) BUILD=build/sanitize OBJ=obj/sanitize CFLAGS="$(CFLAGS) $(SANITIZER_CFLAGS)" LDFLAGS="$(LDFLAGS) $(SANITIZER_CFLAGS)" test-gc-lifecycle
 	$(MAKE) BUILD=build/sanitize OBJ=obj/sanitize CFLAGS="$(CFLAGS) $(SANITIZER_CFLAGS)" LDFLAGS="$(LDFLAGS) $(SANITIZER_CFLAGS)" test-gc-allocation-failure
+	$(MAKE) BUILD=build/sanitize OBJ=obj/sanitize CFLAGS="$(CFLAGS) $(SANITIZER_CFLAGS)" LDFLAGS="$(LDFLAGS) $(SANITIZER_CFLAGS)" test-static-literals
+	$(MAKE) BUILD=build/sanitize OBJ=obj/sanitize CFLAGS="$(CFLAGS) $(SANITIZER_CFLAGS)" LDFLAGS="$(LDFLAGS) $(SANITIZER_CFLAGS)" test-runtime-instances
+	$(MAKE) BUILD=build/sanitize OBJ=obj/sanitize CFLAGS="$(CFLAGS) $(SANITIZER_CFLAGS)" LDFLAGS="$(LDFLAGS) $(SANITIZER_CFLAGS)" test-int-raw-ops
 	$(SANITIZER_ENV) P2C_COMPILER=./build/sanitize/python-code-to-c P2C_TEST_CFLAGS="-Wall -Wextra -Werror -std=gnu11 $(SANITIZER_CFLAGS)" P2C_TEST_LDFLAGS="$(SANITIZER_CFLAGS)" CC="$(CC)" sh tests/conformance_regression.sh
 
 # --- 厳格プロファイル（バグ狩り） ----------------------------------------------
@@ -403,7 +500,7 @@ test-decorator-diagnostics: all
 	sh tests/decorator_diagnostics_alpha10.sh
 
 test-conformance: all
-	sh tests/conformance_regression.sh
+	P2C_TEST_CFLAGS="$(GENERATED_CFLAGS)" sh tests/conformance_regression.sh
 
 test-container-fuzz: all
 	CC="$(CC)" P2C_FUZZ_CASES="$(P2C_FUZZ_CASES)" P2C_FUZZ_SEEDS="$(P2C_FUZZ_SEEDS)" sh tests/container_fuzz_regression.sh
@@ -425,6 +522,29 @@ test-gc-lifecycle:
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/test_gc_runtime_reinit.c src/runtime/python_code_to_c_runtime.c src/common/python_code_to_c_common.c src/platform/python_code_to_c_platform.c src/platform/python_code_to_c_platform_hosted.c src/platform/python_code_to_c_gui.c src/modules/python_code_to_c_pygame.c $(LDFLAGS) $(LDLIBS) -o $(BUILD)/tests/test_gc_runtime_reinit
 	$(SANITIZER_ENV) $(BUILD)/tests/test_gc_runtime_reinit
 
+# 不変の静的リテラル（P2C_STATIC_STR）の性質を確認する。
+# 生成コードはリテラルを「使うたびに確保」せず共有実体を参照するため、
+# 共有・不変・GC非追跡・再初期化をまたぐ有効性をここで固定する。
+test-static-literals:
+	@mkdir -p $(BUILD)/tests
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/test_static_literals.c src/runtime/python_code_to_c_runtime.c src/common/python_code_to_c_common.c src/platform/python_code_to_c_platform.c src/platform/python_code_to_c_platform_hosted.c src/modules/python_code_to_c_pygame.c $(LDFLAGS) $(LDLIBS) -o $(BUILD)/tests/test_static_literals
+	$(SANITIZER_ENV) $(BUILD)/tests/test_static_literals
+
+# ランタイムインスタンス（コンテキスト）の分離を確認する。
+# 「カーネルのタスクごとに 1 インスタンス」という使い方の前提
+# （GC・レジストリ・フリーリスト・式スタックが混ざらないこと）を固定する。
+test-runtime-instances:
+	@mkdir -p $(BUILD)/tests
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/test_runtime_instances.c src/runtime/python_code_to_c_runtime.c src/common/python_code_to_c_common.c src/platform/python_code_to_c_platform.c src/platform/python_code_to_c_platform_hosted.c src/modules/python_code_to_c_pygame.c $(LDFLAGS) $(LDLIBS) -o $(BUILD)/tests/test_runtime_instances
+	$(SANITIZER_ENV) $(BUILD)/tests/test_runtime_instances
+
+# 生の int64 演算（AOT アンボクシングで型付きローカルから使う）が、
+# P2C_Object* 版と同じ結果・同じ例外になることを固定する。
+test-int-raw-ops:
+	@mkdir -p $(BUILD)/tests
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/test_int_raw_ops.c src/runtime/python_code_to_c_runtime.c src/common/python_code_to_c_common.c src/platform/python_code_to_c_platform.c src/platform/python_code_to_c_platform_hosted.c src/modules/python_code_to_c_pygame.c $(LDFLAGS) $(LDLIBS) -o $(BUILD)/tests/test_int_raw_ops
+	$(SANITIZER_ENV) $(BUILD)/tests/test_int_raw_ops
+
 test-gc-allocation-failure:
 	@mkdir -p $(BUILD)/tests
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/test_gc_allocation_failure.c src/runtime/python_code_to_c_runtime.c src/common/python_code_to_c_common.c src/platform/python_code_to_c_platform.c src/platform/python_code_to_c_platform_hosted.c src/platform/python_code_to_c_gui.c src/modules/python_code_to_c_pygame.c $(LDFLAGS) -Wl,--wrap=malloc -Wl,--wrap=calloc -Wl,--wrap=realloc $(LDLIBS) -o $(BUILD)/tests/test_gc_allocation_failure
@@ -444,7 +564,11 @@ test-fallback:
 
 test-gc-adaptive:
 	@mkdir -p $(BUILD)/tests
-	$(CC) -I./include -DPYTHON_CODE_TO_C_NO_PYGAME -std=c11 -O2 $(WARN_CFLAGS) \
+	@# このテストは「スタック上の生きた集合（20000ポインタ＝約160KiB）を保守的
+	@# スキャンが保持できるか」を検証するため、意図的に巨大なフレームを持つ。
+	@# 検証内容そのものがスタック配置に依存するので、この1ターゲットに限り
+	@# -Wno-stack-usage を付ける（製品コードと他のテストは予算を守る）。
+	$(CC) -I./include -DPYTHON_CODE_TO_C_NO_PYGAME -std=c11 -O2 $(WARN_CFLAGS) -Wno-stack-usage \
 		tests/test_gc_adaptive.c src/runtime/python_code_to_c_runtime.c \
 		src/common/python_code_to_c_common.c src/platform/python_code_to_c_platform.c \
 		src/platform/python_code_to_c_platform_hosted.c $(LDLIBS) -o $(BUILD)/tests/test_gc_adaptive
@@ -696,6 +820,22 @@ ANALYZER_SRCS := src/common/python_code_to_c_common.c \
 	src/tools/python_code_to_c_gui_web.c \
 	src/tools/c2py.c
 
+# 組込み（自作OS/ベアメタル）へ実際に載る「コア」だけを対象にしたスタック予算の
+# 検証用ソース一覧。ホスト側ツール（httpd/gui_web/c2py 等）は含めない
+# （実測最大はツールの 8304 バイト、コアは 3456 バイト）。
+CORE_STACK_SRCS := src/common/python_code_to_c_common.c \
+	src/lexer/python_code_to_c_lexer.c \
+	src/parser/python_code_to_c_ast.c \
+	src/parser/python_code_to_c_astdump.c \
+	src/parser/python_code_to_c_parser.c \
+	src/semantic/python_code_to_c_semantic.c \
+	src/codegen/python_code_to_c_codegen.c \
+	src/core/python_code_to_c.c \
+	src/runtime/python_code_to_c_runtime.c \
+	src/platform/python_code_to_c_platform.c \
+	src/platform/python_code_to_c_embed.c \
+	src/modules/python_code_to_c_pygame.c
+
 # 変換器そのもの（lexer/parser/semantic/codegen）を ASan+UBSan でビルドし、
 # 全フィクスチャを strict と --fallback の両方で変換して一巡させる回帰。
 # ランタイム中心の test-sanitizers と相補的（こちらは変換時の未定義動作を検出）。
@@ -727,6 +867,41 @@ test-analyzer-clang:
 			-Wno-everything -o /dev/null $$src || exit 1; \
 	done
 	@printf '%s\n' 'analyzer_clang_ok: clang static analyzer reported no defects'
+
+# 性能ヒント系のみを集めた任意ターゲット（正しさの検査ではないため既定から分離）。
+#   -Wsuggest-attribute=const,pure : 引数以外に依存しない関数へ属性を促し、
+#                                    不要な再計算・再読み出しを減らす。
+#   -Wunsafe-loop-optimizations    : 最適化できない（反復回数が確定しない）ループを
+#                                    指摘し、ホットパスの見直し材料にする。
+#   -Wstack-usage は既定（WARN_CFLAGS）に含まれ、組込みコアの厳しい予算は
+#   make test-stack-budget が担う（ここは性能ヒントの読み物なので重ねて課さない）。
+# ヒント系は「助言」なので -Wno-error を付け、違反しても失敗させない（人が読んで
+# 判断するためのレポート）。
+OPT_HINT_CFLAGS ?= -Wsuggest-attribute=const -Wsuggest-attribute=pure \
+	-Wunsafe-loop-optimizations \
+	-Wno-error=suggest-attribute=const -Wno-error=suggest-attribute=pure \
+	-Wno-error=unsafe-loop-optimizations
+
+test-opt-hints:
+	@mkdir -p $(BUILD)/tests
+	@for src in $(ANALYZER_SRCS); do \
+		out=$(BUILD)/tests/opthint_$$(basename $$src .c).o; \
+		$(CC) -I./include -std=c11 -O2 $(WARN_CFLAGS) $(OPT_HINT_CFLAGS) \
+			-c $$src -o $$out || exit 1; \
+	done
+	@printf '%s\n' 'opt_hints_ok: performance hints listed above (advisory; build not failed)'
+
+# 組込み向けスタック予算の回帰ゲート。組込みコア（ホスト用ツールを除く）を
+# 実測最大 3456 バイトより少し厳しい 4096 バイトでビルドし、余裕があることを数値で
+# 担保する。大きな配列をスタックに置く変更はここで失敗する。
+test-stack-budget:
+	@for src in $(CORE_STACK_SRCS); do \
+		out=$(BUILD)/tests/stackbudget_$$(basename $$src .c).o; \
+		mkdir -p $(BUILD)/tests; \
+		$(CC) -I./include -std=c11 -O2 $(WARN_CFLAGS) -Wstack-usage=4096 \
+			-c $$src -o $$out || exit 1; \
+	done
+	@printf '%s\n' 'stack_budget_ok: embedded core fits in 4096 bytes of stack per frame'
 
 test-baremetal-build:
 	$(MAKE) -f templates/toolchains/baremetal-example.mk PROJECT_ROOT=. CC="$(CC)" AR="$(AR)" clean all

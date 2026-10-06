@@ -23,6 +23,12 @@ typedef struct {
     /* 未対応構文を「実行時に NotImplementedError を送出するスタブ」へ
      * 置き換えて変換を続行する（--fallback）。既定falseは変換エラー。 */
     bool fallback_unsupported;
+    /* AOT アンボクシング（--unbox）。「int しか入らないと証明できた」関数ローカルを
+     * C の int64_t で持ち、算術・比較・代入を P2C_Object を作らずに計算する。
+     * 境界（呼び出し・コンテナ格納・return など）では p2c_obj_from_int で
+     * ボックス化するため意味論は変わらない。既定false（計測で効果と安全性を
+     * 確認してから既定ONにする）。 */
+    bool unbox_int_locals;
 } P2C_CodeGenOptions;
 
 extern const P2C_CodeGenOptions P2C_DEFAULT_OPTIONS;
@@ -52,6 +58,10 @@ struct P2C_CodeGen {
     int loop_depth;                       /* ループ入れ子数（break/continueの脱出範囲判定） */
     int function_depth;
     P2C_Map *declared_vars;
+    P2C_Map *synthetic_locals; /* コード生成が導入した一時ローカル名（_p2c_unpack_src_1 等）。
+                                * declared_vars と違いクロージャ捕捉の候補にはしない
+                                * （ラムダ生成時に「外側の変数」として取り込まれて
+                                * 壊れたCになるのを防ぐ）。 */
     P2C_Map *known_classes;
     P2C_Map *module_globals; /* モジュールトップレベルで代入される単純名の集合。global文の解決に使う。 */
     P2C_Map *class_init_adapter; /* クラス名 -> 解決済み__init__アダプタ関数名（自身 or 継承元）。値なしはNULLエントリ扱い。 */
@@ -85,6 +95,15 @@ struct P2C_CodeGen {
      * gen_exprの名前解決がこの表を優先することで、組込み関数呼び出しや
      * タプル/辞書表示の中でも genexpr のローカル名を正しく解決できる。 */
     P2C_Map *genexpr_locals;
+    /* 文字列リテラルの共有実体（内容 -> 通し番号+1）。同じ内容は1回だけ
+     * `P2C_STATIC_STR` で定義し、以降は同じ実体を参照する。これにより
+     * リテラル使用箇所での確保とGC負荷がゼロになる（詳細はruntime.h参照）。 */
+    P2C_Map *lit_strs;
+    int lit_str_counter;
+    /* AOT アンボクシング: 「int しか入らないと証明できたローカル」の集合。
+     * 空なら従来どおり全ローカルを P2C_Object* で扱う。関数ごとに入れ替える
+     * （入れ子スコープの生成時は保存/復元する）。 */
+    P2C_Map *native_int_locals;
     P2C_Result last_error;
     char *error_msg;
     const char *source_text; /* debug_info有効時に元のPython行をコメント挿入するために使う（NULL可） */

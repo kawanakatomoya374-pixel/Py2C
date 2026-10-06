@@ -40,6 +40,11 @@ static size_t phase_churn(P2C_Object **live) {
 int main(void) {
     char stack_hint = 0;
     P2C_GcStats stats;
+    /* この配列は「スタック上に置いた生きた集合を保守的スキャンが保持できるか」を
+     * 検証するためのものなので、static/heap へ逃がしてはいけない（逃がすと
+     * ルートから見えなくなり、テストの前提が崩れる）。スタック使用量だけが
+     * 大きくなるため、この1ターゲットに限り -Wno-stack-usage を付けている
+     * （Makefile の test-gc-adaptive を参照）。 */
     P2C_Object *live[LIVE_TARGET];
     P2C_Object *pinned = NULL;
     size_t fixed_collections, adaptive_collections;

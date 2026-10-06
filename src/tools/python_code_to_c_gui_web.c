@@ -120,7 +120,7 @@ static void handle_run(int client_fd, const char *src) {
         return;
     }
 
-    P2C_RuntimeLocation loc;
+    static P2C_RuntimeLocation loc;
     if (!p2c_locate_runtime(g_argv0, &loc)) {
         char *json = make_json_err("ランタイムのソース (python_code_to_c_runtime.c 等) が見つかりませんでした。"
                                     "PYTHON_CODE_TO_C_SRC_DIR環境変数でsrcディレクトリを指定するか、"

@@ -135,12 +135,27 @@ static int rewind_restores_depths(void) {
     p2c_fstr_rewind(0);
     if (p2c_binop_depth() != 0 || p2c_fstr_depth() != 0) return 34;
 
-    /* 容量を超える保存値は「スタック全体を空にする」扱い。 */
+    /* 保存値が現在の深さより大きい場合は「何もしない」（深さは増減しない）。
+     * これは呼び出し側の契約違反だが、値を壊さないことを保証する。
+     * （スタックは動的確保なので容量という概念が無くなった。） */
     p2c_binop_begin(p2c_obj_from_int(1));
     p2c_fstr_begin();
     p2c_binop_rewind(9999);
     p2c_fstr_rewind(9999);
-    if (p2c_binop_depth() != 0 || p2c_fstr_depth() != 0) return 35;
+    if (p2c_binop_depth() != 1 || p2c_fstr_depth() != 1) return 35;
+    p2c_binop_rewind(0);
+    p2c_fstr_rewind(0);
+    if (p2c_binop_depth() != 0 || p2c_fstr_depth() != 0) return 38;
+
+    /* 深い入れ子（以前の固定容量 64 を超える）でも伸長して使える。 */
+    for (size_t i = 0; i < 200; i++) {
+        p2c_binop_begin(p2c_obj_from_int((int64_t)i));
+        p2c_fstr_begin();
+    }
+    if (p2c_binop_depth() != 200 || p2c_fstr_depth() != 200) return 39;
+    p2c_binop_rewind(0);
+    p2c_fstr_rewind(0);
+    if (p2c_binop_depth() != 0 || p2c_fstr_depth() != 0) return 40;
 
     /* 一部だけ戻す（内側のtryが外側の一時値を壊さない）。 */
     p2c_binop_begin(p2c_obj_from_int(1));

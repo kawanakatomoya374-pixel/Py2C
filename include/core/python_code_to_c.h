@@ -29,6 +29,11 @@ typedef struct {
      * 送出するスタブ」へ置き換えて変換を続行する（ビルドは失敗させない）。
      * false（既定）では、黙って不正な値を作らず変換エラーとして報告する。 */
     bool fallback_unsupported;
+    /* AOT アンボクシング（CLI: --unbox）。「int しか入らないと証明できた」
+     * 関数ローカルを C の int64_t で持ち、算術・比較・代入を P2C_Object を
+     * 作らずに計算する。境界ではボックス化するため意味論は変わらない。
+     * 既定 false（計測と検証が済んでから既定 ON にする）。 */
+    bool unbox_int_locals;
     int indent_spaces;      /* 出力Cコードのインデント */
     /* NULL以外なら int main(void) の代わりに、カーネルから呼び出せる
      * "P2C_Object *<name>(void)" を生成する（CLI: --embed-entry <name>）。

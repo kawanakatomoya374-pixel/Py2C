@@ -49,7 +49,7 @@ static int path_is_file(const char *p) {
  * とfork/execが使える環境であることが前提。GUI本体の変換処理自体は
  * サブプロセスを使わないが、この「実行」機能だけは例外的にcc/system(3)を使う）。 */
 static void compile_and_run_c(const char *c_code) {
-    P2C_RuntimeLocation loc;
+    static P2C_RuntimeLocation loc;
     if (!p2c_locate_runtime(g_argv0, &loc)) {
         printf("ランタイムのソース (python_code_to_c_runtime.c 等) が見つかりませんでした。\n");
         printf("環境変数 PYTHON_CODE_TO_C_SRC_DIR に src ディレクトリのパスを指定するか、\n");
@@ -78,7 +78,9 @@ static void compile_and_run_c(const char *c_code) {
         strlen(loc.runtime_c) + strlen(loc.common_c) + strlen(loc.platform_core_c) +
         strlen(loc.platform_c) + strlen(loc.pygame_c) + strlen(bin_path) + 80;
     char *cmd = (char*)malloc(cmd_cap);
-    char compile_log[8192] = {0};
+    /* 最大8KiBのログはヒープに置く（-Wstack-usage 予算を守るため）。 */
+    char *compile_log = (char*)calloc(1, 8192);
+    if (!compile_log) { free(cmd); return; }
     if (!cmd) { printf("コマンド生成用のメモリ確保に失敗しました。\n"); return; }
 #if defined(__GNUC__) && !defined(__clang__)
 /* バッファ長は直上のstrlen計算から求めているため実際に切り詰めは起きないが、
@@ -99,13 +101,14 @@ static void compile_and_run_c(const char *c_code) {
     FILE *cc_out = popen(cmd, "r");
     free(cmd);
     if (cc_out) {
-        size_t n = fread(compile_log, 1, sizeof(compile_log) - 1, cc_out);
+        size_t n = fread(compile_log, 1, 8191u, cc_out);
         compile_log[n] = '\0';
         pclose(cc_out);
     }
     if (!path_is_file(bin_path)) {
         printf("コンパイルに失敗しました:\n%s\n", compile_log);
         printf("(生成されたCコードは残しています: %s)\n", c_path);
+        free(compile_log);
         return;
     }
     printf("--- 実行結果 ---\n");
@@ -116,6 +119,7 @@ static void compile_and_run_c(const char *c_code) {
         printf("(実行コマンドの起動に失敗しました)\n");
     }
     printf("--- 実行終了 ---\n");
+    free(compile_log);
 
     if (!getenv("PYTHON_CODE_TO_C_RUN_KEEP_TMP")) { remove(c_path); remove(bin_path); rmdir(tmpdir); }
 }

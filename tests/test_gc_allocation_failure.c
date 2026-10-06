@@ -80,6 +80,10 @@ int main(void) {
     p2c_runtime_init(NULL, 0);
     p2c_gc_init(&stack_mark);
     p2c_gc_set_enabled(false);
+    /* このテストは「確保が失敗したときのロールバック」を検証するため、
+     * オブジェクトのフリーリストを無効化して毎回 malloc/free を通す
+     * （プールが効くと注入した失敗が使われない）。 */
+    p2c_obj_pool_set_enabled(false);
 
     int status = expect_rollback_dict();
     if (status != 0) return status;

@@ -111,6 +111,57 @@ int kernel_task(void *task_stack_lo, void *task_stack_hi) {
 - 1つの `P2C_EmbedHeap` は1つの領域に対応します。同じ領域を再初期化すると、
   以前のヒープ構造体の空きリストは無効になります。
 
+### 5-2. タスクごとに 1 インスタンス（マルチインスタンス）
+
+既定ではランタイムは「プロセス（カーネル）に 1 つ」の静的インスタンスを使いますが、
+カーネルのタスクごとに独立した Python 実行環境を持ちたい場合は、インスタンス
+（コンテキスト）を明示的に作って切り替えます。
+
+```c
+#include "runtime/python_code_to_c_runtime.h"
+
+static struct P2C_RuntimeContext *task_ctx[2];
+static P2C_Object *task_result[2];
+
+static void task_entry(int id, int arg) {
+    p2c_runtime_context_select(task_ctx[id]);   /* このタスクのインスタンスを選ぶ */
+    P2C_GC_ENTER_TASK(task_stack_lo(id), task_stack_hi(id));  /* 境界を宣言 */
+    p2c_runtime_init(NULL, 0);                  /* 未初期化なら初期化 */
+    task_result[id] = my_program_entry(arg);    /* 生成コード（--embed-entry） */
+    /* タスクを終えるとき: */
+    p2c_runtime_shutdown();
+    p2c_runtime_context_select(NULL);           /* 既定インスタンスへ戻す */
+}
+
+/* 起動時にタスクごとのインスタンスを作る */
+task_ctx[0] = p2c_runtime_context_create();
+task_ctx[1] = p2c_runtime_context_create();
+/* タスクを破棄するとき */
+p2c_runtime_context_destroy(task_ctx[1]);       /* shutdown も内部で行う */
+```
+
+インスタンスごとに独立するもの:
+
+| 分離される状態 | 補足 |
+|---|---|
+| GC の追跡リスト・ルート・しきい値・収集回数 | 片方の収集がもう片方のオブジェクトに触れない |
+| クラスレジストリ / モジュールレジストリ | 同名クラスを作っても混ざらない |
+| オブジェクトのフリーリスト | プールのメモリを別インスタンスへ返す事故を防ぐ |
+| 式評価スタック（二項演算・f-string） | 片方の巻き戻しが相手の一時値を捨てない |
+| サンドボックス予算・OOM ハンドラ | タスクごとに別の予算を設定できる |
+
+共有されるもの（設計上の前提）:
+
+- **ヒープ（アロケータ）**: `P2C_Platform` / 共有ヒープ層が持ちます。インスタンスごとに
+  別ヒープにしたい場合は、カーネル側で `p2c_platform_set_allocator()` を切り替えるか、
+  タスクごとに別のランタイム同梱ヒープ（`P2C_EmbedHeap`）を用意して切り替えてください。
+- **静的リテラル**（`P2C_STATIC_STR`）と小整数キャッシュ: 不変オブジェクトなので
+  共有して問題ありません（どのインスタンスにも属しません）。
+- **スレッド安全性**: ランタイムは 1 インスタンス = 1 実行文脈を前提とします。
+  同一インスタンスを複数スレッドから同時に使うことはサポートしません
+  （協調スケジューラのように 1 本ずつ動かし、切り替え時に
+  `p2c_runtime_context_select()` を呼ぶ形を想定しています）。
+
 ### 5-1. ヒープサイズの見積り（実測）
 
 ランタイムの初期化（`p2c_embed_start`）は、組込みモジュール（`math` など）の登録を
@@ -235,9 +286,12 @@ P2C_Result r = python_to_c(python_source, NULL, &generated);
 | コマンド | 検証内容 |
 |---|---|
 | `make test-embed-runtime` | 組込みヒープ（分割・合体・realloc・破損検出）、ライフサイクル、タスク再起動、GCの安全側停止と有効化、OOM通知、MemoryError化、panic経路 |
+| `make test-runtime-instances` | ランタイムインスタンス（コンテキスト）の分離: GC・クラス/モジュールレジストリ・フリーリスト・式スタックがインスタンスをまたいで混ざらないこと、片方を destroy しても他方が動き続けること、`select(NULL)` で既定へ戻れること |
+| `make test-static-literals` | 不変の静的リテラル（`P2C_STATIC_STR`）が共有・不変・GC非追跡で、再初期化をまたいでも有効なこと |
+| `make test-int-raw-ops` | 生の int64 演算ヘルパ（AOT アンボクシング用）が `P2C_Object*` 版と同じ結果・同じ例外（OverflowError / ZeroDivisionError / ValueError）を返すこと。境界値を含む値のマトリクス×全演算子と、int/float/bool/None/str を相手にした混在比較を確認する |
 | `make test-freestanding-setjmp` | カーネル提供 setjmp/longjmp の契約（raise/except、入れ子フレーム、深いフレームからの longjmp） |
 | `make test-baremetal-exceptions` | 自作libcスタブ構成での例外機構（コンパイラ組み込みsetjmp）、スタック上の生存ローカル保護、プラットフォームアロケータが実際に使われること |
-| `make test-gc-temp-roots` | 式評価中のTLS一時値（二項演算の左オペランド、処理中の例外）が収集のルートに入ること、式の途中で例外が脱出しても深さが漏れず、その後の式が正しいこと、停止後に深さが0へ戻ること |
+| `make test-gc-temp-roots` | 式評価中の一時値（二項演算の左オペランド、処理中の例外）が収集のルートに入ること、式の途中で例外が脱出しても深さが漏れず、その後の式が正しいこと、停止後に深さが0へ戻ること |
 | `make test-gc-stack-scan-scope` | 保守的スタックスキャンが使用中の範囲だけを走査すること（`p2c_gc_last_stack_words()`）と、ローカルのみ到達可能なオブジェクトの生存 |
 | `make test-embed-compile` | カーネル相当環境での変換器コア実行（`--embed-entry` 相当APIと不正名の拒否も検証） |
 | `make test-embed-generated` | `--embed-entry` 生成モジュールをカーネル相当ドライバで実行し、CPythonと出力差分比較 |

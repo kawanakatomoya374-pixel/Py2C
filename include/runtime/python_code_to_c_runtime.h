@@ -175,6 +175,30 @@ extern P2C_Object P2C_False;
 /* Pythonの単一値 `...`。式のプレースホルダやスタブ本体（def f(): ...）に使う。 */
 extern P2C_Object P2C_Ellipsis;
 
+/* ── 不変の静的リテラル ─────────────────────────────────────────────
+ * codegen は文字列リテラル（および識別子名・キーワード名・辞書キーなど、
+ * 内容がコンパイル時に確定する文字列）を、使うたびに確保する代わりに
+ * `P2C_STATIC_STR(名前, "内容", バイト長);` で定義した共有実体へ置き換える。
+ *
+ *   - 管理領域は .data、文字列は .rodata に置かれる。実行時の確保が無く、
+ *     GC の負荷も一切増えない（組み込み/自作OSで有利）。
+ *   - GC の追跡リストに載らないため、スイープで解放されない。リテラルは
+ *     プログラム寿命と同じなので解放は不要（＝リークではない）。
+ *   - 本ランタイムの str は不変（ペイロードを書くのは生成時だけ）なので、
+ *     複数箇所で実体を共有しても意味は変わらない。
+ *   - ランタイムコンテキストに属さないので、複数インスタンスを同時に動かしても
+ *     `p2c_runtime_shutdown()` の影響を受けない。
+ *
+ * text_len は Python 文字列としてのバイト長（strlen 相当）を渡す。
+ * 内容は書き込み可能な静的配列へ複製する（生成Cは -Wwrite-strings/-Wcast-qual
+ * 付きでビルドされるため、リテラルを直接 char* へ入れるキャストを使わない）。
+ * ユーザーがホスト側Cで同じ性質の定数を定義する場合もこのマクロを使える。 */
+#define P2C_STATIC_STR(obj_name, text, text_len)                                  \
+    static char obj_name##_buf[] = text;                                          \
+    static P2C_Object obj_name = { &P2C_Class_Str, 0,                             \
+                                   { .v_str = { obj_name##_buf, (text_len) } },   \
+                                   NULL, 0 }
+
 P2C_Object* p2c_obj_new(P2C_ClassDef *cls);
 /* p2c_obj_incref/decref: 参照カウンタの増減のみを行う（解放は行わない）。
  * オブジェクトの実際の解放はp2c_gc_collect()が担う（下記GCセクション参照）。
@@ -232,6 +256,34 @@ P2C_Object* p2c_percent_format(const char *fmt, P2C_Object *rhs);
 P2C_Object* p2c_obj_pow(P2C_Object *a, P2C_Object *b);
 P2C_Object* p2c_obj_lshift(P2C_Object *a, P2C_Object *b);
 P2C_Object* p2c_obj_rshift(P2C_Object *a, P2C_Object *b);
+/* ── 生の int64 演算（AOT アンボクシング用）───────────────────────────
+ * codegen が「int しか入らないと証明できたローカル」を int64_t で持つとき、
+ * そのローカル同士（および int リテラルとの）演算に使う。P2C_Object を
+ * 作らないため確保もGC負荷も無い。意味論（オーバーフロー→OverflowError、
+ * 0除算→ZeroDivisionError、負のシフト→ValueError、負数の // と % の定義）は
+ * P2C_Object* 版と完全に同一で、判定と計算を共有している。
+ *
+ * object 側が混在する比較（例: 型付きローカル < 関数引数）は p2c_int_*_obj を使う。
+ * 相手が int なら生比較、それ以外は従来の比較経路へ委譲する。 */
+int64_t p2c_int_add_raw(int64_t a, int64_t b);
+int64_t p2c_int_sub_raw(int64_t a, int64_t b);
+int64_t p2c_int_mul_raw(int64_t a, int64_t b);
+int64_t p2c_int_floordiv_raw(int64_t a, int64_t b);
+int64_t p2c_int_mod_raw(int64_t a, int64_t b);
+int64_t p2c_int_bitand_raw(int64_t a, int64_t b);
+int64_t p2c_int_bitor_raw(int64_t a, int64_t b);
+int64_t p2c_int_bitxor_raw(int64_t a, int64_t b);
+int64_t p2c_int_lshift_raw(int64_t a, int64_t count);
+int64_t p2c_int_rshift_raw(int64_t a, int64_t count);
+int64_t p2c_int_neg_raw(int64_t a);
+int64_t p2c_int_invert_raw(int64_t a);
+bool p2c_int_lt_obj(int64_t a, P2C_Object *b);
+bool p2c_int_le_obj(int64_t a, P2C_Object *b);
+bool p2c_int_gt_obj(int64_t a, P2C_Object *b);
+bool p2c_int_ge_obj(int64_t a, P2C_Object *b);
+bool p2c_int_eq_obj(int64_t a, P2C_Object *b);
+bool p2c_int_ne_obj(int64_t a, P2C_Object *b);
+
 P2C_Object* p2c_obj_bitand(P2C_Object *a, P2C_Object *b);
 P2C_Object* p2c_obj_bitor(P2C_Object *a, P2C_Object *b);
 P2C_Object* p2c_obj_bitxor(P2C_Object *a, P2C_Object *b);
@@ -319,6 +371,30 @@ P2C_Object* p2c_call_attr_kw(P2C_Object *obj, const char *name, P2C_Object **arg
 void p2c_runtime_init(void *heap_base, size_t heap_size);
 void p2c_runtime_shutdown(void);
 bool p2c_runtime_is_active(void);
+
+/* ── ランタイムインスタンス（コンテキスト）─────────────────────────────
+ * 既定では 1 プロセス 1 インスタンス（上の p2c_runtime_init() が使う静的
+ * インスタンス）で動く。カーネルのタスクごとに独立した実行環境を持ちたい場合
+ * などに、インスタンスを明示的に作って切り替えられる。
+ *
+ *   struct P2C_RuntimeContext *ctx = p2c_runtime_context_create();
+ *   p2c_runtime_context_select(ctx);
+ *   p2c_runtime_init(NULL, 0);
+ *   ... 生成コードを実行 ...
+ *   p2c_runtime_shutdown();
+ *   p2c_runtime_context_select(NULL);   // 既定インスタンスへ戻す
+ *   p2c_runtime_context_destroy(ctx);
+ *
+ * インスタンスごとに独立するのは GC（追跡リスト・ルート・しきい値）、
+ * クラス/モジュールレジストリ、オブジェクトのフリーリスト、式評価スタック
+ * など。ヒープ（アロケータ）は共有ヒープ層／プラットフォーム側が持つため、
+ * インスタンスごとに別ヒープにしたい場合はカーネル側で
+ * p2c_platform_set_allocator() を切り替える。型は不透明ハンドルとして扱う。 */
+struct P2C_RuntimeContext;
+struct P2C_RuntimeContext *p2c_runtime_context_create(void);
+struct P2C_RuntimeContext *p2c_runtime_context_current(void);
+void p2c_runtime_context_select(struct P2C_RuntimeContext *ctx);
+void p2c_runtime_context_destroy(struct P2C_RuntimeContext *ctx);
 /* 現在のランタイムコンテキストに登録されているクラス数（観測用）。
  * p2c_runtime_shutdown() で 0 に戻る（再初期化の検証に使う）。 */
 size_t p2c_runtime_class_count(void);
@@ -534,6 +610,12 @@ void longjmp(jmp_buf env, int val);
  * setjmp/longjmp（ホスト構成）またはカーネル実装（NO_LIBC_STUBS）を使う。 */
 #if !defined(setjmp) && !defined(PYTHON_CODE_TO_C_NO_COMPILER_SETJMP) && \
     (defined(__GNUC__) || defined(__clang__)) && !defined(__TINYC__)
+/* __builtin_setjmp/__builtin_longjmp は void** を要求するため、jmp_buf からの
+ * キャスト（型破り参照）が不可避である。これは意図した契約であり、
+ * -Wstrict-aliasing（-O2 で有効）が「別名規則違反の可能性」を報告するのは
+ * 誤検知になる。既定ビルド（ホスト libc の setjmp を使う構成）ではこの pun は
+ * 発生せず違反0件なので、Makefile 側は -Wno-error=strict-aliasing として
+ * 「報告はするが失敗はさせない」扱いにしている（freestanding 構成のみ該当）。 */
 #  define setjmp(env) __builtin_setjmp((void**)(env))
 #  define longjmp(env, val) ((void)(val), __builtin_longjmp((void**)(env), 1))
 #  define P2C_HAVE_COMPILER_SETJMP 1
@@ -606,6 +688,8 @@ P2C_Object* p2c_fstr_finish(void);
  * 例外フレームへ到達した時点で同じ保存値へ戻す契約とする。 */
 size_t p2c_binop_depth(void);
 void p2c_binop_rewind(size_t depth);
+/* 式評価スタック（binop/f-string）の後始末。p2c_runtime_shutdown() が呼ぶ。 */
+void p2c_expr_stacks_release(void);
 size_t p2c_fstr_depth(void);
 void p2c_fstr_rewind(size_t depth);
 P2C_Object* p2c_obj_slice(P2C_Object *obj, P2C_Object *start, P2C_Object *stop, P2C_Object *step);
@@ -672,6 +756,8 @@ P2C_Object* p2c_getattr(P2C_Object *obj, const char *name);
 P2C_Object* p2c_getattr_default(P2C_Object *obj, const char *name, P2C_Object *default_val);
 P2C_Object* p2c_builtin_iter(P2C_Object *obj);
 P2C_Object* p2c_builtin_next(P2C_Object *it);
+/* 反復の高速路（生成Cの for が使う）。1=要素あり / 0=尽きた / -1=高速路不可。 */
+int p2c_iter_try_next(P2C_Object *it, P2C_Object **out);
 P2C_Object* p2c_async_iter(P2C_Object *obj);
 P2C_Object* p2c_async_next(P2C_Object *iter);
 P2C_Object* p2c_async_call_attr(P2C_Object *obj, const char *name, P2C_Object **args, size_t nargs);
@@ -693,6 +779,14 @@ P2C_Object* p2c_generator_finish_exception(P2C_Object *generator, P2C_Object *ex
 P2C_Object* p2c_generator_send(P2C_Object *generator, P2C_Object *value);
 P2C_Object* p2c_generator_sent_value(P2C_Object *generator);
 P2C_Object* p2c_generator_result(P2C_Object *generator);
+/* オブジェクト用フリーリストの観測（チューニング/テスト用）。 */
+size_t p2c_obj_pool_cached(void);
+size_t p2c_obj_pool_hits(void);
+size_t p2c_obj_pool_misses(void);
+/* フリーリストの有効/無効。無効にすると毎回 malloc/free を使う
+ * （確保失敗を注入するテストや、valgrind でリーク箇所を追うとき用）。 */
+void p2c_obj_pool_set_enabled(bool enabled);
+bool p2c_obj_pool_is_enabled(void);
 P2C_Object* p2c_generator_await(P2C_Object *generator, P2C_Object *awaitable, uint32_t next_state);
 P2C_Object* p2c_generator_await_result(P2C_Object *generator);
 bool p2c_generator_is_done(P2C_Object *generator);

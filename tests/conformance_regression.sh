@@ -168,4 +168,10 @@ run_differential_case R01-R29 tests/round3_alpha10.py 29
 # ジェネレータ内 assert/型注釈、入れ子アンパック、__lt__ によるソート、例外 .args、
 # type(x).__name__、組み込み例外基底の super().__init__）。
 run_differential_case R30-R44 tests/round4_alpha10.py 15
-printf '%s\n' 'conformance_regression_ok: 847 semantic assertions passed'
+# Round-5: assert メッセージ式の評価、ジェネレータ内 assert、dict の `|`/`|=`、
+# str.removeprefix/removesuffix、zip(*m)、enumerate(start=)、タプル値/連鎖代入。
+run_differential_case R45-R55 tests/round5_alpha10.py 11
+# Round-6: 括弧付き/入れ子/starred の for ターゲット、深い再帰を含む二項演算式
+# （式評価スタックの動的化）、数値の符号・丸め。
+run_differential_case R56-R65 tests/round6_alpha10.py 10
+printf '%s\n' 'conformance_regression_ok: 868 semantic assertions passed'

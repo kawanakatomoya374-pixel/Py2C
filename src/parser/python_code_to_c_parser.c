@@ -1979,15 +1979,45 @@ static P2C_AstStmt* parse_for_stmt(P2C_Parser *p, P2C_Result *err) {
     uint32_t line = tok->line, col = tok->col;
     NEXT(p);
     
-    /* forのtargetは変数名、またはカンマ区切りの複数変数名（タプルアンパック）をサポート
-     * （比較演算の'in'と衝突回避のため、式全体ではなく識別子の並びのみ受け付ける） */
+    /* forのtargetは変数名、カンマ区切りの複数変数名（タプルアンパック）、
+     * または括弧で囲んだ同じ形（`for (a, b) in ...`）をサポートする。
+     * 比較演算の'in'と衝突回避のため、括弧なしの場合は式全体ではなく
+     * 識別子の並びのみを受け付ける。 */
+    P2C_AstExpr *target = NULL;
+    if (CURRENT(p) && CURRENT(p)->type == TOK_LPAREN) {
+        /* `for (a, b) in ...` / `for (x) in ...`（括弧はグループ化）。 */
+        NEXT(p);
+        P2C_AstExpr *inner = parse_literal_element(p, err);
+        if (!inner) return NULL;
+        if (CONSUME(p, TOK_COMMA)) {
+            P2C_Vector *elts = p2c_vec_new(p->alloc, NULL);
+            if (!elts) return NULL;
+            p2c_vec_push(elts, inner);
+            while (CURRENT(p) && CURRENT(p)->type != TOK_RPAREN) {
+                P2C_AstExpr *item = parse_literal_element(p, err);
+                if (!item) { p2c_vec_free(elts); return NULL; }
+                p2c_vec_push(elts, item);
+                if (!CONSUME(p, TOK_COMMA)) break;
+            }
+            P2C_AstExpr *tup = p2c_ast_expr_new(p->alloc, AST_TUPLE, line, col);
+            if (!tup) { p2c_vec_free(elts); return NULL; }
+            tup->base.u.tuple.elts = elts;
+            target = tup;
+        } else {
+            target = inner;
+        }
+        if (!EXPECT(p, TOK_RPAREN, err)) {
+            set_error(p, "expected ')' after for loop target");
+            return NULL;
+        }
+    } else {
     bool target_starred = CONSUME(p, TOK_STAR);
     P2C_Token *target_tok = EXPECT(p, TOK_IDENTIFIER, err);
     if (!target_tok) {
         set_error(p, "expected loop variable name in for statement");
         return NULL;
     }
-    P2C_AstExpr *target = p2c_ast_name(p->alloc, target_tok->text, target_tok->line, target_tok->col);
+    target = p2c_ast_name(p->alloc, target_tok->text, target_tok->line, target_tok->col);
     if (target_starred) {
         P2C_AstExpr *starred = p2c_ast_expr_new(p->alloc, AST_STARRED, target_tok->line, target_tok->col);
         if (!starred) return NULL;
@@ -2016,6 +2046,7 @@ static P2C_AstStmt* parse_for_stmt(P2C_Parser *p, P2C_Result *err) {
         if (!tup) return NULL;
         tup->base.u.tuple.elts = elts;
         target = tup;
+    }
     }
     if (!EXPECT(p, TOK_KW_IN, err)) {
         set_error(p, "expected 'in' in for statement");

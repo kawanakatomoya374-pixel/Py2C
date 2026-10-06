@@ -39,31 +39,88 @@ static const TestCase tests[] = {
     {NULL, NULL}
 };
 
+/* 大文字小文字を無視して "help" 系の要求かどうかを判定する。
+ * `Py2C help` のように綴りが揺れても案内が出るようにする。 */
+static bool arg_is_help(const char *s) {
+    static const char *const words[] = {"help", "--help", "-h", "-?", "/?", "usage", NULL};
+    if (!s) return false;
+    for (size_t w = 0; words[w]; w++) {
+        const char *a = s;
+        const char *b = words[w];
+        size_t ia = 0, ib = 0;
+        while (a[ia] && b[ib]) {
+            char ca = a[ia], cb = b[ib];
+            if (ca >= 'A' && ca <= 'Z') ca = (char)(ca - 'A' + 'a');
+            if (cb >= 'A' && cb <= 'Z') cb = (char)(cb - 'A' + 'a');
+            if (ca != cb) break;
+            ia++; ib++;
+        }
+        if (a[ia] == '\0' && b[ib] == '\0') return true;
+    }
+    return false;
+}
+
+/* 使い方の案内が長いので、誤り時の1行ヒントとしても同じ入口を示す。 */
+static void print_help_hint(const char *argv0) {
+    fprintf(stderr, "  `%s help` で使い方を表示します（例: %s run hello.py）。\n",
+            argv0 ? argv0 : "python_code_to_c", argv0 ? argv0 : "python_code_to_c");
+}
+
+/* 初心者向けの案内。`py2c help` / `--help` / `-h` / `help` で表示する。
+ * 引数の書き方だけでなく「最初に何をすればよいか」「失敗したときどう切り分けるか」
+ * まで書くことで、README を開かなくても使い始められるようにしている。 */
 static void print_usage(const char *argv0) {
+    const char *prog = argv0 ? argv0 : "python_code_to_c";
     fprintf(stderr,
-            "python_code_to_c %s\n"
-            "Usage:\n"
-            "  %s <input.py> [-o output.c] [-v] [--comments] [--c11] [--embed-entry NAME]  ... PythonをCコードに変換\n"
-            "  %s run [-v] <input.py>            ... 変換・コンパイル・実行をまとめて1コマンドで行う\n"
-            "  %s --dump-ast <input.py>          ... パース結果のASTを木構造で表示する（デバッグ用）\n"
-            "  %s --self-test\n"
-            "  %s --supported\n"
+            "python_code_to_c %s — Python のサブセットを C11 コードへ変換するツール\n"
             "\n"
-            "  -v, --verbose                     ... 変換の各段階(字句解析/構文解析/意味解析/\n"
-            "                                         コード生成)の所要時間や統計をstderrへ出力する\n"
-            "  --comments                        ... 生成Cコードに、対応する元のPython行を\n"
-            "                                         コメントとして挿入する\n"
-            "  --c11                             ... GNU拡張が必要な構文を拒否し、ISO C11対象を明示する\n"
-            "  --embed-entry NAME                ... int main() の代わりにカーネルから呼べる\n"
-            "                                         P2C_Object *NAME(void) を生成する（自作OS組込み用）\n"
-            "  --fallback                        ... 未対応構文を「実行時にNotImplementedErrorを\n"
-            "                                         送出するスタブ」へ置き換え、変換を続行する\n"
+            "使い方:\n"
+            "  %s help                     このヘルプを表示する（--help / -h でも同じ）\n"
+            "  %s <input.py> [-o out.c]    Python ファイルを C コードへ変換する\n"
+            "  %s run <input.py>           変換 → コンパイル → 実行 をまとめて行う（おすすめ）\n"
+            "  %s --dump-ast <input.py>    構文解析の結果（AST）を表示する\n"
+            "  %s --supported              変換できる構文の範囲を表示する\n"
+            "  %s --self-test              インストール直後の動作確認（同梱例を変換・実行）\n"
+            "  %s --version                バージョンを表示する\n"
             "\n"
-            "Examples:\n"
-            "  %s sample.py -o sample.c\n"
-            "  cc -I./include sample.c src/runtime/python_code_to_c_runtime.c src/common/python_code_to_c_common.c src/platform/python_code_to_c_platform.c src/platform/python_code_to_c_platform_hosted.c src/modules/python_code_to_c_pygame.c -lm -o sample\n"
-            "  %s run sample.py               ... 上記と同じことを1コマンドで（ファイルを投げるだけ）\n",
-            p2c_version_string(), argv0, argv0, argv0, argv0, argv0, argv0, argv0);
+            "主なオプション:\n"
+            "  -o <path>          出力する C ファイル名（省略時は標準出力へ書き出す）\n"
+            "  -v, --verbose      字句解析〜コード生成の所要時間と統計を stderr へ表示する\n"
+            "  --comments         生成する C コードに、対応する元の Python 行をコメントで残す\n"
+            "  --c11              GNU 拡張が必要な構文を拒否し、ISO C11 のみを対象にする\n"
+            "  --fallback         未対応構文を「実行時に NotImplementedError を送出する\n"
+            "                     コード」へ置き換えて変換を続ける（既定は変換エラー）\n"
+            "  --unbox            関数ローカルのうち int しか入らないものを int64_t で扱い、\n"
+            "                     算術・比較・代入を高速化する（意味論は変えない）\n"
+            "  --embed-entry NAME 自作OSへ組み込むため、int main() の代わりに\n"
+            "                     P2C_Object *NAME(void) を生成する\n"
+            "\n"
+            "はじめの一歩:\n"
+            "  echo 'print(\"hello\")' > hello.py\n"
+            "  %s run hello.py                  # 変換・コンパイル・実行をまとめて確認\n"
+            "  %s hello.py -o hello.c           # C コードだけが欲しいとき\n"
+            "\n"
+            "生成した C コードを自分でビルドする場合:\n"
+            "  cc -I<このツールの include ディレクトリ> hello.c \\\n"
+            "     src/runtime/python_code_to_c_runtime.c src/common/python_code_to_c_common.c \\\n"
+            "     src/platform/python_code_to_c_platform.c \\\n"
+            "     src/platform/python_code_to_c_platform_hosted.c \\\n"
+            "     src/modules/python_code_to_c_pygame.c -lm -o hello\n"
+            "  （`%s run` はこのコンパイル手順を自動で行います）\n"
+            "\n"
+            "うまくいかないとき:\n"
+            "  * 「Parse error ...」/「Code generation error ...」\n"
+            "      → その構文にはまだ対応していません。メッセージの行・列が原因箇所です。\n"
+            "        %s --supported で対応範囲を確認するか、--fallback を付けると\n"
+            "        変換は続き、実行時に NotImplementedError として検出できます。\n"
+            "  * 生成した C がコンパイルできない\n"
+            "      → 変換時のエラーを先に解消してください（エラーがあると C は生成されません）。\n"
+            "  * 実行結果が Python と違う\n"
+            "      → 未対応/差異の可能性があります。%s --dump-ast で構文の解釈を確認できます。\n"
+            "  * ツール自体が怪しい\n"
+            "      → %s --self-test で同梱例の変換・実行を一括確認できます。\n",
+            p2c_version_string(), prog, prog, prog, prog, prog, prog, prog,
+            prog, prog, prog, prog, prog, prog);
 }
 
 static char *read_text_file(const char *path) {
@@ -152,7 +209,10 @@ static int run_mode(const char *argv0, const char *input_path) {
     fprintf(stderr, "Error: run mode requires a hosted build (PYTHON_CODE_TO_C_NO_STDLIB is defined).\n");
     return 1;
 #else
-    P2C_RuntimeLocation loc;
+    /* 単一スレッドのCLIなので、約25KiBの探索結果バッファはスタックではなく static に
+     * 置く（-Wstack-usage の予算内に収める。ツール側の都合で組込み向けスタック予算を
+     * 緩めないため）。 */
+    static P2C_RuntimeLocation loc;
     if (!p2c_locate_runtime(argv0, &loc)) {
         fprintf(stderr,
             "Error: ランタイムのソース (python_code_to_c_runtime.c 等) が見つかりませんでした。\n"
@@ -204,11 +264,22 @@ static int run_mode(const char *argv0, const char *input_path) {
      * 各パスは理論上4000バイト超になりうる(P2C_RuntimeLocation参照)ため、
      * 固定長バッファだとGCCのformat-truncation検査(-Werror)を満たせない。
      * 実際の長さから必要サイズを計算して動的確保する。 */
+    /* 生成Cのコンパイル: 既定で -O2 を付ける。以前は最適化フラグが無く、
+     * 既定(-O0)でビルドしていたため、同じコードでも数倍遅く実行されていた。
+     * 環境変数 P2C_RUN_CFLAGS で上書きできる（例: -O0 -g でデバッグ）。 */
+    const char *run_cflags = getenv("P2C_RUN_CFLAGS");
+    if (!run_cflags || !run_cflags[0]) run_cflags = "-O2";
     size_t cmd_cap = strlen(cc) + strlen(loc.include_dir) + strlen(c_path) +
         strlen(loc.runtime_c) + strlen(loc.common_c) + strlen(loc.platform_core_c) +
-        strlen(loc.platform_c) + strlen(loc.pygame_c) + strlen(bin_path) + 80;
+        strlen(loc.platform_c) + strlen(loc.pygame_c) + strlen(bin_path) + strlen(run_cflags) + 96;
     char *cmd = (char*)malloc(cmd_cap);
-    char compile_log[8192] = {0};
+    /* コンパイラのログ（最大8KiB）もヒープに置き、フレームを小さく保つ。 */
+    char *compile_log = (char*)calloc(1, 8192);
+    if (!compile_log) {
+        fprintf(stderr, "Error: out of memory building compiler log buffer.\n");
+        free(cmd);
+        return 1;
+    }
     if (!cmd) {
         fprintf(stderr, "Error: out of memory building compile command.\n");
         return 1;
@@ -224,8 +295,8 @@ static int run_mode(const char *argv0, const char *input_path) {
 #pragma GCC diagnostic ignored "-Wformat-truncation"
 #endif
     snprintf(cmd, cmd_cap,
-        "%s -I\"%s\" -std=c11 \"%s\" \"%s\" \"%s\" \"%s\" \"%s\" \"%s\" -lm -o \"%s\" 2>&1",
-        cc, loc.include_dir, c_path, loc.runtime_c, loc.common_c, loc.platform_core_c, loc.platform_c, loc.pygame_c, bin_path);
+        "%s -I\"%s\" %s -std=c11 \"%s\" \"%s\" \"%s\" \"%s\" \"%s\" \"%s\" -lm -o \"%s\" 2>&1",
+        cc, loc.include_dir, run_cflags, c_path, loc.runtime_c, loc.common_c, loc.platform_core_c, loc.platform_c, loc.pygame_c, bin_path);
 #if defined(__GNUC__) && !defined(__clang__)
 #pragma GCC diagnostic pop
 #endif
@@ -233,13 +304,14 @@ static int run_mode(const char *argv0, const char *input_path) {
     FILE *cc_out = popen(cmd, "r");
     free(cmd);
     if (cc_out) {
-        size_t n = fread(compile_log, 1, sizeof(compile_log) - 1, cc_out);
+        size_t n = fread(compile_log, 1, 8191u, cc_out);
         compile_log[n] = '\0';
         pclose(cc_out);
     }
     if (!path_is_file(bin_path)) {
         fprintf(stderr, "Error: generated C code failed to compile.\n");
         if (compile_log[0]) fprintf(stderr, "%s\n", compile_log);
+        free(compile_log);
         fprintf(stderr, "(生成されたCコードは残しています: %s)\n", c_path);
         return 1;
     }
@@ -255,8 +327,9 @@ static int run_mode(const char *argv0, const char *input_path) {
     }
 
 #ifdef WIFEXITED
-    if (rc != -1 && WIFEXITED(rc)) return WEXITSTATUS(rc);
+    if (rc != -1 && WIFEXITED(rc)) { free(compile_log); return WEXITSTATUS(rc); }
 #endif
+    free(compile_log);
     return rc;
 #endif
 }
@@ -268,12 +341,16 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    if (strcmp(argv[1], "--self-test") == 0) {
-        return run_self_test();
-    }
-    if (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0) {
+    if (arg_is_help(argv[1])) {
         print_usage(argv[0]);
         return 0;
+    }
+    if (strcmp(argv[1], "--version") == 0 || strcmp(argv[1], "-V") == 0) {
+        printf("python_code_to_c %s\n", p2c_version_string());
+        return 0;
+    }
+    if (strcmp(argv[1], "--self-test") == 0) {
+        return run_self_test();
     }
     if (strcmp(argv[1], "--supported") == 0) {
         p2c_print_supported_range();
@@ -320,6 +397,7 @@ int main(int argc, char *argv[]) {
     bool want_comments = false;
     bool want_strict_c11 = false;
     bool want_fallback = false;   /* 未対応構文をランタイムスタブへ置換 */
+    bool want_unbox = false;      /* int 型付きローカル（AOT アンボクシング）を生成 */
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-o") == 0) {
             if (i + 1 >= argc) {
@@ -343,9 +421,13 @@ int main(int argc, char *argv[]) {
             /* 未対応構文でも変換・ビルドを失敗させない（実行時に
              * NotImplementedError を送出するスタブを生成する）。 */
             want_fallback = true;
+        } else if (strcmp(argv[i], "--unbox") == 0) {
+            /* AOT アンボクシング: int しか入らないローカルを int64_t で扱う。 */
+            want_unbox = true;
         } else if (argv[i][0] == '-') {
             fprintf(stderr, "Error: unknown option '%s'\n", argv[i]);
-            return 1;
+            print_help_hint(argv[0]);
+            return 2;
         } else {
             input_path = argv[i];
         }
@@ -359,6 +441,8 @@ int main(int argc, char *argv[]) {
     char *code = read_text_file(input_path);
     if (!code) {
         fprintf(stderr, "Error: cannot read file '%s'\n", input_path);
+        fprintf(stderr, "  （ファイル名の綴りと、カレントディレクトリからの相対パスを確認してください）\n");
+        print_help_hint(argv[0]);
         return 1;
     }
 
@@ -367,6 +451,7 @@ int main(int argc, char *argv[]) {
     tr_opts.debug_comments = want_comments;
     tr_opts.strict_c11 = want_strict_c11;
     tr_opts.fallback_unsupported = want_fallback;
+    tr_opts.unbox_int_locals = want_unbox;
     tr_opts.embed_entry = embed_entry;
     P2C_Result r = python_to_c(code, &tr_opts, &c_code);
     free(code);

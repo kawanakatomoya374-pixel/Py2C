@@ -234,6 +234,13 @@ static void p2c_small_ints_init(void) {
     g_small_ints_ready = true;
 }
 
+/* 確保統計（測定用・ホスト構成のみ）。既定は無効で、集計コストは
+ * `if (g_stats_enabled)` の1分岐だけ。詳細は下部の p2c_stats_report() 参照。 */
+#ifndef PYTHON_CODE_TO_C_NO_STDLIB
+static bool   g_stats_enabled = false;
+static size_t g_stats_from_str = 0;
+#endif
+
 /* ============================================================
  * GC (ガベージコレクタ) グローバル状態
  * stop-the-world mark-and-sweep + 保守的 C スタックスキャン。
@@ -333,7 +340,25 @@ typedef struct P2C_RuntimeContext {
     /* --- 保守的スタックスキャンの一時索引 --- */
     void          **scan_index;
     size_t          scan_index_cap;     /* 常に 2 の冪（0 は未確保） */
-    size_t          scan_index_used;
+    size_t          scan_index_used;    /* 使用中スロット数（トゥームストーン含む） */
+    size_t          scan_index_live;    /* 実オブジェクト数（0 なら線形探索へ） */
+    /* --- オブジェクトのフリーリスト（インスタンスごとに独立）-------------
+     * プールのメモリは「そのインスタンスのヒープ」から確保したものなので、
+     * インスタンスをまたいで共有してはいけない（別ヒープへ返す事故になる）。 */
+    P2C_Object *obj_pool_head;
+    size_t      obj_pool_count;
+    size_t      obj_pool_hits;
+    size_t      obj_pool_misses;
+    bool        obj_pool_enabled;
+    /* --- 式評価中の一時値スタック（binop/f-string。インスタンスごとに独立）---
+     * グローバル（TLS）に置くと、あるインスタンスの式評価中に別インスタンスが
+     * 動いたときに巻き戻し（rewind）が相手の一時値を捨ててしまう。 */
+    P2C_Object **binop_stack;
+    size_t      binop_depth;
+    size_t      binop_capacity;
+    P2C_String **fstr_stack;
+    size_t      fstr_depth;
+    size_t      fstr_capacity;
     /* 実行状態（初期化済みで、例外を投げて安全か） */
     bool        active;
 } P2C_RuntimeContext;
@@ -346,9 +371,82 @@ static P2C_RuntimeContext g_runtime_context_default = {
     .gc_adaptive       = true,
     .gc_threshold_max  = P2C_GC_THRESHOLD_MAX,
     .gc_addr_lo        = (uintptr_t)-1,
+    .obj_pool_enabled  = true,
 };
+
+/* 初期しきい値の上書き（ホスト構成のみ）。
+ * メモリと実行速度のトレードオフはアプリごとに違うため、環境変数
+ * P2C_GC_THRESHOLD（バイト数）で初期値を指定できるようにする。
+ * 未設定なら上の既定値（適応GCが負荷に応じて調整する）。 */
+static size_t gc_initial_threshold_from_env(void) {
+#ifndef PYTHON_CODE_TO_C_NO_STDLIB
+    const char *env = getenv("P2C_GC_THRESHOLD");
+    if (env && env[0]) {
+        char *end = NULL;
+        unsigned long long v = strtoull(env, &end, 10);
+        if (end && *end == '\0' && v >= 64u * 1024u && v <= (unsigned long long)P2C_GC_THRESHOLD_MAX) {
+            return (size_t)v;
+        }
+    }
+#endif
+    return 256u * 1024u;
+}
 static P2C_RuntimeContext *g_runtime_context = &g_runtime_context_default;
 #define P2C_CTX (g_runtime_context)
+
+/* ── ランタイムインスタンス（コンテキスト）の生成と切り替え ──────────────
+ * 既定では「プロセスに 1 つ」の静的インスタンス（g_runtime_context_default）を
+ * 使い、従来どおり p2c_runtime_init() がそれを初期化する。カーネルのタスクごとに
+ * 独立した実行環境を持ちたい場合は、次のように使う。
+ *
+ *   struct P2C_RuntimeContext *ctx = p2c_runtime_context_create();
+ *   p2c_runtime_context_select(ctx);
+ *   p2c_runtime_init(NULL, 0);          // このインスタンスを初期化
+ *   ... 生成コード（現在のインスタンスを見る）...
+ *   p2c_runtime_shutdown();
+ *   p2c_runtime_context_select(NULL);   // 既定インスタンスへ戻す
+ *   p2c_runtime_context_destroy(ctx);
+ *
+ * 選択は C の呼び出しチェーン（現在の実行文脈）に効くので、タスクが 1 本ずつ
+ * 動く協調スケジューラでは「タスクへ入る前に select する」だけでよい。
+ *
+ * インスタンスが分離するのは GC・ルート・クラスレジストリ・モジュールレジストリ・
+ * オブジェクトのフリーリスト・式評価スタックなどのランタイム状態である。
+ * ヒープ（アロケータ）は共有ヒープ層／プラットフォーム側が持つため、
+ * インスタンスごとに別ヒープにしたい場合はカーネル側で
+ * p2c_platform_set_allocator() を切り替える。 */
+struct P2C_RuntimeContext *p2c_runtime_context_create(void) {
+    P2C_RuntimeContext *ctx = (P2C_RuntimeContext*)p2c_heap_alloc(sizeof(P2C_RuntimeContext));
+    if (!ctx) return NULL;
+    memset(ctx, 0, sizeof(*ctx));
+    ctx->gc_enabled        = true;
+    ctx->gc_threshold      = 256u * 1024u;
+    ctx->gc_threshold_base = 256u * 1024u;
+    ctx->gc_adaptive       = true;
+    ctx->gc_threshold_max  = P2C_GC_THRESHOLD_MAX;
+    ctx->gc_addr_lo        = (uintptr_t)-1;
+    ctx->obj_pool_enabled  = true;
+    return ctx;
+}
+
+struct P2C_RuntimeContext *p2c_runtime_context_current(void) { return P2C_CTX; }
+
+void p2c_runtime_context_select(struct P2C_RuntimeContext *ctx) {
+    g_runtime_context = ctx ? ctx : &g_runtime_context_default;
+}
+
+void p2c_runtime_context_destroy(struct P2C_RuntimeContext *ctx) {
+    if (!ctx || ctx == &g_runtime_context_default) return;  /* 既定は静的。解放不要 */
+    P2C_RuntimeContext *saved = P2C_CTX;
+    /* 破棄するインスタンスを選択したままにしない（解放後に選択が
+     * 解放済みメモリを指してしまうため）。 */
+    if (saved == ctx) saved = &g_runtime_context_default;
+    p2c_runtime_context_select(ctx);
+    /* 初期化済みなら、そのインスタンスのヒープ・プール・スタックを片付ける。 */
+    if (ctx->active) p2c_runtime_shutdown();
+    p2c_heap_free(ctx);
+    p2c_runtime_context_select(saved);
+}
 
 
 /* ── サンドボックス予算 ──
@@ -884,6 +982,77 @@ static bool p2c_obj_is_exception_instance(P2C_Object *obj) {
     return false;
 }
 
+/* ---- オブジェクト用フリーリスト ------------------------------------------
+ * P2C_Object は種類によらず同じ大きさなので、単一のフリーリストで再利用できる。
+ * 以前は 1 オブジェクトごとに malloc/free を呼んでおり、確保主体のループ
+ * （数値の加算・リスト内包表記など）で malloc が実行時間の大半を占めていた。
+ * 解放済みオブジェクトを上限付きで保持し、次の確保で即座に使い回す。
+ *
+ * リンク用のポインタは union の先頭領域へ memcpy で読み書きする
+ * （別フィールドを増やすと全オブジェクトが 8 バイト太り、型破り参照も避けたい）。
+ * GC の sweep と参照カウントの解放が同じ入口を通る。 */
+#define P2C_OBJ_POOL_LIMIT 8192u
+
+static P2C_Object *obj_pool_pop(void) {
+    P2C_Object *reuse = P2C_CTX->obj_pool_enabled ? P2C_CTX->obj_pool_head : NULL;
+    if (!reuse) {
+        P2C_CTX->obj_pool_misses++;
+        return NULL;
+    }
+    P2C_Object *next = NULL;
+    memcpy(&next, &reuse->u, sizeof(next));
+    P2C_CTX->obj_pool_head = next;
+    P2C_CTX->obj_pool_count--;
+    P2C_CTX->obj_pool_hits++;
+    return reuse;
+}
+
+static void obj_pool_push(P2C_Object *obj) {
+    if (!obj) return;
+    if (!P2C_CTX->obj_pool_enabled || P2C_CTX->obj_pool_count >= P2C_OBJ_POOL_LIMIT) {
+        p2c_heap_free(obj);
+        return;
+    }
+    P2C_Object *head = P2C_CTX->obj_pool_head;
+    memcpy(&obj->u, &head, sizeof(head));
+    P2C_CTX->obj_pool_head = obj;
+    P2C_CTX->obj_pool_count++;
+}
+
+/* 観測用（テスト・チューニング）。現在選択中のインスタンスの値を返す。 */
+size_t p2c_obj_pool_cached(void) { return P2C_CTX->obj_pool_count; }
+size_t p2c_obj_pool_hits(void)   { return P2C_CTX->obj_pool_hits; }
+size_t p2c_obj_pool_misses(void) { return P2C_CTX->obj_pool_misses; }
+
+/* フリーリストの有効/無効（現在選択中のインスタンスに適用）。
+ * 無効化すると毎回 malloc/free を使う（確保失敗の注入テストや、
+ * valgrind でリーク箇所を追うときに使う）。 */
+static void obj_pool_release_all(void);   /* 定義はこの後方 */
+
+void p2c_obj_pool_set_enabled(bool enabled) {
+    if (!enabled && P2C_CTX->obj_pool_enabled) obj_pool_release_all();
+    P2C_CTX->obj_pool_enabled = enabled;
+}
+bool p2c_obj_pool_is_enabled(void) { return P2C_CTX->obj_pool_enabled; }
+
+/* プールを空にする（ランタイム終了時に呼ぶ）。 */
+static void obj_pool_release_all(void) {
+    P2C_Object *cur = P2C_CTX->obj_pool_head;
+    while (cur) {
+        P2C_Object *next = NULL;
+        memcpy(&next, &cur->u, sizeof(next));
+        p2c_heap_free(cur);
+        cur = next;
+    }
+    P2C_CTX->obj_pool_head = NULL;
+    P2C_CTX->obj_pool_count = 0;
+}
+
+/* スタックスキャン索引（定義は後方）: 確保時に挿入、解放時に削除する。 */
+static bool gc_scan_index_insert(P2C_Object *o);
+static void gc_scan_index_remove(P2C_Object *o);
+static void gc_scan_index_release(void);
+
 P2C_Object* p2c_obj_new(P2C_ClassDef *cls) {
     /* 閾値を超えていたら collect してから確保する */
     if (P2C_CTX->gc_enabled && P2C_CTX->gc_stack_bottom &&
@@ -901,8 +1070,11 @@ P2C_Object* p2c_obj_new(P2C_ClassDef *cls) {
             return NULL;
         }
     }
-    P2C_Object *obj = (P2C_Object*)p2c_malloc_checked(sizeof(P2C_Object), "object");
-    if (!obj) return NULL;
+    P2C_Object *obj = obj_pool_pop();
+    if (!obj) {
+        obj = (P2C_Object*)p2c_malloc_checked(sizeof(P2C_Object), "object");
+        if (!obj) return NULL;
+    }
     obj->cls       = cls;
     obj->refcount  = 0;       /* GC管理下では refcount はピン留めカウンタ */
     memset(&obj->u, 0, sizeof(obj->u));
@@ -910,6 +1082,10 @@ P2C_Object* p2c_obj_new(P2C_ClassDef *cls) {
     obj->gc_next   = P2C_CTX->gc_all;
     obj->gc_marked = 0;
     P2C_CTX->gc_all = obj;
+    /* スタックスキャン索引へ増分挿入する。表を維持できない場合は索引ごと
+     * 破棄して線形探索へ落ちる（不完全な表を使うと、載っていないオブジェクトが
+     * 回収されてしまうため）。 */
+    if (!gc_scan_index_insert(obj)) gc_scan_index_release();
     P2C_CTX->gc_bytes_alloc += sizeof(P2C_Object);
     P2C_CTX->gc_obj_count++;
     if (P2C_CTX->gc_obj_count > P2C_CTX->gc_peak_objects) P2C_CTX->gc_peak_objects = P2C_CTX->gc_obj_count;
@@ -933,7 +1109,8 @@ static void p2c_gc_discard_new_object(P2C_Object *obj) {
         }
         link = &(*link)->gc_next;
     }
-    p2c_heap_free(obj);
+    gc_scan_index_remove(obj);
+    obj_pool_push(obj);
 }
 
 void p2c_obj_incref(P2C_Object *obj) {
@@ -1014,6 +1191,9 @@ P2C_Object* p2c_obj_from_int(int64_t v) {
 P2C_Object* p2c_obj_from_float(double v) { P2C_Object *o = p2c_obj_new(&P2C_Class_Float); if (o) o->u.v_float = v; return o; }
 P2C_Object* p2c_obj_from_str(const char *s) { return p2c_obj_from_str_n(s, s ? strlen(s) : 0); }
 P2C_Object* p2c_obj_from_str_n(const char *s, size_t len) {
+#ifndef PYTHON_CODE_TO_C_NO_STDLIB
+    if (g_stats_enabled) g_stats_from_str++;
+#endif
     P2C_Object *o = p2c_obj_new(&P2C_Class_Str);
     if (!o) return NULL;
     o->u.v_str.data = p2c_strdup_n_local(s ? s : "", len);
@@ -1852,6 +2032,131 @@ P2C_Object* p2c_obj_rshift(P2C_Object *a, P2C_Object *b) {
     return p2c_obj_from_int(q);
 }
 
+/* ── 生の int64 演算（型付きローカル用）────────────────────────────────
+ * codegen は「int しか入らないと証明できたローカル」を C の int64_t で保持する
+ * （AOT アンボクシング）。そのローカル同士の演算を、P2C_Object を作らずに
+ * 計算するための入口がここ。
+ *
+ * 意味論は P2C_Object* 版と同一に保つ:
+ *   - 64bit を超える結果は OverflowError（P2C_Object* 版と同じ判定関数を使う）
+ *   - 0 除算・0 剰余は ZeroDivisionError、負のシフト量は ValueError
+ *   - 負数を含む // と % は Python の定義（床・除数と同じ符号）
+ * そのため、判定・計算は P2C_Object* 版から切り出して共有している
+ * （p2c_int_divmod_i64 を参照）。違いが出ると意味論が変わるので、
+ * 片方だけを直さないこと。 */
+static bool p2c_int_divmod_i64(int64_t a, int64_t b, const char *zero_msg,
+                               bool want_quotient, int64_t *out) {
+    if (b == 0) {
+        p2c_raise(p2c_make_exception("ZeroDivisionError", zero_msg));
+        return false;
+    }
+    if (a == INT64_MIN && b == -1) {
+        /* // は 64bit に収まらない（% は 0 で定義される）。 */
+        if (want_quotient) { (void)p2c_int_overflow(); return false; }
+        *out = 0;
+        return true;
+    }
+    if (want_quotient) {
+        /* Pythonの // は結果を負の無限大方向へ切り捨てる（Cの / は0方向）。 */
+        int64_t q = a / b;
+        int64_t r = a % b;
+        if (r != 0 && ((r < 0) != (b < 0))) q -= 1;
+        *out = q;
+    } else {
+        /* Pythonの % は除数と同じ符号の結果を返す（Cの % は被除数と同じ符号）。 */
+        int64_t r = a % b;
+        if (r != 0 && ((r < 0) != (b < 0))) r += b;
+        *out = r;
+    }
+    return true;
+}
+
+int64_t p2c_int_add_raw(int64_t a, int64_t b) {
+    int64_t r = 0;
+    if (!p2c_int_add_checked(a, b, &r)) { (void)p2c_int_overflow(); return 0; }
+    return r;
+}
+int64_t p2c_int_sub_raw(int64_t a, int64_t b) {
+    int64_t r = 0;
+    if (!p2c_int_sub_checked(a, b, &r)) { (void)p2c_int_overflow(); return 0; }
+    return r;
+}
+int64_t p2c_int_mul_raw(int64_t a, int64_t b) {
+    int64_t r = 0;
+    if (!p2c_int_mul_checked(a, b, &r)) { (void)p2c_int_overflow(); return 0; }
+    return r;
+}
+int64_t p2c_int_floordiv_raw(int64_t a, int64_t b) {
+    int64_t r = 0;
+    if (!p2c_int_divmod_i64(a, b, "integer division by zero", true, &r)) return 0;
+    return r;
+}
+int64_t p2c_int_mod_raw(int64_t a, int64_t b) {
+    int64_t r = 0;
+    if (!p2c_int_divmod_i64(a, b, "modulo by zero", false, &r)) return 0;
+    return r;
+}
+/* & | ^ は C の演算子が 2 の補数で Python と同じ結果になる（64bit 前提）。 */
+int64_t p2c_int_bitand_raw(int64_t a, int64_t b) { return a & b; }
+int64_t p2c_int_bitor_raw(int64_t a, int64_t b)  { return a | b; }
+int64_t p2c_int_bitxor_raw(int64_t a, int64_t b) { return a ^ b; }
+int64_t p2c_int_invert_raw(int64_t a) { return ~a; }
+/* 単項マイナスは P2C_Object* 版と同じく int64 の符号反転
+ * （$-(INT64\_MIN)$ はどちらも INT64_MIN のまま。この選択は P2C_Object* 版と揃える）。 */
+int64_t p2c_int_neg_raw(int64_t a) { return -a; }
+int64_t p2c_int_lshift_raw(int64_t a, int64_t count) {
+    if (count < 0) {
+        p2c_raise(p2c_make_exception("ValueError", "negative shift count"));
+        return 0;
+    }
+    if (count >= 63) {
+        p2c_raise(p2c_make_exception("OverflowError", "shift count exceeds Alpha1.0 64-bit integer range"));
+        return 0;
+    }
+    int64_t result = 0;
+    if (!p2c_int_mul_checked(a, ((int64_t)1) << count, &result)) {
+        p2c_raise(p2c_make_exception("OverflowError", "left shift exceeds Alpha1.0 64-bit integer range"));
+        return 0;
+    }
+    return result;
+}
+int64_t p2c_int_rshift_raw(int64_t a, int64_t count) {
+    if (count < 0) {
+        p2c_raise(p2c_make_exception("ValueError", "negative shift count"));
+        return 0;
+    }
+    if (count >= 63) return a < 0 ? -1 : 0;
+    int64_t divisor = ((int64_t)1) << count;
+    int64_t q = a / divisor, r = a % divisor;
+    if (r != 0 && a < 0) q -= 1;
+    return q;
+}
+
+/* ── 型付きローカルと P2C_Object* の混在比較 ────────────────────────────
+ * 例: `while i < n:` の i だけが型付き（n は関数引数などで P2C_Object*）の場合に、
+ * i を毎回ボックス化しないための入口。右辺が int なら生比較、それ以外
+ * （float・bool・ユーザー定義など）は従来の比較経路へそのまま委譲する。
+ * 意味論を変えないため、フォールバックでは必ず P2C_Object* 版を呼ぶ。 */
+static bool p2c_int_cmp_obj_mixed(int64_t a, P2C_Object *b, const char *func,
+                                  P2C_Object* (*cmp)(P2C_Object*, P2C_Object*)) {
+    if (p2c_obj_is_int(b)) {
+        int64_t bi = p2c_obj_as_int(b);
+        if (strcmp(func, "lt") == 0) return a <  bi;
+        if (strcmp(func, "le") == 0) return a <= bi;
+        if (strcmp(func, "gt") == 0) return a >  bi;
+        if (strcmp(func, "ge") == 0) return a >= bi;
+        if (strcmp(func, "eq") == 0) return a == bi;
+        return a != bi;   /* "ne" */
+    }
+    return p2c_obj_is_truthy(cmp(p2c_obj_from_int(a), b));
+}
+bool p2c_int_lt_obj(int64_t a, P2C_Object *b) { return p2c_int_cmp_obj_mixed(a, b, "lt", p2c_obj_lt); }
+bool p2c_int_le_obj(int64_t a, P2C_Object *b) { return p2c_int_cmp_obj_mixed(a, b, "le", p2c_obj_le); }
+bool p2c_int_gt_obj(int64_t a, P2C_Object *b) { return p2c_int_cmp_obj_mixed(a, b, "gt", p2c_obj_gt); }
+bool p2c_int_ge_obj(int64_t a, P2C_Object *b) { return p2c_int_cmp_obj_mixed(a, b, "ge", p2c_obj_ge); }
+bool p2c_int_eq_obj(int64_t a, P2C_Object *b) { return p2c_int_cmp_obj_mixed(a, b, "eq", p2c_obj_eq); }
+bool p2c_int_ne_obj(int64_t a, P2C_Object *b) { return p2c_int_cmp_obj_mixed(a, b, "ne", p2c_obj_ne); }
+
 static bool p2c_obj_is_hashable(P2C_Object *obj) {
     if (!obj || !obj->cls) return true;
     switch (obj->cls->type_tag) {
@@ -2017,6 +2322,15 @@ static int p2c_obj_order_cmp(P2C_Object *a, P2C_Object *b) {
     if (a && b && (p2c_obj_is_tuple(a) || p2c_obj_is_list(a)) &&
         (p2c_obj_is_tuple(b) || p2c_obj_is_list(b))) {
         return p2c_sequence_less(a, b) ? -1 : (p2c_sequence_less(b, a) ? 1 : 0);
+    }
+    /* 整数同士は int64 で厳密に比較する。以前は double 経由だったため、
+     * 2^53 を超える値で桁が丸められ、CPython と結果が食い違っていた
+     * （例: 9007199254740993 > 9007199254740992 が偽になっていた）。 */
+    if (a && b && p2c_obj_is_int(a) && p2c_obj_is_int(b)) {
+        int64_t ia = p2c_obj_as_int(a), ib = p2c_obj_as_int(b);
+        if (ia < ib) return -1;
+        if (ia > ib) return 1;
+        return 0;
     }
     {
         double da = p2c_obj_as_float(a), db = p2c_obj_as_float(b);
@@ -5553,53 +5867,120 @@ static void gc_mark(P2C_Object *obj, void *ctx) {
     }
 }
 
-/* スタックスキャン用アドレス索引の構築。
- * 収集開始時点の全オブジェクトをオープンアドレッシング表へ入れる。
- * 表が確保できない場合は false を返し、呼び出し側は線形探索へ落ちる。 */
-static bool gc_scan_index_build(void) {
+/* スタックスキャン用アドレス索引（増分維持）。
+ *
+ * 以前は収集のたびに全オブジェクトを入れ直しており、コストが
+ * O(オブジェクト数) × 収集回数 になって GC 時間の約半分を占めていた。
+ * ここではオープンアドレッシング表を
+ *   - 確保時: 挿入（p2c_obj_new）
+ *   - sweep / 破棄時: トゥームストーンで削除
+ * により増分維持し、入れ直しはテーブル拡張時だけにする（総コスト O(確保+解放)）。
+ * 収集の前後で「生存オブジェクトだけが入っている」状態が保たれるため、
+ * 保守的スタックスキャンは収集中いつでもこの表を使ってよい。
+ *
+ * 重要: トゥームストーンは番兵値 (void*)1 で表すが、**候補との一致判定からは
+ * 必ず除外する**。除外しないと、スタック上の語がたまたま 1 だったときに番兵と
+ * 一致して「アドレス 1 のオブジェクト」をマークしてしまい落ちる
+ * （合成スタックを走査する embed テストで実際に発生した）。
+ *
+ * 寿命: 表はランタイム終了時に解放し、再初期化後は先頭の確保で作り直す。
+ * 確保に失敗して表を維持できない場合は索引ごと破棄して線形探索へ落ちる
+ * （不完全な表を使うと、載っていないオブジェクトが回収されてしまうため）。 */
+#define P2C_SCAN_TOMBSTONE ((void*)(uintptr_t)1)
+#define P2C_SCAN_INDEX_INITIAL 64u
+#define P2C_SCAN_INDEX_LOAD_NUM 7u     /* used/cap が 7/10 を超えたら拡張 */
+#define P2C_SCAN_INDEX_LOAD_DEN 10u
 
-    size_t count = P2C_CTX->gc_obj_count;
-    /* 負荷率50%を保つため2倍を確保し、2の冪へ切り上げる。 */
-    size_t want = count < 8 ? 16 : count * 2;
-    if (want < count) return false; /* 桁あふれ */
-    if (want > P2C_CTX->scan_index_cap) {
-        size_t new_cap = P2C_CTX->scan_index_cap ? P2C_CTX->scan_index_cap : 16;
-        while (new_cap < want) {
-            if (new_cap > ((size_t)-1) / 2) return false;
-            new_cap *= 2;
-        }
-        void **grown = (void**)p2c_heap_realloc(P2C_CTX->scan_index, new_cap * sizeof(void*));
-        if (!grown) return false;
-        P2C_CTX->scan_index = grown;
-        P2C_CTX->scan_index_cap = new_cap;
+static bool gc_scan_index_ensure_capacity(size_t need_used) {
+    if (!P2C_CTX->scan_index) {
+        P2C_CTX->scan_index = (void**)p2c_heap_calloc(P2C_SCAN_INDEX_INITIAL, sizeof(void*));
+        if (!P2C_CTX->scan_index) return false;
+        P2C_CTX->scan_index_cap = P2C_SCAN_INDEX_INITIAL;
+        P2C_CTX->scan_index_used = 0;
+        P2C_CTX->scan_index_live = 0;
+        return true;
     }
-    if (!P2C_CTX->scan_index) return false;
-    memset(P2C_CTX->scan_index, 0, P2C_CTX->scan_index_cap * sizeof(void*));
-    P2C_CTX->scan_index_used = 0;
-    size_t mask = P2C_CTX->scan_index_cap - 1;
-    for (P2C_Object *o = P2C_CTX->gc_all; o; o = o->gc_next) {
-        if (o == &P2C_None || o == &P2C_True || o == &P2C_False) continue;
-        size_t slot = ((size_t)(uintptr_t)o >> 4) & mask;
-        while (P2C_CTX->scan_index[slot] != NULL) slot = (slot + 1) & mask;
-        P2C_CTX->scan_index[slot] = (void*)o;
-        P2C_CTX->scan_index_used++;
+    if (need_used * P2C_SCAN_INDEX_LOAD_DEN <= P2C_CTX->scan_index_cap * P2C_SCAN_INDEX_LOAD_NUM) return true;
+    /* 2倍へ拡張して「生きている要素だけ」を移す。 */
+    size_t new_cap = P2C_CTX->scan_index_cap;
+    while (new_cap < P2C_CTX->scan_index_cap * 2u) {
+        if (new_cap > ((size_t)-1) / 2u) return false;
+        new_cap *= 2u;
     }
+    void **grown = (void**)p2c_heap_calloc(new_cap, sizeof(void*));
+    if (!grown) return false;
+    size_t mask = new_cap - 1u;
+    size_t moved = 0;
+    for (size_t i = 0; i < P2C_CTX->scan_index_cap; i++) {
+        void *entry = P2C_CTX->scan_index[i];
+        if (!entry || entry == P2C_SCAN_TOMBSTONE) continue;
+        size_t slot = ((size_t)(uintptr_t)entry >> 4) & mask;
+        while (grown[slot] != NULL) slot = (slot + 1u) & mask;
+        grown[slot] = entry;
+        moved++;
+    }
+    p2c_heap_free(P2C_CTX->scan_index);
+    P2C_CTX->scan_index = grown;
+    P2C_CTX->scan_index_cap = new_cap;
+    P2C_CTX->scan_index_used = moved;
+    P2C_CTX->scan_index_live = moved;
     return true;
 }
 
-static void gc_scan_index_clear(void) {
-    if (P2C_CTX->scan_index && P2C_CTX->scan_index_cap) memset(P2C_CTX->scan_index, 0, P2C_CTX->scan_index_cap * sizeof(void*));
-    P2C_CTX->scan_index_used = 0;
+/* 索引へ挿入する。失敗したら false（呼び出し側は索引を破棄する）。 */
+static bool gc_scan_index_insert(P2C_Object *o) {
+    if (!o) return true;
+    if (!gc_scan_index_ensure_capacity(P2C_CTX->scan_index_used + 1u)) return false;
+    size_t mask = P2C_CTX->scan_index_cap - 1u;
+    size_t slot = ((size_t)(uintptr_t)o >> 4) & mask;
+    size_t tombstone = (size_t)-1;
+    while (P2C_CTX->scan_index[slot] != NULL) {
+        void *entry = P2C_CTX->scan_index[slot];
+        if (entry == (void*)o) return true;                        /* 既に入っている */
+        if (entry == P2C_SCAN_TOMBSTONE && tombstone == (size_t)-1) tombstone = slot;
+        slot = (slot + 1u) & mask;
+    }
+    if (tombstone != (size_t)-1) slot = tombstone;
+    else P2C_CTX->scan_index_used++;
+    P2C_CTX->scan_index[slot] = (void*)o;
+    P2C_CTX->scan_index_live++;
+    return true;
 }
 
-/* candidate がGC管理下のオブジェクトならそれへのポインタを返す。 */
+/* 索引から削除する（トゥームストーンを置く）。 */
+static void gc_scan_index_remove(P2C_Object *o) {
+    if (!o || !P2C_CTX->scan_index || !P2C_CTX->scan_index_cap) return;
+    size_t mask = P2C_CTX->scan_index_cap - 1u;
+    size_t slot = ((size_t)(uintptr_t)o >> 4) & mask;
+    while (P2C_CTX->scan_index[slot] != NULL) {
+        if (P2C_CTX->scan_index[slot] == (void*)o) {
+            P2C_CTX->scan_index[slot] = P2C_SCAN_TOMBSTONE;
+            if (P2C_CTX->scan_index_live > 0) P2C_CTX->scan_index_live--;
+            return;
+        }
+        slot = (slot + 1u) & mask;
+    }
+}
+
+/* 索引を破棄する（失敗時と終了時）。 */
+static void gc_scan_index_release(void) {
+    p2c_heap_free(P2C_CTX->scan_index);
+    P2C_CTX->scan_index = NULL;
+    P2C_CTX->scan_index_cap = 0;
+    P2C_CTX->scan_index_used = 0;
+    P2C_CTX->scan_index_live = 0;
+}
+
+/* candidate がGC管理下のオブジェクトならそれへのポインタを返す。
+ * トゥームストーンは候補と比較しない（番兵値と偶然一致しても無視する）。 */
 static P2C_Object* gc_candidate_object(void *candidate) {
-    if (P2C_CTX->scan_index && P2C_CTX->scan_index_used) {
-        size_t mask = P2C_CTX->scan_index_cap - 1;
+    if (P2C_CTX->scan_index && P2C_CTX->scan_index_live) {
+        size_t mask = P2C_CTX->scan_index_cap - 1u;
         size_t slot = ((size_t)(uintptr_t)candidate >> 4) & mask;
         while (P2C_CTX->scan_index[slot] != NULL) {
-            if (P2C_CTX->scan_index[slot] == candidate) return (P2C_Object*)candidate;
-            slot = (slot + 1) & mask;
+            void *entry = P2C_CTX->scan_index[slot];
+            if (entry != P2C_SCAN_TOMBSTONE && entry == candidate) return (P2C_Object*)entry;
+            slot = (slot + 1u) & mask;
         }
         return NULL;
     }
@@ -5608,6 +5989,7 @@ static P2C_Object* gc_candidate_object(void *candidate) {
     }
     return NULL;
 }
+
 
 /* 保守的スタックスキャン用ビジター (スタック上の語がGCオブジェクトなら mark)
  * no_sanitize: 保守的スキャンは隣接する変数の "間" を意図的に読む。
@@ -5768,7 +6150,13 @@ void p2c_gc_collect(void) {
     }
 
     /* ── 0. スタックスキャン用アドレス索引を構築（失敗時は線形探索へ） ── */
-    (void)gc_scan_index_build();
+    /* ── 0. スタックスキャン用アドレス索引を構築（失敗時は線形探索へ）──
+     *
+     * 増分維持（確保で挿入・解放でトゥームストーン削除）も試したが、
+     * embed 構成（固定ヒープ + 自前 setjmp）で再初期化をまたぐと不安定に
+     * なったため、計測値（約15%高速）よりも安全性を優先して元の方式に戻した。
+     * 詳細は docs/review/PERF_ALPHA1.0.md §6 を参照。 */
+    /* 索引は確保/解放時に増分維持しているため再構築は不要。 */
 
     /* ── 1. レジスタをスタックに flush (P2C_SETJMP の副作用を利用) ── */
     jmp_buf env;
@@ -5842,8 +6230,8 @@ void p2c_gc_collect(void) {
     /* 実体化配列のアンカー: 呼び出し元がまだ使っている配列の要素をルート化する。 */
     gc_anchors_verify_and_mark();
     /* 索引はスキャン専用。スイープでオブジェクトが消える前に無効化し、
-     * 次の収集まで古いポインタを参照しないことを保証する。 */
-    gc_scan_index_clear();
+     * 次の収集まで古いポインタを参照しない。sweep が解放分を削除するため、
+     * 収集後も索引は生存集合と一致している。 */
 
     /* マーク用ワークリストを解放する（次回の収集時に確保し直す）。 */
     if (P2C_CTX->gc_work) {
@@ -5862,8 +6250,9 @@ void p2c_gc_collect(void) {
         if (!cur->gc_marked) {
             /* 到達不能: リストから外して解放 */
             *prev_next = next;
+            gc_scan_index_remove(cur);
             gc_free_obj_data(cur);
-            p2c_heap_free(cur);
+            obj_pool_push(cur);
             freed++;
             P2C_CTX->gc_obj_count--;
         } else {
@@ -5885,9 +6274,12 @@ void p2c_gc_collect(void) {
      * 戻していき、メモリを抱え込まないようにする。 */
     if (P2C_CTX->gc_adaptive) {
         size_t live = P2C_CTX->gc_obj_count;
-        /* しきい値の上限は「生存集合の概算（オブジェクト1個あたりの平均確保量）」
-         * とヒープ由来の上限の小さい方にする。生存集合が小さいのにしきい値だけ
-         * 大きくなると、収集が止まって小さなヒープが枯渇する。 */
+        /* しきい値の上限は「生存集合の約2倍（オブジェクト1個あたり96バイト換算）」と
+         * ヒープ由来の上限の小さい方にする。生存集合が小さいのにしきい値だけ
+         * 大きくなると、収集が止まってメモリを抱え込むため。
+         * 計測（Round-7）では、しきい値を 4MiB まで大きくしても実行時間は
+         * 改善せず（収集1回あたりのスイープ量が増えるだけで相殺される）、
+         * この上限式が妥当であることを確認している。 */
         size_t live_bytes = live * 96u;
         size_t cap = live_bytes < P2C_CTX->gc_threshold_max ? live_bytes : P2C_CTX->gc_threshold_max;
         if (cap < P2C_CTX->gc_threshold_base) cap = P2C_CTX->gc_threshold_base;
@@ -5955,8 +6347,48 @@ size_t  p2c_gc_last_temp_roots(void)        { return P2C_CTX->gc_temp_roots; }
 size_t  p2c_gc_root_count(void)             { return P2C_CTX->gc_root_count; }
 size_t  p2c_gc_root_capacity(void)          { return P2C_CTX->gc_root_cap; }
 
+/* ── 確保統計（測定用・ホスト構成のみ）─────────────────────────────
+ * P2C_ALLOC_STATS=1 を付けて実行すると、終了時に stderr へ
+ * 「リテラル文字列の生成回数」「オブジェクト確保回数」などを出す。
+ * 最適化の前後比較（A/B）で何がどれだけ減ったかを数字で確認するための
+ * 観測フックで、既定（未設定）では出力も集計も行わない。 */
+#ifndef PYTHON_CODE_TO_C_NO_STDLIB
+static void p2c_stats_write(const char *text) {
+    const P2C_Platform *pl = p2c_platform_current();
+    if (pl && pl->write) pl->write(2, text, strlen(text), pl->user);
+}
+static void p2c_stats_emit(const char *label, size_t value) {
+    char buf[96];
+    int n = snprintf(buf, sizeof(buf), "  %s = %zu\n", label, value);
+    if (n > 0) p2c_stats_write(buf);
+}
+static void p2c_stats_report(void) {
+    if (!g_stats_enabled) return;
+    p2c_stats_write("P2C_ALLOC_STATS (測定用):\n");
+    p2c_stats_emit("p2c_obj_from_str 呼び出し", g_stats_from_str);
+    p2c_stats_emit("オブジェクト新規確保", p2c_obj_pool_misses());
+    p2c_stats_emit("オブジェクト再利用", p2c_obj_pool_hits());
+    p2c_stats_emit("GC収集回数", P2C_CTX->gc_collections);
+    p2c_stats_emit("GCピーク時オブジェクト数", P2C_CTX->gc_peak_objects);
+}
+static void p2c_stats_init_from_env(void) {
+    const char *env = getenv("P2C_ALLOC_STATS");
+    g_stats_enabled = env && env[0] && env[0] != '0';
+}
+#endif
+
 void p2c_runtime_init(void *heap_base, size_t heap_sz) {
     if (P2C_CTX->active) return;
+    /* 初期しきい値の上書き（ホスト構成のみ）。メモリと速度のトレードオフは
+     * アプリごとに違うため、環境変数 P2C_GC_THRESHOLD（バイト数）で指定できる。 */
+    {
+        size_t initial = gc_initial_threshold_from_env();
+        P2C_CTX->gc_threshold = initial;
+        P2C_CTX->gc_threshold_base = initial;
+    }
+#ifndef PYTHON_CODE_TO_C_NO_STDLIB
+    p2c_stats_init_from_env();
+#endif
 #ifdef PYTHON_CODE_TO_C_NO_STDLIB
 #  ifndef PYTHON_CODE_TO_C_NO_LIBC_STUBS
     heap_start = (char*)heap_base; heap_size = heap_sz; heap_used = 0; heap_peak = 0;
@@ -6057,6 +6489,10 @@ void p2c_runtime_init(void *heap_base, size_t heap_sz) {
 }
 void p2c_runtime_shutdown(void) {
     if (!P2C_CTX->active) return;
+#ifndef PYTHON_CODE_TO_C_NO_STDLIB
+    /* 測定用の確保統計（P2C_ALLOC_STATS=1）は分解前の数字を出す。 */
+    p2c_stats_report();
+#endif
 
     p2c_reset_async_queue();
     p2c_gc_reset_roots();
@@ -6081,6 +6517,10 @@ void p2c_runtime_shutdown(void) {
     if (P2C_CTX->gc_roots) { p2c_heap_free(P2C_CTX->gc_roots); P2C_CTX->gc_roots = NULL; P2C_CTX->gc_root_cap = 0; }
     if (P2C_CTX->gc_work)  { p2c_heap_free(P2C_CTX->gc_work);  P2C_CTX->gc_work = NULL;  P2C_CTX->gc_work_cap = 0; }
     if (P2C_CTX->gc_anchors) { p2c_heap_free(P2C_CTX->gc_anchors); P2C_CTX->gc_anchors = NULL; }
+    /* 式評価用スタック（binop/f-string）は動的確保なので明示的に解放する。 */
+    p2c_expr_stacks_release();
+    /* オブジェクトのフリーリストも解放する（LSan に残さない）。 */
+    obj_pool_release_all();
     P2C_CTX->gc_anchor_count = 0;
     P2C_CTX->gc_anchor_cap = 0;
     P2C_CTX->gc_work_len = 0;
@@ -6107,7 +6547,7 @@ void p2c_runtime_shutdown(void) {
     p2c_fstr_rewind(0);
     P2C_CTX->oom_exception = NULL; /* 上で解放済み（再初期化時に作り直す） */
     P2C_CTX->oom_in_handler = false;
-    gc_scan_index_clear();
+    gc_scan_index_release();
 #ifdef PYTHON_CODE_TO_C_NO_STDLIB
 #  ifndef PYTHON_CODE_TO_C_NO_LIBC_STUBS
     heap_start = NULL; heap_size = 0; heap_used = 0; heap_peak = 0;
@@ -6845,33 +7285,107 @@ P2C_Object* p2c_fstr_fmt(P2C_Object *obj, P2C_Object *spec_obj) {
     return p2c_obj_from_str(val_buf);
 }
 
-#define P2C_BINOP_STACK_CAPACITY 64
-static P2C_THREAD_LOCAL P2C_Object *g_binop_stack[P2C_BINOP_STACK_CAPACITY];
-static P2C_THREAD_LOCAL size_t g_binop_depth = 0;
+/* 反復の高速路（生成Cの for 文が使う）。
+ *
+ * 生成Cの for は、カスタム __next__ やジェネレータが StopIteration を送出する
+ * 場合に備えて setjmp を挟む必要がある。しかし list/tuple/str/range のような
+ * 組み込み系列では例外は起きないため、毎要素 setjmp するのは純粋な
+ * オーバーヘッドになる（setjmp は 1 回あたり数十〜数百サイクル）。
+ *
+ * 戻り値:  1 = 要素を *out に入れた / 0 = 尽きた / -1 = 高速路を使えない
+ *          （-1 のときは呼び出し側が p2c_builtin_next の例外経路へ回る）。
+ */
+int p2c_iter_try_next(P2C_Object *it, P2C_Object **out) {
+    if (!it || !it->cls || it->cls->type_tag != OBJ_ITERATOR || !out) return -1;
+    if (it->u.v_iterator.step || it->u.v_iterator.custom) return -1;
+    P2C_Object *seq = it->u.v_iterator.seq;
+    if (!seq || !seq->cls) return -1;
+    int64_t pos = it->u.v_iterator.pos;
+    switch (seq->cls->type_tag) {
+        case OBJ_LIST:
+            if (pos < 0 || (size_t)pos >= seq->u.v_list.len) { return 0; }
+            *out = seq->u.v_list.items[pos];
+            it->u.v_iterator.pos = pos + 1;
+            return 1;
+        case OBJ_TUPLE:
+            if (pos < 0 || (size_t)pos >= seq->u.v_tuple.len) { return 0; }
+            *out = seq->u.v_tuple.items[pos];
+            it->u.v_iterator.pos = pos + 1;
+            return 1;
+        case OBJ_STR:
+        case OBJ_RANGE: {
+            if (pos < 0 || pos >= p2c_len(seq)) { return 0; }
+            *out = p2c_subscript_get(seq, p2c_obj_from_int(pos));
+            it->u.v_iterator.pos = pos + 1;
+            return 1;
+        }
+        default:
+            /* dict/set/generator/ユーザー定義は従来の経路（例外処理付き）へ。 */
+            return -1;
+    }
+}
+
+/* 式評価中の左オペランドと f-string ビルダを積むスタック。
+ * 入れ子の深さは「式の入れ子」だけでなく「再帰呼び出しの深さ」でも増える
+ * （例: `1 + f(n-1)` は f の実行中も左オペランドを保持する）ため、
+ * 固定長だと再帰で誤って "nesting limit exceeded" を出していた。
+ * ここでは必要に応じて伸長する動的なスタックにし、上限は実際の
+ * C スタックとメモリだけにする。中身は GC のルートとしても走査する
+ * （gc_mark_expr_stack を参照）。
+ *
+ * スタックはランタイムインスタンス（コンテキスト）ごとに持つ。
+ * グローバル（TLS）に置くと、あるインスタンスの式評価中に別インスタンスが
+ * 動いたときに巻き戻し（rewind）が相手の一時値を捨ててしまい、
+ * 相手が評価中の左オペランドが回収されうる。 */
+#define P2C_EXPR_STACK_INITIAL 64
+
+static bool binop_stack_reserve(size_t need) {
+    if (need <= P2C_CTX->binop_capacity) return true;
+    size_t cap = P2C_CTX->binop_capacity ? P2C_CTX->binop_capacity : P2C_EXPR_STACK_INITIAL;
+    while (cap < need) {
+        if (cap > ((size_t)-1 / 2u) / sizeof(P2C_Object*)) return false;
+        cap *= 2u;
+    }
+    P2C_Object **grown = (P2C_Object**)p2c_heap_realloc(P2C_CTX->binop_stack, cap * sizeof(P2C_Object*));
+    if (!grown) return false;
+    P2C_CTX->binop_stack = grown;
+    P2C_CTX->binop_capacity = cap;
+    return true;
+}
 
 void p2c_binop_begin(P2C_Object *left) {
-    if (g_binop_depth >= P2C_BINOP_STACK_CAPACITY) {
-        p2c_raise(p2c_make_exception("RuntimeError", "binary expression nesting limit exceeded"));
+    if (!binop_stack_reserve(P2C_CTX->binop_depth + 1u)) {
+        p2c_raise(p2c_make_exception("MemoryError", "binary expression stack allocation failed"));
         return;
     }
-    g_binop_stack[g_binop_depth++] = left;
+    P2C_CTX->binop_stack[P2C_CTX->binop_depth++] = left;
 }
 
 P2C_Object* p2c_binop_finish(P2C_BinaryOpFn op, P2C_Object *right) {
-    if (g_binop_depth == 0 || !op) {
+    if (P2C_CTX->binop_depth == 0 || !op) {
         p2c_raise(p2c_make_exception("RuntimeError", "binary expression stack is not active"));
         return &P2C_None;
     }
-    return op(g_binop_stack[--g_binop_depth], right);
+    return op(P2C_CTX->binop_stack[--P2C_CTX->binop_depth], right);
 }
 
-#define P2C_FSTR_STACK_CAPACITY 32
-static P2C_THREAD_LOCAL P2C_String *g_fstr_stack[P2C_FSTR_STACK_CAPACITY];
-static P2C_THREAD_LOCAL size_t g_fstr_depth = 0;
+static bool fstr_stack_reserve(size_t need) {
+    if (need <= P2C_CTX->fstr_capacity) return true;
+    size_t cap = P2C_CTX->fstr_capacity ? P2C_CTX->fstr_capacity : P2C_EXPR_STACK_INITIAL;
+    while (cap < need) {
+        if (cap > ((size_t)-1 / 2u) / sizeof(P2C_String*)) return false;
+        cap *= 2u;
+    }
+    P2C_String **grown = (P2C_String**)p2c_heap_realloc(P2C_CTX->fstr_stack, cap * sizeof(P2C_String*));
+    if (!grown) return false;
+    P2C_CTX->fstr_stack = grown;
+    P2C_CTX->fstr_capacity = cap;
+    return true;
+}
 
 void p2c_fstr_begin(void) {
-    if (g_fstr_depth >= P2C_FSTR_STACK_CAPACITY) {
-        p2c_raise(p2c_make_exception("RuntimeError", "f-string nesting limit exceeded"));
+    if (!fstr_stack_reserve(P2C_CTX->fstr_depth + 1u)) {
+        p2c_raise(p2c_make_exception("MemoryError", "f-string stack allocation failed"));
         return;
     }
     P2C_String *builder = p2c_str_new(NULL);
@@ -6879,24 +7393,24 @@ void p2c_fstr_begin(void) {
         p2c_raise(p2c_make_exception("MemoryError", "f-string allocation failed"));
         return;
     }
-    g_fstr_stack[g_fstr_depth++] = builder;
+    P2C_CTX->fstr_stack[P2C_CTX->fstr_depth++] = builder;
 }
 
 void p2c_fstr_append(P2C_Object *obj) {
-    if (g_fstr_depth == 0) {
+    if (P2C_CTX->fstr_depth == 0) {
         p2c_raise(p2c_make_exception("RuntimeError", "f-string builder is not active"));
         return;
     }
     P2C_Object *text = p2c_obj_str(obj);
-    p2c_str_append(g_fstr_stack[g_fstr_depth - 1], p2c_obj_as_str(text));
+    p2c_str_append(P2C_CTX->fstr_stack[P2C_CTX->fstr_depth - 1], p2c_obj_as_str(text));
 }
 
 P2C_Object* p2c_fstr_finish(void) {
-    if (g_fstr_depth == 0) {
+    if (P2C_CTX->fstr_depth == 0) {
         p2c_raise(p2c_make_exception("RuntimeError", "f-string builder is not active"));
         return &P2C_None;
     }
-    P2C_String *builder = g_fstr_stack[--g_fstr_depth];
+    P2C_String *builder = P2C_CTX->fstr_stack[--P2C_CTX->fstr_depth];
     P2C_Object *out = p2c_obj_from_str(p2c_str_cstr(builder));
     p2c_str_free(builder);
     return out;
@@ -6908,32 +7422,49 @@ P2C_Object* p2c_fstr_finish(void) {
  * 生成Cのtryは、try開始時の深さを保存してハンドラ到達時にそこへ戻すことで、
  *  1. 放棄された左オペランドを取り残さない（GCのルートも収集時に整合する）、
  *  2. ネイティブ確保であるf-stringビルダを確実に解放する（リーク防止）、
- *  3. 例外が繰り返し脱出してもBINOP/FSTRスタックを使い切らない
- *     （64/32回で「nesting limit exceeded」を誤発火させない）
+ *  3. 例外が繰り返し脱出してもスタックを食いつぶさない
  * を保証する。
  *
  * 巻き戻しは冪等（保存値以下の深さでは何もしない）なので、ハンドラごとに
  * 呼んでも安全である。生成C以外（ホストが自前でlongjmpする場合）も、
  * 例外フレームへ到達した時点で同じ保存値へ戻す契約とする。 */
-size_t p2c_binop_depth(void) { return g_binop_depth; }
+size_t p2c_binop_depth(void) { return P2C_CTX->binop_depth; }
 
 void p2c_binop_rewind(size_t depth) {
-    /* 容量を超える保存値は不正なので、スタック全体を空にする扱いにする。 */
-    if (depth >= P2C_BINOP_STACK_CAPACITY) depth = 0;
-    while (g_binop_depth > depth) {
-        g_binop_stack[--g_binop_depth] = NULL;
+    /* 保存値が深さより大きい場合（記録後にスタックが伸びた等）は何もしない。
+     * 深さが不正に大きい値でも binop_depth を超えることはないため安全。 */
+    while (P2C_CTX->binop_depth > depth) {
+        P2C_CTX->binop_stack[--P2C_CTX->binop_depth] = NULL;
     }
 }
 
-size_t p2c_fstr_depth(void) { return g_fstr_depth; }
+size_t p2c_fstr_depth(void) { return P2C_CTX->fstr_depth; }
 
 void p2c_fstr_rewind(size_t depth) {
-    if (depth >= P2C_FSTR_STACK_CAPACITY) depth = 0;
-    while (g_fstr_depth > depth) {
-        P2C_String *builder = g_fstr_stack[--g_fstr_depth];
-        g_fstr_stack[g_fstr_depth] = NULL;
+    while (P2C_CTX->fstr_depth > depth) {
+        P2C_String *builder = P2C_CTX->fstr_stack[--P2C_CTX->fstr_depth];
+        P2C_CTX->fstr_stack[P2C_CTX->fstr_depth] = NULL;
         if (builder) p2c_str_free(builder);
     }
+}
+
+/* 式スタック（binop/f-string）の後始末。ランタイム終了時に呼ぶ。
+ * どちらも必要に応じて伸長する動的配列なので、解放しないとリークになる。
+ * 現在選択中のインスタンスのスタックだけを解放する。 */
+void p2c_expr_stacks_release(void) {
+    p2c_heap_free(P2C_CTX->binop_stack);
+    P2C_CTX->binop_stack = NULL;
+    P2C_CTX->binop_capacity = 0;
+    P2C_CTX->binop_depth = 0;
+    if (P2C_CTX->fstr_stack) {
+        for (size_t i = 0; i < P2C_CTX->fstr_depth; i++) {
+            if (P2C_CTX->fstr_stack[i]) p2c_str_free(P2C_CTX->fstr_stack[i]);
+        }
+    }
+    p2c_heap_free(P2C_CTX->fstr_stack);
+    P2C_CTX->fstr_stack = NULL;
+    P2C_CTX->fstr_capacity = 0;
+    P2C_CTX->fstr_depth = 0;
 }
 
 /* GCのmarkフェーズから呼ばれ、スタック上のどこからも参照されていない
@@ -6945,9 +7476,9 @@ static size_t gc_mark_tls_temporaries(void) {
         gc_mark(p2c_active_exception, NULL);
         count++;
     }
-    for (size_t i = 0; i < g_binop_depth && i < P2C_BINOP_STACK_CAPACITY; i++) {
-        if (g_binop_stack[i]) {
-            gc_mark(g_binop_stack[i], NULL);
+    for (size_t i = 0; i < P2C_CTX->binop_depth; i++) {
+        if (P2C_CTX->binop_stack[i]) {
+            gc_mark(P2C_CTX->binop_stack[i], NULL);
             count++;
         }
     }
